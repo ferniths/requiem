@@ -7,7 +7,7 @@ All agents share a single globally-configured model (the "9router" route). What 
 ## Architecture
 
 ```
-requiem-cli
+requiem
 ├── main.rs          entry point, REPL loop, subcommands
 ├── config.rs        TOML config at ~/.requiem/config.toml
 └── commands.rs      slash-command dispatch
@@ -32,7 +32,9 @@ requiem-cli
 - **Verification loop.** `run_agent_verified` re-checks a completed task with a `Verifier` before marking it done. Failed verifications retry up to a bounded attempt count, feeding the failure reason back into the agent's history.
 - **Git tooling.** `GitTool` exposes status/diff/log/add/commit/branch/remote as a single `run_git` action, gated by the mode's `git_mutation` permission.
 - **Multi-agent delegation.** `SubagentTool` lets the model call `spawn_subagent` to delegate a subtask to a child agent. The child runs with the same model, a focused context slice, and the parent's permission profile. Depth is bounded to 4. The subagent's final response is returned to the parent as a tool result.
-- **Session persistence.** Every completed task writes a `SessionRecord` to SQLite. Resume with `reqeum session --resume <uuid>`.
+- **Concurrent dispatch.** `run_agents_concurrent` runs multiple agent tasks in parallel via `futures::join_all`, returning results in input order.
+- **Obsidian vault tooling.** `ObsidianTool` exposes read/write/list/audit on the user's vault at `~/.requiem/vault`. Writes are atomic with a JSON change log. Gated by `can_write_file()`.
+- **Session persistence.** Every completed task writes a `SessionRecord` to SQLite. Resume with `requiem session --resume <uuid>`.
 
 ## Building
 
@@ -62,25 +64,25 @@ The API key can also come from the `REQUIEM_API_KEY` environment variable (takes
 
 ```bash
 # Show banner and help
-reqeum
+requiem
 
 # Show the ASCII banner
-reqeum banner
+requiem banner
 
 # Show the configured model
-reqeum model
+requiem model
 
 # Test the model connection
-reqeum model --test
+requiem model --test
 
 # List slash commands
-reqeum help
+requiem help
 
 # Start an interactive session
-reqeum session
+requiem session
 
 # Resume a previous session
-reqeum session --resume <uuid>
+requiem session --resume <uuid>
 ```
 
 ### Slash commands (in-session)

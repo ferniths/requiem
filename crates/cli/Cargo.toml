@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[[bin]]
+name = "requiem"
+path = "src/main.rs"
+
 [dependencies]
 requiem-core = { path = "../core" }
 requiem-model = { path = "../model" }

@@ -1603,6 +1603,7 @@ dependencies = [
  "async-trait",
  "requiem-core",
  "requiem-model",
+ "requiem-obsidian",
  "requiem-orchestration",
  "serde",
  "serde_json",

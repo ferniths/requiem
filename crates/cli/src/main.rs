@@ -534,12 +534,12 @@ fn show_banner_and_help() {
         "REQUIEM".yellow().bold()
     );
     println!("{}", "usage:".cyan().bold());
-    println!("  reqeum banner          show this banner");
-    println!("  reqeum setup            interactive first-run configuration");
-    println!("  reqeum model [--test]  show or test the configured model");
-    println!("  reqeum help            list slash commands");
-    println!("  reqeum session [--resume <uuid>]   start an interactive session");
-    println!("  reqeum install [--dir <path>]     install into PATH\n");
+    println!("  requiem banner          show this banner");
+    println!("  requiem setup            interactive first-run configuration");
+    println!("  requiem model [--test]  show or test the configured model");
+    println!("  requiem help            list slash commands");
+    println!("  requiem session [--resume <uuid>]   start an interactive session");
+    println!("  requiem install [--dir <path>]     install into PATH\n");
     println!("{}", "slash commands (in session):".cyan().bold());
     for (name, desc) in requiem_cli::commands::list_commands() {
         println!("  {name:<12} {desc}");
@@ -623,7 +623,7 @@ fn run_setup() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     }
 
     println!(
-        "\nrun `reqeum model --test` to verify the model endpoint, then `reqeum session` to start."
+        "\nrun `requiem model --test` to verify the model endpoint, then `requiem session` to start."
     );
     Ok("setup complete".into())
 }
@@ -638,18 +638,13 @@ fn prompt_override(current: &mut String) {
     }
 }
 
-/// Install the current binary into a PATH-visible location so `reqeum`
+/// Install the current binary into a PATH-visible location so `requiem`
 /// can be invoked from any directory.
 fn run_install(
     dir: Option<std::path::PathBuf>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot resolve current executable path: {e}"))?;
-    let exe_name = exe
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("cannot resolve executable name")?
-        .to_string();
 
     let target_dir = match dir {
         Some(d) => d,
@@ -665,7 +660,13 @@ fn run_install(
 
     std::fs::create_dir_all(&target_dir)?;
 
-    let target = target_dir.join(exe_name);
+    // Always install as "requiem" (with the platform exe suffix).
+    let target_name = if cfg!(windows) {
+        "requiem.exe".to_string()
+    } else {
+        "requiem".to_string()
+    };
+    let target = target_dir.join(&target_name);
     std::fs::copy(&exe, &target)?;
 
     println!("{} installed to {}", "✓".green().bold(), target.display());
