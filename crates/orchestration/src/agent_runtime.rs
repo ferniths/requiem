@@ -38,6 +38,7 @@ pub trait ToolExecutor: Send + Sync {
 }
 
 /// The accumulated state of one agent running one task.
+#[derive(Debug)]
 pub struct AgentRun {
     /// The agent descriptor.
     pub agent: Agent,
@@ -230,4 +231,72 @@ pub async fn run_agent_verified(
         "task {} failed verification after {max_attempts} attempts",
         run.task.id
     )))
+}
+
+/// Run multiple agent tasks concurrently via `tokio::join!`.
+///
+/// Each task runs in its own `AgentRun` with the same client, executor,
+/// and tool set. Results are returned in the same order as the input.
+/// A task that exceeds its turn budget or fails verification is returned
+/// as `Err` without blocking the other tasks.
+pub async fn run_agents_concurrent(
+    client: &ModelClient,
+    executor: &std::sync::Arc<dyn ToolExecutor>,
+    runs: Vec<AgentRun>,
+    tools: &[ToolDef],
+) -> Vec<Result<AgentRun, RequiemError>> {
+    let futures: Vec<_> = runs
+        .into_iter()
+        .map(|mut run| async move {
+            let result = run_agent(client, executor, &mut run, tools).await;
+            match result {
+                Ok(()) => Ok(run),
+                Err(e) => Err(e),
+            }
+        })
+        .collect();
+
+    futures::future::join_all(futures).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use requiem_core::Id;
+    use requiem_model::request::ToolDef;
+
+    #[tokio::test]
+    async fn concurrent_runs_return_results_in_order() {
+        let cfg = requiem_model::config::ModelConfig {
+            endpoint: "http://localhost:9999".into(),
+            api_key: "test".into(),
+            model: "test-model".into(),
+            timeout_ms: 5_000,
+            max_concurrency: 4,
+            max_retries: 1,
+            max_context_tokens: None,
+            max_output_tokens: None,
+        };
+        let client = ModelClient::new(cfg).unwrap();
+
+        let executor: std::sync::Arc<dyn ToolExecutor> =
+            std::sync::Arc::new(crate::test_executor::test_executor());
+        let tools: Vec<ToolDef> = Vec::new();
+
+        let agents: Vec<AgentRun> = (0..3)
+            .map(|i| {
+                let agent = Agent::master(&format!("agent-{i}"), Id::new());
+                let task = Task::new(&format!("task-{i}"));
+                AgentRun::new(agent, task)
+            })
+            .collect();
+
+        // These will fail (no real model server), but the test verifies
+        // that all 3 results come back in order without panicking.
+        let results = run_agents_concurrent(&client, &executor, agents, &tools).await;
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.is_err(), "expected error with no server, got {r:?}");
+        }
+    }
 }

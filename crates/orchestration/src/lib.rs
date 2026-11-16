@@ -18,3 +18,26 @@ pub mod agent_runtime;
 pub mod scheduler;
 pub mod subagent;
 pub mod verifier;
+
+#[cfg(test)]
+pub mod test_executor {
+    use async_trait::async_trait;
+    use requiem_core::error::RequiemError;
+
+    pub struct NoopExecutor;
+
+    #[async_trait]
+    impl crate::agent_runtime::ToolExecutor for NoopExecutor {
+        async fn execute(
+            &self,
+            _name: &str,
+            _arguments: &serde_json::Value,
+        ) -> Result<serde_json::Value, RequiemError> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    pub fn test_executor() -> NoopExecutor {
+        NoopExecutor
+    }
+}
