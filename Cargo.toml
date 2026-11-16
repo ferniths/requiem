@@ -1,0 +1,88 @@
+[package]
+name = "requiem"
+version = "0.1.0"
+edition = "2021"
+description = "REQUIEM — high-performance, cross-platform, multi-agent CLI coding and knowledge-management harness"
+license = "MIT"
+authors = ["Fern"]
+publish = false
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# config
+toml = "0.8"
+dirs = "5"
+
+# terminal / TUI
+crossterm = "0.27"
+ratatui = "0.29"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+
+# HTTP / model client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-stream = "0.1"
+bytes = "1"
+
+# crypto / hashing
+sha2 = "0.10"
+
+# error handling
+thiserror = "1"
+anyhow = "1"
+color-eyre = "0.6"
+
+# logging / diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# persistence
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# utils
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+walkdir = "2"
+tempfile = "3"
+colored = "2"
+textwrap = "0.16"
+
+# internal crates
+requiem-core = { path = "crates/core" }
+requiem-model = { path = "crates/model" }
+requiem-orchestration = { path = "crates/orchestration" }
+requiem-tools = { path = "crates/tools" }
+requiem-permissions = { path = "crates/permissions" }
+requiem-context = { path = "crates/context" }
+requiem-project = { path = "crates/project" }
+requiem-obsidian = { path = "crates/obsidian" }
+requiem-memory = { path = "crates/memory" }
+requiem-tui = { path = "crates/tui" }
+requiem-cli = { path = "crates/cli" }
+
+[features]
+default = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,12 @@
+[package]
+name = "requiem-permissions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+requiem-core = { path = "../core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

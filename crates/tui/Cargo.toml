@@ -1,0 +1,14 @@
+[package]
+name = "requiem-tui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+requiem-core = { path = "../core" }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+colored = { workspace = true }
+textwrap = { workspace = true }
+serde = { workspace = true }

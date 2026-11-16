@@ -1,0 +1,20 @@
+[package]
+name = "requiem-tools"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+requiem-core = { path = "../core" }
+requiem-model = { path = "../model" }
+requiem-orchestration = { path = "../orchestration" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+walkdir = { workspace = true }
+tempfile = { workspace = true }

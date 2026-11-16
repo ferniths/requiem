@@ -1,0 +1,32 @@
+[package]
+name = "requiem-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+requiem-core = { path = "../core" }
+requiem-model = { path = "../model" }
+requiem-orchestration = { path = "../orchestration" }
+requiem-tools = { path = "../tools" }
+requiem-permissions = { path = "../permissions" }
+requiem-context = { path = "../context" }
+requiem-project = { path = "../project" }
+requiem-obsidian = { path = "../obsidian" }
+requiem-memory = { path = "../memory" }
+requiem-tui = { path = "../tui" }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+colored = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
