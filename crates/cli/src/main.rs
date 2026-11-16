@@ -42,6 +42,14 @@ enum Commands {
         #[arg(long)]
         resume: Option<Uuid>,
     },
+    /// Interactive first-run setup: configure endpoint, API key, model, vault.
+    Setup,
+    /// Install the binary into PATH (creates a symlink/junction or copies).
+    Install {
+        /// Target directory (default: user's AppData\Local\Microsoft\WindowsApps or ~\bin).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
 }
 
 /// A tool executor that bridges the sync `Tool` trait into the async
@@ -190,6 +198,26 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Commands::Session { resume }) => match run_session(resume).await {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", e.to_string().red());
+                ExitCode::FAILURE
+            }
+        },
+        Some(Commands::Setup) => match run_setup() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", e.to_string().red());
+                ExitCode::FAILURE
+            }
+        },
+        Some(Commands::Install { dir }) => match run_install(dir) {
             Ok(msg) => {
                 println!("{msg}");
                 ExitCode::SUCCESS
@@ -507,9 +535,11 @@ fn show_banner_and_help() {
     );
     println!("{}", "usage:".cyan().bold());
     println!("  reqeum banner          show this banner");
+    println!("  reqeum setup            interactive first-run configuration");
     println!("  reqeum model [--test]  show or test the configured model");
     println!("  reqeum help            list slash commands");
-    println!("  reqeum session [--resume <uuid>]   start an interactive session\n");
+    println!("  reqeum session [--resume <uuid>]   start an interactive session");
+    println!("  reqeum install [--dir <path>]     install into PATH\n");
     println!("{}", "slash commands (in session):".cyan().bold());
     for (name, desc) in requiem_cli::commands::list_commands() {
         println!("  {name:<12} {desc}");
@@ -532,4 +562,136 @@ async fn run_model_command(test: bool) -> Result<String, Box<dyn std::error::Err
             client.endpoint()
         ))
     }
+}
+
+/// Interactive first-run setup: walk through endpoint, API key, model,
+/// and vault path. Writes `~/.requiem/config.toml` and optionally
+/// creates the vault directory.
+fn run_setup() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let home = dirs::home_dir().ok_or("cannot resolve home directory")?;
+    let req_dir = home.join(".requiem");
+    std::fs::create_dir_all(&req_dir)?;
+    let config_path = req_dir.join("config.toml");
+
+    println!("{} REQUIEM setup\n", "▸".cyan().bold());
+
+    let existing = if config_path.is_file() {
+        let raw = std::fs::read_to_string(&config_path)?;
+        Some(
+            toml::from_str::<Config>(&raw)
+                .map_err(|e| format!("failed to parse existing config: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    let mut config = existing.unwrap_or_default();
+
+    println!("endpoint [{}]: ", config.endpoint);
+    prompt_override(&mut config.endpoint);
+    println!("model [{}]: ", config.model);
+    prompt_override(&mut config.model);
+    let api_key_display = if config.api_key.is_empty() {
+        "(empty — use REQUIEM_API_KEY env var)"
+    } else {
+        "(set)"
+    };
+    println!("api_key [{api_key_display}]: ");
+    prompt_override(&mut config.api_key);
+
+    let raw = toml::to_string_pretty(&config)?;
+    std::fs::write(&config_path, raw)?;
+    println!(
+        "\n{} config written to {}",
+        "✓".green().bold(),
+        config_path.display()
+    );
+
+    // Optionally create the vault directory.
+    let vault_root = req_dir.join("vault");
+    if !vault_root.is_dir() {
+        println!(
+            "vault directory {} does not exist — create it? [y/N]: ",
+            vault_root.display()
+        );
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if answer.trim().eq_ignore_ascii_case("y") {
+            std::fs::create_dir_all(&vault_root)?;
+            println!("✓ vault created at {}", vault_root.display());
+        }
+    }
+
+    println!(
+        "\nrun `reqeum model --test` to verify the model endpoint, then `reqeum session` to start."
+    );
+    Ok("setup complete".into())
+}
+
+/// Prompt for a value; if the user just presses Enter, keep the existing value.
+fn prompt_override(current: &mut String) {
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).ok();
+    let trimmed = input.trim().to_string();
+    if !trimmed.is_empty() {
+        *current = trimmed;
+    }
+}
+
+/// Install the current binary into a PATH-visible location so `reqeum`
+/// can be invoked from any directory.
+fn run_install(
+    dir: Option<std::path::PathBuf>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot resolve current executable path: {e}"))?;
+    let exe_name = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("cannot resolve executable name")?
+        .to_string();
+
+    let target_dir = match dir {
+        Some(d) => d,
+        None => {
+            // On Windows, use %LOCALAPPDATA%\bin (or create it).
+            let local = std::env::var("LOCALAPPDATA")
+                .ok()
+                .map(|p| std::path::PathBuf::from(p).join("bin"))
+                .filter(|p| p.is_dir() || p.parent().map(|pp| pp.is_dir()).unwrap_or(false));
+            local.ok_or("cannot resolve install directory; use --dir <path>")?
+        }
+    };
+
+    std::fs::create_dir_all(&target_dir)?;
+
+    let target = target_dir.join(exe_name);
+    std::fs::copy(&exe, &target)?;
+
+    println!("{} installed to {}", "✓".green().bold(), target.display());
+
+    // Check if the target dir is on PATH.
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let target_canonical = target_dir.canonicalize().ok();
+    let is_on_path = path_env
+        .split(';')
+        .filter_map(|p| std::path::Path::new(p).canonicalize().ok())
+        .any(|p| Some(p) == target_canonical);
+
+    if !is_on_path {
+        println!(
+            "\n{} {} is not on PATH.",
+            "⚠".yellow().bold(),
+            target_dir.display()
+        );
+        println!(
+            "Add it to your PATH environment variable, or run via full path: {}",
+            target.display()
+        );
+    }
+
+    Ok(format!(
+        "installed to {target_display}",
+        target_display = target.display()
+    ))
 }
