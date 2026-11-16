@@ -117,6 +117,7 @@ impl SyncToolExecutor {
             "run_terminal" => gate.can_run_terminal(true).is_allowed(),
             "run_git" => gate.can_mutate_git().is_allowed(),
             "spawn_subagent" => gate.can_spawn_agent().is_allowed(),
+            "obsidian" => gate.can_write_file().is_allowed(),
             "read_file" | "glob_search" | "grep_search" => true,
             _ => true,
         }
@@ -336,13 +337,8 @@ async fn run_session(
         let mut tools = executor.tool_defs();
 
         // Add the subagent tool when the current mode allows spawning.
-        // The subagent tool needs an Arc<dyn ToolExecutor> for the child run,
-        // but we haven't built that yet. We create a temporary executor
-        // reference that the subagent will use; the child agent's tool calls
-        // go through the same shared tools map.
         if executor.is_tool_allowed("spawn_subagent") {
             let client_arc: Arc<requiem_model::client::ModelClient> = Arc::new(client.clone());
-            // Build a child-executor that shares the same tools map.
             let child_executor: Arc<dyn requiem_orchestration::agent_runtime::ToolExecutor> =
                 Arc::new(executor.share());
             let sub_tool = requiem_tools::make_subagent_tool(
@@ -354,6 +350,17 @@ async fn run_session(
             );
             tools.push(sub_tool.tool_def());
             executor.add_tool(Box::new(sub_tool));
+        }
+
+        // Add the obsidian vault tool when the mode allows writes.
+        if executor.is_tool_allowed("obsidian") {
+            let vault_root = dirs::home_dir()
+                .map(|h| h.join(".requiem").join("vault"))
+                .unwrap_or_default();
+            std::fs::create_dir_all(&vault_root).ok();
+            let obs_tool = requiem_tools::ObsidianTool::new(vault_root);
+            tools.push(obs_tool.tool_def());
+            executor.add_tool(Box::new(obs_tool));
         }
 
         let executor_arc: Arc<dyn requiem_orchestration::agent_runtime::ToolExecutor> =

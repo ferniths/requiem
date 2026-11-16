@@ -6,12 +6,14 @@
 
 pub mod file_ops;
 pub mod git;
+pub mod obsidian;
 pub mod search;
 pub mod subagent;
 pub mod terminal;
 
 pub use file_ops::{FileDeleteTool, FileEditTool, FileReadTool, FileWriteTool};
 pub use git::GitTool;
+pub use obsidian::ObsidianTool;
 pub use search::{GlobSearchTool, GrepSearchTool};
 pub use subagent::make_subagent_tool;
 pub use terminal::TerminalTool;

@@ -9,6 +9,7 @@ publish = false
 requiem-core = { path = "../core" }
 requiem-model = { path = "../model" }
 requiem-orchestration = { path = "../orchestration" }
+requiem-obsidian = { path = "../obsidian" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
