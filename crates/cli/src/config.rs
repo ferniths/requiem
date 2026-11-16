@@ -30,6 +30,33 @@ pub struct Config {
     /// The max context window in tokens for the model.
     #[serde(default = "default_max_tokens")]
     pub max_context_tokens: u32,
+
+    // ── Agent limits ────────────────────────────────────────────
+    /// Maximum depth of the agent hierarchy (master → worker → subagent…).
+    #[serde(default = "default_agent_depth")]
+    pub max_agent_depth: u32,
+    /// Default token budget per agent task.
+    #[serde(default = "default_token_budget")]
+    pub token_budget: u32,
+    /// Maximum number of tasks a single session may queue.
+    #[serde(default = "default_max_task_budget")]
+    pub max_task_budget: u32,
+    /// Whether agents can dynamically scale up/down based on load.
+    #[serde(default)]
+    pub dynamic_scaling: bool,
+
+    // ── UI / appearance ─────────────────────────────────────────
+    /// The theme variant: "default", "high_contrast", or "muted".
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// The default operating mode when a session starts.
+    #[serde(default = "default_mode")]
+    pub default_mode: String,
+
+    // ── Obsidian vaults ─────────────────────────────────────────
+    /// Paths to Obsidian vaults. The first entry is the default vault.
+    #[serde(default)]
+    pub vaults: Vec<String>,
 }
 
 fn default_max_concurrency() -> u32 {
@@ -43,6 +70,21 @@ fn default_max_retries() -> u32 {
 }
 fn default_max_tokens() -> u32 {
     128_000
+}
+fn default_agent_depth() -> u32 {
+    4
+}
+fn default_token_budget() -> u32 {
+    50_000
+}
+fn default_max_task_budget() -> u32 {
+    20
+}
+fn default_theme() -> String {
+    "default".into()
+}
+fn default_mode() -> String {
+    "code".into()
 }
 
 impl Config {
@@ -71,6 +113,19 @@ impl Config {
             std::fs::write(&path, raw).map_err(|e| ConfigError::Write(e.to_string()))?;
             Ok(config)
         }
+    }
+
+    /// Whether the config has been initialized (endpoint and model are set
+    /// to non-default values, or a config file exists on disk).
+    pub fn is_initialized(&self) -> bool {
+        let path = Self::config_path().ok();
+        if let Some(p) = &path {
+            if p.is_file() {
+                return true;
+            }
+        }
+        // Also consider it initialized if the endpoint is not the default.
+        self.endpoint != "http://localhost:11434/v1" || self.model != "gpt-4o"
     }
 
     /// Build a `ModelConfig` from this config.
@@ -103,6 +158,13 @@ impl Default for Config {
             timeout_ms: 120_000,
             max_retries: 3,
             max_context_tokens: 128_000,
+            max_agent_depth: 4,
+            token_budget: 50_000,
+            max_task_budget: 20,
+            dynamic_scaling: false,
+            theme: "default".to_string(),
+            default_mode: "code".to_string(),
+            vaults: Vec::new(),
         }
     }
 }

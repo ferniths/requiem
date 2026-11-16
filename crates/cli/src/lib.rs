@@ -5,5 +5,6 @@
 
 pub mod commands;
 pub mod config;
+pub mod setup;
 
 pub use commands::CommandResult;

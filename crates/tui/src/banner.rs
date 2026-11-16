@@ -1,5 +1,7 @@
 //! The REQUIEM ASCII banner, embedded at compile time.
 
+use crate::theme::Theme;
+
 /// The exact banner from `REQUIEM-ASCII-BANNER.txt` (15 lines, 1498 bytes).
 pub const BANNER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -15,6 +17,11 @@ pub fn render_banner() -> String {
 /// supported (e.g. piping to a file).
 pub fn render_plain() -> String {
     BANNER.to_string()
+}
+
+/// Render the banner with the REQUIEM theme accent color.
+pub fn render_themed(theme: &Theme) -> String {
+    theme.accent(BANNER).to_string()
 }
 
 #[cfg(test)]

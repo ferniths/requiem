@@ -15,7 +15,8 @@ use requiem_cli::config::Config;
 use requiem_core::mode::Mode;
 use requiem_permissions::PermissionGate;
 use requiem_tools::Tool;
-use requiem_tui::DashboardRenderer;
+use requiem_tui::dashboard::{DashboardRenderer, ThemedRenderer};
+use requiem_tui::theme::theme_from_name;
 
 #[derive(Parser)]
 #[command(name = "requiem", version, about = "REQUIEM multi-agent CLI harness")]
@@ -173,6 +174,17 @@ async fn main() -> ExitCode {
 
     match cli.command {
         None => {
+            let config = Config::load_or_init().ok();
+            if let Some(cfg) = &config {
+                if !cfg.is_initialized() {
+                    show_banner_and_help();
+                    println!(
+                        "\n{} No config found. Run `requiem setup` to configure your model endpoint.\n",
+                        "⚠".yellow().bold()
+                    );
+                    return ExitCode::SUCCESS;
+                }
+            }
             show_banner_and_help();
             ExitCode::SUCCESS
         }
@@ -235,9 +247,12 @@ async fn run_session(
     resume: Option<Uuid>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::load_or_init().map_err(|e| e.to_string())?;
+    let theme = theme_from_name(&config.theme);
+    let renderer = ThemedRenderer::new(&theme);
+
     let client = reqwest_client(&config)?;
 
-    let mut mode = Mode::Code;
+    let mut mode = Mode::from_slash(&format!("/{}", config.default_mode)).unwrap_or(Mode::Code);
     let gate = PermissionGate::for_mode(mode);
     let mut executor = SyncToolExecutor::new(gate);
 
@@ -251,7 +266,7 @@ async fn run_session(
     let mut completed_tasks: usize = 0;
     let task_session_id = requiem_core_id();
 
-    println!("{}", requiem_tui_banner());
+    println!("{}", requiem_tui_banner(&theme));
     println!(
         "{} session {session_id} — mode: {} — type a task or a slash command\n",
         "REQUIEM".yellow().bold(),
@@ -291,7 +306,41 @@ async fn run_session(
                     break;
                 }
                 "/help" => {
-                    show_repl_help();
+                    show_repl_help(&theme);
+                    continue;
+                }
+                "/setup" => {
+                    println!(
+                        "{} re-running setup wizard…",
+                        "▸".cyan().bold()
+                    );
+                    if let Ok(cfg) = requiem_cli::setup::run_wizard() {
+                        println!(
+                            "{} config updated. New theme: {}",
+                            "✓".green().bold(),
+                            cfg.theme
+                        );
+                    }
+                    continue;
+                }
+                "/theme" => {
+                    println!("{}", "Available themes:".yellow().bold());
+                    for name in requiem_tui::THEME_NAMES {
+                        let t = theme_from_name(name);
+                        let marker = if name == &config.theme {
+                            "✓ "
+                        } else {
+                            "  "
+                        };
+                        println!(
+                            "  {}{} {} — {}{}",
+                            marker,
+                            t.accent(name),
+                            t.secondary("preview:"),
+                            t.info("hello world"),
+                            t.muted(" muted text"),
+                        );
+                    }
                     continue;
                 }
                 "/model" => {
@@ -404,7 +453,7 @@ async fn run_session(
 
         // Render dashboard after the run.
         let dash =
-            requiem_tui_dashboard(&run, total_tasks, completed_tasks, &session_id.to_string());
+            requiem_tui_dashboard(&run, total_tasks, completed_tasks, &session_id.to_string(), &renderer);
         println!("{dash}");
 
         let task_success = match result {
@@ -452,8 +501,8 @@ async fn run_session(
     ))
 }
 
-fn requiem_tui_banner() -> String {
-    requiem_tui::banner::BANNER.to_string()
+fn requiem_tui_banner(theme: &requiem_tui::Theme) -> String {
+    requiem_tui::banner::render_themed(theme)
 }
 
 fn requiem_tui_dashboard(
@@ -461,6 +510,7 @@ fn requiem_tui_dashboard(
     total: usize,
     completed: usize,
     session_id: &str,
+    renderer: &ThemedRenderer,
 ) -> String {
     let usage = run
         .final_response
@@ -484,7 +534,7 @@ fn requiem_tui_dashboard(
         row.tokens_in = usage.0;
         row.tokens_out = usage.1;
     }
-    requiem_tui::PlainRenderer.render(&state)
+    renderer.render(&state)
 }
 
 fn render_final(resp: &requiem_model::response::ModelResponse) -> String {
@@ -496,16 +546,26 @@ fn render_final(resp: &requiem_model::response::ModelResponse) -> String {
         .unwrap_or_else(|| "(no text content)".into())
 }
 
-fn show_repl_help() {
-    println!("\n{} commands:", "available".yellow().bold());
-    for (name, desc) in requiem_cli::commands::list_commands() {
-        println!("  {name:<12} {desc}");
+fn show_repl_help(theme: &requiem_tui::Theme) {
+    println!();
+    for (group, cmds) in requiem_cli::commands::list_commands_grouped() {
+        println!(
+            "  {}",
+            theme.accent_bold(group)
+        );
+        for (name, desc) in cmds {
+            println!(
+                "    {} {}",
+                theme.secondary(format!("{name:<10}")),
+                theme.muted(desc)
+            );
+        }
     }
-    println!("  {exit:<12} leave the session", exit = "/exit");
     println!(
-        "  {any:<12} submit a task to the agent\n",
-        any = "(any text)"
+        "  {} — submit a task to the agent",
+        theme.secondary("(any text)")
     );
+    println!();
 }
 
 fn session_db_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
@@ -528,7 +588,8 @@ fn reqwest_client(
 }
 
 fn show_banner_and_help() {
-    println!("{}", requiem_tui_banner());
+    let theme = theme_from_name("default");
+    println!("{}", requiem_tui_banner(&theme));
     println!(
         "\n{} — multi-agent CLI harness\n",
         "REQUIEM".yellow().bold()
@@ -542,7 +603,11 @@ fn show_banner_and_help() {
     println!("  requiem install [--dir <path>]     install into PATH\n");
     println!("{}", "slash commands (in session):".cyan().bold());
     for (name, desc) in requiem_cli::commands::list_commands() {
-        println!("  {name:<12} {desc}");
+        println!(
+            "  {} {}",
+            theme.accent(name),
+            theme.secondary(desc)
+        );
     }
 }
 
@@ -564,71 +629,34 @@ async fn run_model_command(test: bool) -> Result<String, Box<dyn std::error::Err
     }
 }
 
-/// Interactive first-run setup: walk through endpoint, API key, model,
-/// and vault path. Writes `~/.requiem/config.toml` and optionally
-/// creates the vault directory.
+/// Interactive first-run setup: runs the 7-step wizard from `setup.rs`,
+/// then optionally creates the vault directory.
 fn run_setup() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let home = dirs::home_dir().ok_or("cannot resolve home directory")?;
-    let req_dir = home.join(".requiem");
-    std::fs::create_dir_all(&req_dir)?;
-    let config_path = req_dir.join("config.toml");
+    let config = requiem_cli::setup::run_wizard()?;
 
-    println!("{} REQUIEM setup\n", "▸".cyan().bold());
-
-    let existing = if config_path.is_file() {
-        let raw = std::fs::read_to_string(&config_path)?;
-        Some(
-            toml::from_str::<Config>(&raw)
-                .map_err(|e| format!("failed to parse existing config: {e}"))?,
-        )
-    } else {
-        None
-    };
-
-    let mut config = existing.unwrap_or_default();
-
-    println!("endpoint [{}]: ", config.endpoint);
-    prompt_override(&mut config.endpoint);
-    println!("model [{}]: ", config.model);
-    prompt_override(&mut config.model);
-    let api_key_display = if config.api_key.is_empty() {
-        "(empty — use REQUIEM_API_KEY env var)"
-    } else {
-        "(set)"
-    };
-    println!("api_key [{api_key_display}]: ");
-    prompt_override(&mut config.api_key);
-
-    let raw = toml::to_string_pretty(&config)?;
-    std::fs::write(&config_path, raw)?;
-    println!(
-        "\n{} config written to {}",
-        "✓".green().bold(),
-        config_path.display()
-    );
-
-    // Optionally create the vault directory.
-    let vault_root = req_dir.join("vault");
-    if !vault_root.is_dir() {
-        println!(
-            "vault directory {} does not exist — create it? [y/N]: ",
-            vault_root.display()
-        );
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if answer.trim().eq_ignore_ascii_case("y") {
-            std::fs::create_dir_all(&vault_root)?;
-            println!("✓ vault created at {}", vault_root.display());
+    // Create the vault directory if configured.
+    if let Some(first_vault) = config.vaults.first() {
+        let vault_path = std::path::PathBuf::from(first_vault);
+        if !vault_path.is_dir() {
+            println!(
+                "{} vault directory {} does not exist — create it? [y/N]: ",
+                "▸".cyan().bold(),
+                vault_path.display()
+            );
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if answer.trim().eq_ignore_ascii_case("y") {
+                std::fs::create_dir_all(&vault_path)?;
+                println!("✓ vault created at {}", vault_path.display());
+            }
         }
     }
 
-    println!(
-        "\nrun `requiem model --test` to verify the model endpoint, then `requiem session` to start."
-    );
-    Ok("setup complete".into())
+    Ok("setup complete — run `requiem session` to start".into())
 }
 
 /// Prompt for a value; if the user just presses Enter, keep the existing value.
+#[allow(dead_code)]
 fn prompt_override(current: &mut String) {
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).ok();
