@@ -8,5 +8,5 @@ pub mod vault;
 pub mod wikilink;
 
 pub use audit::{AuditResult, BrokenLink, Duplicates, OrphanNote};
-pub use vault::Vault;
+pub use vault::{SearchHit, Vault};
 pub use wikilink::{extract_wikilinks, resolve_wikilink};

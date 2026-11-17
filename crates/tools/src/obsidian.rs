@@ -155,6 +155,37 @@ impl ObsidianTool {
             "orphan_samples": result.orphan_notes.iter().take(5).map(|o| &o.path).collect::<Vec<_>>(),
         }))
     }
+
+    fn handle_search(&self, args: &Value) -> Result<Value> {
+        let (_, vault) = self.resolve_vault(args)?;
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        if query.is_empty() {
+            return Err(ToolError::InvalidArgument(
+                "query is required for search".into(),
+            ));
+        }
+        let max = args
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20) as usize;
+        let hits = vault.search(query, max);
+        let hits_json: Vec<Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "path": h.path,
+                    "matched_in_filename": h.matched_in_filename,
+                    "snippet": h.snippet,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "action": "search",
+            "query": query,
+            "count": hits.len(),
+            "results": hits_json,
+        }))
+    }
 }
 
 #[async_trait::async_trait]
@@ -164,8 +195,8 @@ impl Tool for ObsidianTool {
     }
 
     fn description(&self) -> &str {
-        "Read, write, list, or audit notes in an Obsidian vault. \
-         Actions: read (path), write (path + content), list, audit. \
+        "Read, write, list, search, or audit notes in an Obsidian vault. \
+         Actions: read (path), write (path + content), list, search (query), audit. \
          Optional `vault` argument selects a configured vault by name \
          (defaults to the first configured vault). \
          Writes are atomic and append to the vault change log."
@@ -177,7 +208,7 @@ impl Tool for ObsidianTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["read", "write", "list", "audit"],
+                    "enum": ["read", "write", "list", "search", "audit"],
                     "description": "The vault operation to perform"
                 },
                 "path": {
@@ -187,6 +218,14 @@ impl Tool for ObsidianTool {
                 "content": {
                     "type": "string",
                     "description": "Note content (required for write)"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search term (required for search; case-insensitive match on filename and content)"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of search results to return (default 20)"
                 },
                 "vault": {
                     "type": "string",
@@ -203,6 +242,7 @@ impl Tool for ObsidianTool {
             "read" => self.handle_read(args),
             "write" => self.handle_write(args),
             "list" => self.handle_list(args),
+            "search" => self.handle_search(args),
             "audit" => self.handle_audit(args),
             _ => Err(ToolError::InvalidArgument(format!(
                 "unknown obsidian action: {action}"
@@ -313,5 +353,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("requiem setup"));
+    }
+
+    #[tokio::test]
+    async fn search_finds_notes_by_content() {
+        let root = temp_vault_root("search-vault");
+        std::fs::write(
+            root.join("Rust Patterns.md"),
+            "# Rust Patterns\n\nOwnership is the key concept.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Cooking.md"),
+            "# Cooking\n\nBake at 180C for 30 minutes.\n",
+        )
+        .unwrap();
+        let tool = ObsidianTool::new(root.clone());
+
+        let res = tool
+            .execute(&serde_json::json!({"action": "search", "query": "ownership"}))
+            .await
+            .unwrap();
+        assert_eq!(res["count"], 1);
+        assert_eq!(res["results"][0]["path"], "Rust Patterns.md");
+
+        // Case-insensitive: uppercase query still matches.
+        let res2 = tool
+            .execute(&serde_json::json!({"action": "search", "query": "BAKE"}))
+            .await
+            .unwrap();
+        assert_eq!(res2["count"], 1);
+        assert_eq!(res2["results"][0]["path"], "Cooking.md");
+    }
+
+    #[tokio::test]
+    async fn search_finds_notes_by_filename() {
+        let root = temp_vault_root("name-search");
+        std::fs::write(root.join("Alpha Notes.md"), "nothing matching here").unwrap();
+        let tool = ObsidianTool::new(root.clone());
+
+        let res = tool
+            .execute(&serde_json::json!({"action": "search", "query": "alpha"}))
+            .await
+            .unwrap();
+        assert_eq!(res["count"], 1);
+        assert_eq!(res["results"][0]["matched_in_filename"], true);
+    }
+
+    #[tokio::test]
+    async fn search_requires_query() {
+        let tool = test_tool();
+        let err = tool
+            .execute(&serde_json::json!({"action": "search"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("query is required"));
+    }
+
+    #[tokio::test]
+    async fn search_respects_max_results() {
+        let root = temp_vault_root("many-notes");
+        for i in 0..10 {
+            std::fs::write(root.join(format!("note-{i}.md")), "target content").unwrap();
+        }
+        let tool = ObsidianTool::new(root.clone());
+        let res = tool
+            .execute(&serde_json::json!({"action": "search", "query": "target", "max_results": 3}))
+            .await
+            .unwrap();
+        assert_eq!(res["count"], 3);
     }
 }
