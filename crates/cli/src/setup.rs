@@ -270,6 +270,11 @@ fn step_model(config: &mut Config, theme: &Theme) -> Result<Step, String> {
         Answer::Value(v) if v.eq_ignore_ascii_case("y") => {
             println!("  {}", theme.muted("probing…"));
             match test_endpoint(&config.endpoint, &config.model, &config.api_key) {
+                Ok(result) if result.starts_with(SKIPPED_PREFIX) => println!(
+                    "{} {}",
+                    theme.warning("◦"),
+                    theme.secondary(result.trim_start_matches(SKIPPED_PREFIX))
+                ),
                 Ok(model) => println!(
                     "{} {}",
                     theme.success_bold("✓"),
@@ -311,7 +316,19 @@ fn validate_model(model: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Sentinel prefix that marks a skipped (not failed) connection probe.
+const SKIPPED_PREFIX: &str = "[skipped] ";
+
 /// Build a throwaway ModelClient and probe it.
+///
+/// The wizard runs under `#[tokio::main]` (via `run_default`), which means
+/// we are already inside a tokio runtime.  In that case we cannot build a
+/// nested runtime on the same thread, so we skip the live probe and just
+/// validate the config shape — the user can always re-test with
+/// `requiem model --test` after the wizard completes.
+///
+/// Returns an `Ok` string on success or skip; an `Err` string only on a
+/// real connection failure.
 fn test_endpoint(endpoint: &str, model: &str, api_key: &str) -> Result<String, String> {
     let mc = requiem_model::config::ModelConfig {
         model: model.to_string(),
@@ -325,6 +342,18 @@ fn test_endpoint(endpoint: &str, model: &str, api_key: &str) -> Result<String, S
     };
     let client = requiem_model::client::ModelClient::new(mc).map_err(|e| e.to_string())?;
 
+    // Inside an existing runtime we cannot call `block_on` (tokio forbids
+    // nested runtimes on the same thread).  The wizard's caller is async,
+    // so the live probe is unavailable here — report a soft success so the
+    // user can continue; `requiem model --test` remains the real check.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Ok(format!(
+            "{SKIPPED_PREFIX}live probe unavailable in this async context — run `requiem model --test` to verify"
+        ));
+    }
+
+    // Standalone path (e.g. `requiem setup` subcommand when called from a
+    // non-async context): we own the thread and can safely block_on.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
