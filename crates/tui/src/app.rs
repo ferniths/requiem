@@ -798,13 +798,13 @@ impl App {
                 self.composer.delete_to_end();
                 self.refresh_suggestions();
             }
-            KeyCode::Char('z') if ctrl => {
-                if self.composer.undo() {
+            KeyCode::Char('z') if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.composer.redo() {
                     self.refresh_suggestions();
                 }
             }
-            KeyCode::Char('z') if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if self.composer.redo() {
+            KeyCode::Char('z') if ctrl => {
+                if self.composer.undo() {
                     self.refresh_suggestions();
                 }
             }
@@ -2309,6 +2309,165 @@ fn hello() {
             app.handle_key(test_key(KeyCode::Char(c)));
         }
         assert!(app.suggestions.is_empty(), "no workdir → no suggestions");
+    }
+
+    // ── Keyboard-mapping tests ────────────────────────────────────
+
+    #[test]
+    fn enter_submits_and_clears_composer() {
+        let mut app = test_app();
+        for c in "hello world".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        let action = app.handle_key(test_key(KeyCode::Enter));
+        assert!(matches!(action, UiAction::Submit(ref s) if s == "hello world"));
+        assert!(app.composer.text.is_empty());
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline() {
+        let mut app = test_app();
+        for c in "abc".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        let action = app.handle_key(key);
+        assert!(matches!(action, UiAction::None), "Shift+Enter must not submit");
+        assert_eq!(app.composer.text, "abc\n");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline() {
+        let mut app = test_app();
+        for c in "x".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        let action = app.handle_key(test_ctrl('j'));
+        assert!(matches!(action, UiAction::None));
+        assert_eq!(app.composer.text, "x\n");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_left() {
+        let mut app = test_app();
+        for c in "hello world".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        app.handle_key(test_ctrl('w'));
+        assert_eq!(app.composer.text, "hello ");
+        app.handle_key(test_ctrl('w'));
+        assert_eq!(app.composer.text, "");
+    }
+
+    #[test]
+    fn ctrl_u_deletes_to_start() {
+        let mut app = test_app();
+        for c in "abcdef".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        // Move cursor to middle
+        app.composer.cursor = 3;
+        app.handle_key(test_ctrl('u'));
+        assert_eq!(app.composer.text, "def");
+        assert_eq!(app.composer.cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_k_deletes_to_end() {
+        let mut app = test_app();
+        for c in "abcdef".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        app.composer.cursor = 2;
+        app.handle_key(test_ctrl('k'));
+        assert_eq!(app.composer.text, "ab");
+        assert_eq!(app.composer.cursor, 2);
+    }
+
+    #[test]
+    fn ctrl_z_undo_and_redo() {
+        let mut app = test_app();
+        for c in "hi".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        app.handle_key(test_ctrl('z'));
+        assert_eq!(app.composer.text, "h", "undo removes 'i'");
+        // Redo
+        let redo_key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        app.handle_key(redo_key);
+        assert_eq!(app.composer.text, "hi", "redo restores 'i'");
+    }
+
+    #[test]
+    fn esc_clears_composer() {
+        let mut app = test_app();
+        for c in "some text".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        app.handle_key(test_key(KeyCode::Esc));
+        assert!(app.composer.text.is_empty());
+    }
+
+    #[test]
+    fn tab_opens_dashboard_when_no_suggestions() {
+        let mut app = test_app();
+        // Plain text with no suggestions.
+        for c in "hello".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        assert!(app.suggestions.is_empty());
+        let action = app.handle_key(test_key(KeyCode::Tab));
+        assert!(matches!(action, UiAction::None));
+        assert!(app.dash.open, "Tab with no suggestions opens dashboard");
+    }
+
+    // ── Terminal-size rendering tests ─────────────────────────────
+
+    #[test]
+    fn renders_at_small_80x24() {
+        let mut app = test_app();
+        app.push_user_line("fix the login bug in src/auth.rs");
+        app.push_event(&Event::AssistantMessage {
+            agent: "master".into(),
+            text: "Done. The null-check was missing on line 42.".into(),
+        });
+        let buf = render_to_string(&app, 80, 24);
+        assert!(buf.contains("fix the login"), "small: user line visible: {buf}");
+        assert!(buf.contains("Done"), "small: response visible");
+    }
+
+    #[test]
+    fn renders_at_standard_120x40() {
+        let mut app = test_app();
+        app.push_user_line("explain the architecture of the scheduler");
+        app.push_event(&Event::AssistantMessage {
+            agent: "master".into(),
+            text: "The scheduler uses a topological sort.".into(),
+        });
+        let buf = render_to_string(&app, 120, 40);
+        assert!(buf.contains("explain the architecture"), "standard: user line");
+        assert!(buf.contains("topological sort"), "standard: response");
+        assert!(buf.contains("Ctrl+C"), "standard: footer hint");
+    }
+
+    #[test]
+    fn renders_at_large_200x50() {
+        let mut app = test_app();
+        app.push_user_line("run the full test suite and report failures");
+        app.push_event(&Event::RunStarted {
+            agent: "master".into(),
+            role: "master".into(),
+            task: requiem_core::Id::new(),
+            description: "run tests".into(),
+            mode: "code".into(),
+        });
+        app.push_event(&Event::AssistantMessage {
+            agent: "master".into(),
+            text: "All 287 tests passed.".into(),
+        });
+        let buf = render_to_string(&app, 200, 50);
+        assert!(buf.contains("run the full test suite"), "large: user line");
+        assert!(buf.contains("All 287"), "large: response");
     }
 
     #[test]
