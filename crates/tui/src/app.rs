@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph, Wrap};
 use ratatui::Frame;
@@ -28,6 +28,7 @@ use requiem_core::events::{Event, NoticeLevel};
 
 use crate::composer::Composer;
 use crate::dashboard::{AgentRow, AgentStatus, TaskRow, TaskStatus};
+use crate::markdown as md;
 use crate::theme::{Theme, Token};
 
 // ── Public types ─────────────────────────────────────────────────────
@@ -73,6 +74,8 @@ pub struct TranscriptEntry {
     pub indent: usize,
     /// Whether a streaming entry still accepts deltas.
     pub streaming: bool,
+    /// Render the text as markdown (headings, code fences, lists, etc.).
+    pub markdown: bool,
 }
 
 impl TranscriptEntry {
@@ -84,6 +87,7 @@ impl TranscriptEntry {
             bold: false,
             indent: 2,
             streaming: false,
+            markdown: false,
         }
     }
 }
@@ -102,6 +106,116 @@ fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
         .into_iter()
         .map(|c| c.to_string())
         .collect()
+}
+
+/// Parse a single ANSI-styled line (as produced by `color::ansi_wrap`)
+/// into ratatui `Span<'static>` values.
+///
+/// Handles: `\x1b[<params>m<text>\x1b[0m` where params may include:
+/// `0` reset, `1` bold, `2` dim, `3` italic, `4` underline, `7` reverse,
+/// `9` strikethrough, `30-37`/`90-97` 16-colour, `38;5;N` 256-colour,
+/// `38;2;R;G;B` truecolour. Multiple segments in one line are concatenated.
+fn parse_ansi_line(line: &str) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current_style = Style::new();
+    let mut buf: String = String::new();
+
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek().is_some() && *chars.peek().unwrap() == '[' {
+            // Flush text accumulated under current style.
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), current_style));
+            }
+            // Parse SGR parameters.
+            let mut params: String = String::new();
+            while let Some(pc) = chars.next() {
+                if pc == 'm' {
+                    break;
+                }
+                params.push(pc);
+            }
+            if params.is_empty() {
+                continue;
+            }
+            current_style = Style::new();
+            let parts: Vec<&str> = params.split(';').collect();
+            let mut i = 0;
+            while i < parts.len() {
+                let p = parts[i];
+                match p.parse::<u32>() {
+                    Ok(0) => current_style = Style::new(),
+                    Ok(1) => current_style = current_style.add_modifier(Modifier::BOLD),
+                    Ok(2) => current_style = current_style.add_modifier(Modifier::DIM),
+                    Ok(3) => current_style = current_style.add_modifier(Modifier::ITALIC),
+                    Ok(4) => current_style = current_style.add_modifier(Modifier::UNDERLINED),
+                    Ok(7) => current_style = current_style.add_modifier(Modifier::REVERSED),
+                    Ok(9) => current_style =
+                        current_style.add_modifier(Modifier::CROSSED_OUT),
+                    Ok(n) if (30..=37).contains(&n) => {
+                        let idx = (n - 30) as u8;
+                        current_style = current_style.fg(ansi16_to_color(idx));
+                    }
+                    Ok(n) if (90..=97).contains(&n) => {
+                        let idx = (n - 90) as u8;
+                        current_style = current_style.fg(ansi16_to_color(8 + idx));
+                    }
+                    Ok(38) if i + 1 < parts.len() => {
+                        // Extended colour: "5;N" or "2;R;G;B"
+                        if parts.get(i + 1) == Some(&"5") && i + 2 < parts.len() {
+                            if let Ok(n) = parts[i + 2].parse::<u8>() {
+                                current_style = current_style.fg(Color::Indexed(n));
+                            }
+                            i += 2;
+                        } else if parts.get(i + 1) == Some(&"2")
+                            && i + 4 < parts.len()
+                        {
+                            if let (Ok(r), Ok(g), Ok(b)) = (
+                                parts[i + 2].parse::<u8>(),
+                                parts[i + 3].parse::<u8>(),
+                                parts[i + 4].parse::<u8>(),
+                            ) {
+                                current_style =
+                                    current_style.fg(Color::Rgb(r, g, b));
+                            }
+                            i += 4;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        } else {
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, current_style));
+    }
+    spans
+}
+
+/// Map a 0–15 ANSI base colour index to a ratatui `Color`.
+fn ansi16_to_color(idx: u8) -> Color {
+    match idx {
+        0 => Color::Black,
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Yellow,
+        4 => Color::Blue,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        7 => Color::White,
+        8 => Color::Gray,
+        9 => Color::Indexed(9),
+        10 => Color::Indexed(10),
+        11 => Color::Indexed(11),
+        12 => Color::Indexed(12),
+        13 => Color::Indexed(13),
+        14 => Color::Indexed(14),
+        15 => Color::Indexed(15),
+        _ => Color::Reset,
+    }
 }
 
 // ── Dashboard overlay state ──────────────────────────────────────────
@@ -277,6 +391,7 @@ impl App {
             bold: true,
             indent: 4,
             streaming: false,
+            markdown: false,
         });
         self.history.insert(0, text.to_string());
         self.history.truncate(200);
@@ -356,6 +471,7 @@ impl App {
                     bold: false,
                     indent: 4,
                     streaming: false,
+                    markdown: false,
                 });
             }
             Event::TurnStarted { agent, turn } => {
@@ -376,6 +492,7 @@ impl App {
                             bold: false,
                             indent: 4,
                             streaming: true,
+                            markdown: true,
                         });
                         let i = self.entries.len() - 1;
                         self.streaming.insert(agent.clone(), i);
@@ -393,8 +510,9 @@ impl App {
                         self.entries.remove(i);
                     }
                 } else if !text.is_empty() {
-                    self.entries
-                        .push(TranscriptEntry::new("◆", text.clone(), Token::Text));
+                    let mut e = TranscriptEntry::new("◆", text.clone(), Token::Text);
+                    e.markdown = true;
+                    self.entries.push(e);
                 }
             }
             Event::ToolCallStarted {
@@ -497,8 +615,9 @@ impl App {
                     if !text.is_empty() {
                         let exists = self.entries.iter().any(|e| e.text == *text);
                         if !exists {
-                            self.entries
-                                .push(TranscriptEntry::new("◆", text.clone(), Token::Text));
+                            let mut e = TranscriptEntry::new("◆", text.clone(), Token::Text);
+                            e.markdown = true;
+                            self.entries.push(e);
                         }
                     }
                 }
@@ -951,33 +1070,53 @@ impl App {
 
         for e in &self.entries {
             let text_width = width.saturating_sub(e.indent.min(width / 2) + 3);
-            let wrapped = wrap_to_width(&e.text, text_width.max(8));
-            for (i, chunk) in wrapped.iter().enumerate() {
-                let mut spans = Vec::new();
-                if i == 0 {
-                    // Clean entry marker: glyph + 2 spaces.
-                    spans.push(Span::styled(
-                        format!("{glyph}  ", glyph = e.glyph),
-                        if e.bold {
-                            t.style_bold(e.fg)
-                        } else {
-                            t.style(e.fg)
-                        },
-                    ));
-                } else {
-                    // Continuation lines align under the text, not the glyph.
-                    let pad = " ".repeat(e.glyph.chars().count() + 2);
-                    spans.push(Span::styled(pad, Style::new()));
+
+            if e.markdown {
+                // Render markdown with the terminal's colour capability,
+                // then convert each ANSI line into ratatui Spans.
+                let ansi_lines =
+                    md::render_with_mode(&e.text, t, text_width.max(8), crate::color::color_mode());
+                for (i, ansi_line) in ansi_lines.iter().enumerate() {
+                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    if i == 0 {
+                        spans.push(Span::styled(
+                            format!("{glyph}  ", glyph = e.glyph),
+                            t.style_bold(e.fg),
+                        ));
+                    } else {
+                        let pad = " ".repeat(e.glyph.chars().count() + 2);
+                        spans.push(Span::styled(pad, Style::new()));
+                    }
+                    spans.extend(parse_ansi_line(ansi_line));
+                    lines.push(Line::from(spans));
                 }
-                let mut style = t.style(e.fg);
-                if e.bold {
-                    style = style.add_modifier(Modifier::BOLD);
+            } else {
+                let wrapped = wrap_to_width(&e.text, text_width.max(8));
+                for (i, chunk) in wrapped.iter().enumerate() {
+                    let mut spans = Vec::new();
+                    if i == 0 {
+                        spans.push(Span::styled(
+                            format!("{glyph}  ", glyph = e.glyph),
+                            if e.bold {
+                                t.style_bold(e.fg)
+                            } else {
+                                t.style(e.fg)
+                            },
+                        ));
+                    } else {
+                        let pad = " ".repeat(e.glyph.chars().count() + 2);
+                        spans.push(Span::styled(pad, Style::new()));
+                    }
+                    let mut style = t.style(e.fg);
+                    if e.bold {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    if e.streaming {
+                        style = style.add_modifier(Modifier::DIM);
+                    }
+                    spans.push(Span::styled(chunk.clone(), style));
+                    lines.push(Line::from(spans));
                 }
-                if e.streaming {
-                    style = style.add_modifier(Modifier::DIM);
-                }
-                spans.push(Span::styled(chunk.clone(), style));
-                lines.push(Line::from(spans));
             }
             // One blank line between entries for readability.
             lines.push(Line::from(Span::styled(
@@ -1814,6 +1953,35 @@ mod tests {
         assert!(text.contains("fix the login bug"), "{text}");
         assert!(text.contains("read_file"), "{text}");
         assert!(text.contains("null check"), "{text}");
+    }
+
+    #[test]
+    fn markdown_assistant_message_renders_distinct_structure() {
+        let mut app = test_app();
+        let md = r#"## Summary
+
+Here is some **bold** text and a list:
+
+- first item
+- second item
+
+```rust
+fn hello() {
+    println!("world");
+}
+```"#;
+        app.push_event(&Event::AssistantMessage {
+            agent: "master".into(),
+            text: md.into(),
+        });
+        // The entry should be flagged as markdown.
+        let entry = app.entries.iter().find(|e| e.text == md).unwrap();
+        assert!(entry.markdown, "assistant message must be markdown-flagged");
+        // Render and check that structural glyphs appear in the output.
+        let text = visible_text(&app, 80, 40);
+        // Heading bar and code-fence bar are markdown-specific decorations.
+        assert!(text.contains("▌"), "heading bar should be visible: {text}");
+        assert!(text.contains("│"), "code fence bar should be visible: {text}");
     }
 
     #[test]
