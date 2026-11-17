@@ -265,9 +265,7 @@ impl Composer {
             return None;
         }
         let kb = byte_len as f64 / 1024.0;
-        Some(format!(
-            "[Pasted text · {line_count} lines · {kb:.1} KB]"
-        ))
+        Some(format!("[Pasted text · {line_count} lines · {kb:.1} KB]"))
     }
 
     /// True when the composer content is large enough that a compact
@@ -461,7 +459,10 @@ mod tests {
     #[test]
     fn placeholder_shown_for_many_lines() {
         let mut c = Composer::new();
-        let text = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let text = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         c.insert_paste(&text);
         let ph = c.paste_placeholder().unwrap();
         assert!(ph.contains("100 lines"), "got: {ph}");

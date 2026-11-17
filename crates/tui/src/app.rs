@@ -130,7 +130,7 @@ fn parse_ansi_line(line: &str) -> Vec<Span<'static>> {
             }
             // Parse SGR parameters.
             let mut params: String = String::new();
-            while let Some(pc) = chars.next() {
+            for pc in chars.by_ref() {
                 if pc == 'm' {
                     break;
                 }
@@ -151,8 +151,7 @@ fn parse_ansi_line(line: &str) -> Vec<Span<'static>> {
                     Ok(3) => current_style = current_style.add_modifier(Modifier::ITALIC),
                     Ok(4) => current_style = current_style.add_modifier(Modifier::UNDERLINED),
                     Ok(7) => current_style = current_style.add_modifier(Modifier::REVERSED),
-                    Ok(9) => current_style =
-                        current_style.add_modifier(Modifier::CROSSED_OUT),
+                    Ok(9) => current_style = current_style.add_modifier(Modifier::CROSSED_OUT),
                     Ok(n) if (30..=37).contains(&n) => {
                         let idx = (n - 30) as u8;
                         current_style = current_style.fg(ansi16_to_color(idx));
@@ -168,16 +167,13 @@ fn parse_ansi_line(line: &str) -> Vec<Span<'static>> {
                                 current_style = current_style.fg(Color::Indexed(n));
                             }
                             i += 2;
-                        } else if parts.get(i + 1) == Some(&"2")
-                            && i + 4 < parts.len()
-                        {
+                        } else if parts.get(i + 1) == Some(&"2") && i + 4 < parts.len() {
                             if let (Ok(r), Ok(g), Ok(b)) = (
                                 parts[i + 2].parse::<u8>(),
                                 parts[i + 3].parse::<u8>(),
                                 parts[i + 4].parse::<u8>(),
                             ) {
-                                current_style =
-                                    current_style.fg(Color::Rgb(r, g, b));
+                                current_style = current_style.fg(Color::Rgb(r, g, b));
                             }
                             i += 4;
                         }
@@ -219,11 +215,45 @@ fn ansi16_to_color(idx: u8) -> Color {
     }
 }
 
+/// Format a structured provider error card (markdown) for the transcript.
+/// Maps `error_class` to a category label and appends recovery hints.
+fn format_error_card(error: &str, error_class: &str, model: &str) -> String {
+    let (category, action) = match error_class {
+        "connection" => ("Connection", "Check your endpoint URL and network. Run `/model test` to verify."),
+        "model" => ("Model / API", "The provider rejected the request. Check your API key with `/model test` or reconfigure via `/setup`."),
+        "invalid_response" => ("Response Parse", "The provider returned an unexpected payload. Retry the request or check for a provider-side issue."),
+        "context_length" => ("Context Limit", "The prompt exceeded the model's context window. Shorten the input or use `/model` to switch to a larger model."),
+        "rate_limited" => ("Rate Limit", "Too many requests. Wait a moment and retry, or check your provider's quota."),
+        "timeout" => ("Timeout", "The request timed out. Check your network or increase the timeout in config."),
+        "permission" => ("Permission", "The operation was denied by the current mode's permission policy. Switch modes or adjust permissions."),
+        "tool" => ("Tool Error", "A tool invocation failed. Review the tool output above for details."),
+        "io" => ("I/O", "A filesystem or I/O error occurred."),
+        "session" => ("Session", "A session state error occurred. Try starting a new session."),
+        "config" => ("Configuration", "A configuration value is missing or invalid. Run `/setup` to fix."),
+        "vault" => ("Vault", "An Obsidian vault operation failed."),
+        "cancelled" => ("Cancelled", "The request was cancelled by the user."),
+        _ => ("Unknown", "An unexpected error occurred. See the log for details."),
+    };
+    format!(
+        "**PROVIDER ERROR**\n\n\
+         **Category:** {category}  \n\
+         **Model:** {model}  \n\
+         **Detail:** {error}\n\n\
+         **Suggested action:** {action}"
+    )
+}
+
 /// Walk up to `limit` files/dirs under `root` (skipping common noise
 /// directories) and return their relative paths as `String`s.
 fn walk_files_for_suggestions(root: &std::path::Path, limit: usize) -> Vec<String> {
     const SKIP: &[&str] = &[
-        ".git", "target", "node_modules", ".idea", ".vscode", "__pycache__", ".qwen",
+        ".git",
+        "target",
+        "node_modules",
+        ".idea",
+        ".vscode",
+        "__pycache__",
+        ".qwen",
     ];
     let mut out: Vec<String> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -453,6 +483,56 @@ impl App {
         self.scroll_back = 0;
     }
 
+    /// Seed the transcript with the branded welcome screen: the official
+    /// REQUIEM ASCII banner, a description block, and command hints.
+    /// Called once at session start when there is no prior conversation.
+    pub fn push_welcome(&mut self, project_dir: &str) {
+        use crate::banner;
+        let t = &self.theme;
+        // Banner lines, each painted in the accent token.
+        let banner_lines: Vec<String> = banner::BANNER
+            .lines()
+            .map(|l| t.paint(Token::Accent, l))
+            .collect();
+        // Join with newlines — the transcript renderer will wrap if needed.
+        let banner_text = banner_lines.join("\n");
+        self.entries.push(TranscriptEntry {
+            glyph: " ",
+            text: banner_text,
+            fg: Token::Accent,
+            bold: true,
+            indent: 0,
+            streaming: false,
+            markdown: false,
+        });
+        // Description block.
+        let desc = format!(
+            "REQUIEM — MULTI-AGENT AI ENVIRONMENT\n\n\
+             Autonomous coding and knowledge orchestration\n\
+             Model: {}  ·  Project: {}  ·  Mode: /{}\n\n\
+             Start by describing a task, or use a command:\n\
+             /help       Available commands\n\
+             /dashboard  Live agent & task view\n\
+             /model      Model configuration\n\
+             /setup      Reconfigure API key & endpoint",
+            self.model, project_dir, self.mode
+        );
+        let desc_lines: Vec<String> = desc
+            .lines()
+            .map(|l| t.paint(Token::TextSecondary, l))
+            .collect();
+        self.entries.push(TranscriptEntry {
+            glyph: " ",
+            text: desc_lines.join("\n"),
+            fg: Token::TextSecondary,
+            bold: false,
+            indent: 0,
+            streaming: false,
+            markdown: false,
+        });
+        self.scroll_back = 0;
+    }
+
     // ── Event consumption ────────────────────────────────────────
 
     /// Mark whether a run is in flight (used when a run crashes without
@@ -664,7 +744,11 @@ impl App {
                 self.active_task = None;
             }
             Event::RunFailed {
-                agent, task, error, ..
+                agent,
+                task,
+                error,
+                error_class,
+                ..
             } => {
                 self.running = false;
                 if let Some(i) = self.dash.agent_index(agent) {
@@ -673,11 +757,11 @@ impl App {
                 if let Some(i) = self.dash.task_index(task.as_str()) {
                     self.dash.tasks[i].status = TaskStatus::Failed;
                 }
-                self.entries.push(TranscriptEntry::new(
-                    "✗",
-                    format!("task failed: {error}"),
-                    Token::Error,
-                ));
+                // Render a structured error card in the transcript.
+                let card = format_error_card(error, error_class, &self.model);
+                let mut e = TranscriptEntry::new("✗", card, Token::Error);
+                e.markdown = true;
+                self.entries.push(e);
                 self.active_task = None;
             }
             Event::RunCancelled { agent, task } => {
@@ -844,8 +928,7 @@ impl App {
             }
             KeyCode::Tab => {
                 if !self.suggestions.is_empty() {
-                    self.suggestion_idx =
-                        (self.suggestion_idx + 1) % self.suggestions.len();
+                    self.suggestion_idx = (self.suggestion_idx + 1) % self.suggestions.len();
                     let chosen = self.suggestions[self.suggestion_idx].clone();
                     // Detect whether this is an @-file completion or a /cmd.
                     let trimmed = self.composer.text.trim_start();
@@ -967,24 +1050,22 @@ impl App {
         self.suggestions.clear();
         self.suggestion_idx = 0;
         let trimmed = self.composer.text.trim_start();
-        if trimmed.starts_with('@') {
+        if let Some(at) = trimmed.strip_prefix('@') {
             // File autocomplete: fuzzy-search files under workdir.
-            let query = &trimmed[1..].to_lowercase();
+            let query = at.to_lowercase();
             let root = match &self.workdir {
                 Some(p) => p.clone(),
                 None => return,
             };
             let files = walk_files_for_suggestions(&root, 200);
-            let mut matches: Vec<String> = files
+            self.suggestions = files
                 .into_iter()
                 .filter(|p| {
                     let lower = p.to_lowercase();
-                    query.is_empty() || lower.contains(query)
+                    query.is_empty() || lower.contains(&query)
                 })
                 .take(6)
                 .collect();
-            matches.sort();
-            self.suggestions = matches;
             return;
         }
         if !trimmed.starts_with('/') {
@@ -1052,10 +1133,7 @@ impl App {
         let left_spans = vec![
             Span::styled("requiem", t.style_bold(Token::Text)),
             Span::styled("  ", Style::new()),
-            Span::styled(
-                format!("[{:>4}]", self.mode),
-                t.style_bold(Token::Accent),
-            ),
+            Span::styled(format!("[{:>4}]", self.mode), t.style_bold(Token::Accent)),
         ];
 
         // Center: model name (only when wide enough).
@@ -1159,31 +1237,56 @@ impl App {
                     lines.push(Line::from(spans));
                 }
             } else {
-                let wrapped = wrap_to_width(&e.text, text_width.max(8));
-                for (i, chunk) in wrapped.iter().enumerate() {
-                    let mut spans = Vec::new();
-                    if i == 0 {
-                        spans.push(Span::styled(
-                            format!("{glyph}  ", glyph = e.glyph),
-                            if e.bold {
-                                t.style_bold(e.fg)
-                            } else {
-                                t.style(e.fg)
-                            },
-                        ));
-                    } else {
-                        let pad = " ".repeat(e.glyph.chars().count() + 2);
-                        spans.push(Span::styled(pad, Style::new()));
+                // Pre-styled (ANSI) or alignment-sensitive multi-line text
+                // (banner, welcome block): emit each line verbatim, no wrap.
+                let is_prestyled = e.text.contains("\x1b[");
+                let is_align_sensitive = is_prestyled || (e.indent == 0 && e.text.contains('\n'));
+                if is_align_sensitive {
+                    for (i, raw_line) in e.text.lines().enumerate() {
+                        let mut spans: Vec<Span<'static>> = Vec::new();
+                        if i == 0 {
+                            spans.push(Span::styled(
+                                format!("{glyph}  ", glyph = e.glyph),
+                                if e.bold {
+                                    t.style_bold(e.fg)
+                                } else {
+                                    t.style(e.fg)
+                                },
+                            ));
+                        } else {
+                            let pad = " ".repeat(e.glyph.chars().count() + 2);
+                            spans.push(Span::styled(pad, Style::new()));
+                        }
+                        spans.extend(parse_ansi_line(raw_line));
+                        lines.push(Line::from(spans));
                     }
-                    let mut style = t.style(e.fg);
-                    if e.bold {
-                        style = style.add_modifier(Modifier::BOLD);
+                } else {
+                    let wrapped = wrap_to_width(&e.text, text_width.max(8));
+                    for (i, chunk) in wrapped.iter().enumerate() {
+                        let mut spans = Vec::new();
+                        if i == 0 {
+                            spans.push(Span::styled(
+                                format!("{glyph}  ", glyph = e.glyph),
+                                if e.bold {
+                                    t.style_bold(e.fg)
+                                } else {
+                                    t.style(e.fg)
+                                },
+                            ));
+                        } else {
+                            let pad = " ".repeat(e.glyph.chars().count() + 2);
+                            spans.push(Span::styled(pad, Style::new()));
+                        }
+                        let mut style = t.style(e.fg);
+                        if e.bold {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        if e.streaming {
+                            style = style.add_modifier(Modifier::DIM);
+                        }
+                        spans.push(Span::styled(chunk.clone(), style));
+                        lines.push(Line::from(spans));
                     }
-                    if e.streaming {
-                        style = style.add_modifier(Modifier::DIM);
-                    }
-                    spans.push(Span::styled(chunk.clone(), style));
-                    lines.push(Line::from(spans));
                 }
             }
             // One blank line between entries for readability.
@@ -1204,11 +1307,8 @@ impl App {
         // placeholder instead of the full text. The content remains intact
         // in `composer.text` and is submitted exactly once.
         if let Some(placeholder) = self.composer.paste_placeholder() {
-            let areas = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
+            let areas =
+                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
             let text_area = areas[0];
             let hint_area = areas[1];
 
@@ -1242,10 +1342,8 @@ impl App {
         // Find which line the cursor is on and scroll so it's visible.
         let cursor_line = self.composer_line_index();
         let mut start = 0;
-        if total > text_rows {
-            if cursor_line >= start + text_rows {
-                start = cursor_line - text_rows + 1;
-            }
+        if total > text_rows && cursor_line >= start + text_rows {
+            start = cursor_line - text_rows + 1;
         }
         let end = (start + text_rows).min(total);
 
@@ -1265,7 +1363,10 @@ impl App {
                 let col = self.composer_cursor_col();
                 let chars: Vec<char> = line_text.chars().collect();
                 let before: String = chars[..col.min(chars.len())].iter().collect();
-                let at: String = chars.get(col.min(chars.len())).map(|c| c.to_string()).unwrap_or_default();
+                let at: String = chars
+                    .get(col.min(chars.len()))
+                    .map(|c| c.to_string())
+                    .unwrap_or_default();
                 let after: String = chars[(col + 1).min(chars.len())..].iter().collect();
 
                 let mut spans = vec![prefix];
@@ -1273,14 +1374,12 @@ impl App {
                     spans.push(Span::styled(before, t.style(Token::Text)));
                     spans.push(Span::styled(
                         at,
-                        t.style(Token::Background).bg(t.ratatui_color(Token::Accent)),
+                        t.style(Token::Background)
+                            .bg(t.ratatui_color(Token::Accent)),
                     ));
                     spans.push(Span::styled(after, t.style(Token::Text)));
                 } else {
-                    spans.push(Span::styled(
-                        format!("{before} "),
-                        t.style(Token::Text),
-                    ));
+                    spans.push(Span::styled(format!("{before} "), t.style(Token::Text)));
                 }
                 lines.push(Line::from(spans));
             } else {
@@ -1292,11 +1391,9 @@ impl App {
         }
 
         // Render text lines + hint row.
-        let [text_area, hint_area] = Layout::vertical([
-            Constraint::Length(text_rows as u16),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        let [text_area, hint_area] =
+            Layout::vertical([Constraint::Length(text_rows as u16), Constraint::Length(1)])
+                .areas(area);
 
         frame.render_widget(Paragraph::new(lines), text_area);
 
@@ -1352,10 +1449,7 @@ impl App {
                 let desc = hint_text(s, &self.hints);
                 if i == self.suggestion_idx && !desc.is_empty() {
                     spans.push(Span::styled(format!("/{s} "), style));
-                    spans.push(Span::styled(
-                        desc,
-                        t.style(Token::TextSecondary),
-                    ));
+                    spans.push(Span::styled(desc, t.style(Token::TextSecondary)));
                     spans.push(Span::styled(" ", Style::new()));
                 } else {
                     spans.push(Span::styled(format!("/{s} "), style));
@@ -1380,10 +1474,7 @@ impl App {
         } else {
             "  /help · /dashboard · @files · Enter send · Ctrl+C quit"
         };
-        vec![Span::styled(
-            default_hint,
-            t.style(Token::TextMuted),
-        )]
+        vec![Span::styled(default_hint, t.style(Token::TextMuted))]
     }
 
     /// (command, arg hints) when the input names a known command.
@@ -1406,10 +1497,7 @@ impl App {
 
         // Left: mode pill + token usage.
         let left_spans = vec![
-            Span::styled(
-                format!("[{:>4}]", self.mode),
-                t.style_bold(Token::Accent),
-            ),
+            Span::styled(format!("[{:>4}]", self.mode), t.style_bold(Token::Accent)),
             Span::styled(
                 format!(
                     "  {} in / {} out",
@@ -1447,8 +1535,10 @@ impl App {
                     ));
                 }
             } else if let Some(task) = self.active_task.as_deref() {
-                let short: String =
-                    task.chars().take(width.saturating_sub(50).max(10)).collect();
+                let short: String = task
+                    .chars()
+                    .take(width.saturating_sub(50).max(10))
+                    .collect();
                 center_spans.push(Span::styled(
                     format!("  {} ", spinner_glyph(self.started)),
                     t.style_bold(Token::Info),
@@ -1459,10 +1549,7 @@ impl App {
 
         // Right: context hint.
         let right_span = Span::styled(
-            format!(
-                "  Ctrl+C {}",
-                if self.running { "cancel" } else { "quit" }
-            ),
+            format!("  Ctrl+C {}", if self.running { "cancel" } else { "quit" }),
             t.style(Token::TextMuted),
         );
 
@@ -1942,12 +2029,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Byte offset of char index `idx` in `s` (panics never).
-#[cfg(test)]
-fn char_to_byte(s: &str, idx: usize) -> usize {
-    s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
-}
-
 /// Description text for a command name (from the injected hints).
 fn hint_text(name: &str, hints: &CommandHints) -> String {
     hints.descriptions.get(name).cloned().unwrap_or_default()
@@ -2016,6 +2097,37 @@ mod tests {
     }
 
     #[test]
+    fn welcome_screen_shows_banner_and_model_info() {
+        let mut app = test_app();
+        app.push_welcome("/home/user/project");
+        let text = visible_text(&app, 120, 40);
+        // Banner must be visible (its distinctive characters).
+        assert!(text.contains("8888"), "banner art visible: {text}");
+        // Model and project info.
+        assert!(text.contains("test-model"), "model shown: {text}");
+        assert!(
+            text.contains("/home/user/project"),
+            "project dir shown: {text}"
+        );
+        // Command suggestions.
+        assert!(text.contains("/help"), "command hints: {text}");
+    }
+
+    #[test]
+    fn welcome_screen_does_not_wrap_banner_art() {
+        let mut app = test_app();
+        app.push_welcome(".");
+        // At 80 cols the banner (which is ~120 chars wide) would be clipped
+        // but must NOT be re-wrapped / mangled — each original line stays intact.
+        let buf = render_to_string(&app, 80, 50);
+        // The banner's first line starts with dots and spaces.
+        assert!(
+            buf.lines().any(|l| l.contains("..")),
+            "banner first-line fragment visible: {buf}"
+        );
+    }
+
+    #[test]
     fn transcript_renders_user_and_agent_lines() {
         let mut app = test_app();
         app.push_user_line("fix the login bug");
@@ -2074,7 +2186,10 @@ fn hello() {
         let text = visible_text(&app, 80, 40);
         // Heading bar and code-fence bar are markdown-specific decorations.
         assert!(text.contains("▌"), "heading bar should be visible: {text}");
-        assert!(text.contains("│"), "code fence bar should be visible: {text}");
+        assert!(
+            text.contains("│"),
+            "code fence bar should be visible: {text}"
+        );
     }
 
     #[test]
@@ -2281,7 +2396,10 @@ fn hello() {
         for c in "@ma".chars() {
             app.handle_key(test_key(KeyCode::Char(c)));
         }
-        assert!(!app.suggestions.is_empty(), "suggestions should be non-empty");
+        assert!(
+            !app.suggestions.is_empty(),
+            "suggestions should be non-empty"
+        );
         assert!(
             app.suggestions.iter().any(|s| s.contains("main.rs")),
             "main.rs in suggestions: {:?}",
@@ -2332,7 +2450,10 @@ fn hello() {
         }
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
         let action = app.handle_key(key);
-        assert!(matches!(action, UiAction::None), "Shift+Enter must not submit");
+        assert!(
+            matches!(action, UiAction::None),
+            "Shift+Enter must not submit"
+        );
         assert_eq!(app.composer.text, "abc\n");
     }
 
@@ -2393,7 +2514,10 @@ fn hello() {
         app.handle_key(test_ctrl('z'));
         assert_eq!(app.composer.text, "h", "undo removes 'i'");
         // Redo
-        let redo_key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let redo_key = KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
         app.handle_key(redo_key);
         assert_eq!(app.composer.text, "hi", "redo restores 'i'");
     }
@@ -2432,7 +2556,10 @@ fn hello() {
             text: "Done. The null-check was missing on line 42.".into(),
         });
         let buf = render_to_string(&app, 80, 24);
-        assert!(buf.contains("fix the login"), "small: user line visible: {buf}");
+        assert!(
+            buf.contains("fix the login"),
+            "small: user line visible: {buf}"
+        );
         assert!(buf.contains("Done"), "small: response visible");
     }
 
@@ -2445,7 +2572,10 @@ fn hello() {
             text: "The scheduler uses a topological sort.".into(),
         });
         let buf = render_to_string(&app, 120, 40);
-        assert!(buf.contains("explain the architecture"), "standard: user line");
+        assert!(
+            buf.contains("explain the architecture"),
+            "standard: user line"
+        );
         assert!(buf.contains("topological sort"), "standard: response");
         assert!(buf.contains("Ctrl+C"), "standard: footer hint");
     }
@@ -2483,7 +2613,9 @@ fn hello() {
             app.handle_key(test_key(KeyCode::Char(c)));
         }
         assert!(
-            app.suggestions.iter().any(|s| s.to_lowercase().contains("cargo")),
+            app.suggestions
+                .iter()
+                .any(|s| s.to_lowercase().contains("cargo")),
             "fuzzy match finds Cargo.toml: {:?}",
             app.suggestions
         );
@@ -2648,7 +2780,10 @@ fn hello() {
         // The footer occupies row 29 (chars 2900..3000).
         let buf = render_to_string(&app, 100, 30);
         // Row 0: must contain the wordmark and no border glyph.
-        let row0 = buf.get(0..100).unwrap_or(&buf[..100.min(buf.len())]).to_string();
+        let row0 = buf
+            .get(0..100)
+            .unwrap_or(&buf[..100.min(buf.len())])
+            .to_string();
         assert!(row0.contains("requiem"), "header row: {row0:?}");
         assert!(!row0.contains('─'), "border glyph on header row: {row0:?}");
         // Row 29: footer — must contain Ctrl+C hint, no border glyph.
@@ -2659,7 +2794,10 @@ fn hello() {
             footer.contains("Ctrl+C") || footer.contains("[code]"),
             "footer row: {footer:?}"
         );
-        assert!(!footer.contains('─'), "border glyph on footer row: {footer:?}");
+        assert!(
+            !footer.contains('─'),
+            "border glyph on footer row: {footer:?}"
+        );
     }
 
     #[test]
@@ -2683,18 +2821,27 @@ fn hello() {
         let app = test_app();
         let buf = render_to_string(&app, 80, 30);
         // Row 0 (chars 0..80): header with wordmark.
-        let r0 = buf.get(0..80).unwrap_or(&buf[..80.min(buf.len())]).to_string();
+        let r0 = buf
+            .get(0..80)
+            .unwrap_or(&buf[..80.min(buf.len())])
+            .to_string();
         assert!(r0.contains("requiem"), "header: {r0:?}");
         // Row 28 (chars 28*80..29*80): input prompt '>' (second-to-last row).
         let r28_start = 28 * 80;
         let r28_end = (29 * 80).min(buf.len());
         let r28 = buf.get(r28_start..r28_end).unwrap_or("").to_string();
-        assert!(r28.contains(">") || r28.contains("/help"), "input row: {r28:?}");
+        assert!(
+            r28.contains(">") || r28.contains("/help"),
+            "input row: {r28:?}"
+        );
         // Row 29 (chars 29*80..30*80): footer with mode + Ctrl+C.
         let r29_start = 29 * 80;
         let r29_end = (30 * 80).min(buf.len());
         let r29 = buf.get(r29_start..r29_end).unwrap_or("").to_string();
-        assert!(r29.contains("[code]") || r29.contains("Ctrl+C"), "footer: {r29:?}");
+        assert!(
+            r29.contains("[code]") || r29.contains("Ctrl+C"),
+            "footer: {r29:?}"
+        );
     }
 
     // ── Stage 8: paste tests (22 mandated) ───────────────────────
@@ -2727,10 +2874,7 @@ fn hello() {
         );
         // Each original line must appear in order.
         for line in expected.lines() {
-            assert!(
-                app.composer.text.contains(line),
-                "missing line: {line}"
-            );
+            assert!(app.composer.text.contains(line), "missing line: {line}");
         }
     }
 
@@ -2830,7 +2974,10 @@ fn hello() {
         // Force a large paste to trigger the placeholder.
         let large: String = RUST_CODE_BLOCK.repeat(10);
         app.paste_input(&large);
-        let ph = app.composer.paste_placeholder().expect("placeholder expected");
+        let ph = app
+            .composer
+            .paste_placeholder()
+            .expect("placeholder expected");
         assert!(ph.contains("lines"), "placeholder: {ph}");
         assert!(ph.contains("KB"), "placeholder: {ph}");
     }
@@ -2968,10 +3115,7 @@ fn hello() {
         app.paste_input(&large);
         // Render at 100x30 — the placeholder line must be visible.
         let text = visible_text(&app, 100, 30);
-        assert!(
-            text.contains("Pasted text"),
-            "placeholder visible: {text}"
-        );
+        assert!(text.contains("Pasted text"), "placeholder visible: {text}");
         assert!(
             text.contains("lines"),
             "placeholder shows line count: {text}"

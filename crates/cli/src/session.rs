@@ -311,10 +311,7 @@ async fn run_fullscreen(
     // single CEvent::Paste instead of a flood of keypresses. Safe to enable
     // even if the terminal doesn't support it — old terminals just won't
     // send paste events.
-    crossterm::execute!(
-        stdout,
-        crossterm::event::EnableBracketedPaste
-    )?;
+    crossterm::execute!(stdout, crossterm::event::EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -335,20 +332,25 @@ async fn run_fullscreen(
     );
     app.workdir = std::env::current_dir().ok();
     app.set_mode(config.default_mode.as_str());
-    app.push_system(
-        "type a task, or /help for commands · /dashboard for the live view",
-        NoticeLevel::Info,
-    );
-    for rec in &prior {
-        let mark = if rec.success { "✓" } else { "✗" };
-        app.push_system(
-            &format!("{mark} (resumed) {}", rec.task_description),
-            if rec.success {
-                NoticeLevel::Success
-            } else {
-                NoticeLevel::Error
-            },
-        );
+    if prior.is_empty() {
+        // Fresh session: show the branded welcome screen with the ASCII banner.
+        let proj_dir = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into());
+        app.push_welcome(&proj_dir);
+    } else {
+        // Resumed session: restore the conversation, not the welcome.
+        for rec in &prior {
+            let mark = if rec.success { "✓" } else { "✗" };
+            app.push_system(
+                &format!("{mark} (resumed) {}", rec.task_description),
+                if rec.success {
+                    NoticeLevel::Success
+                } else {
+                    NoticeLevel::Error
+                },
+            );
+        }
     }
 
     let mut history = InputHistory::load();
@@ -490,19 +492,13 @@ async fn run_fullscreen(
             {
                 match clipboard::read_clipboard() {
                     Some(text) if !text.is_empty() => {
-                        let normalized =
-                            requiem_tui::composer::normalize_line_endings(&text);
-                        if !normalized.is_empty()
-                            && !app.composer_text_ends_with(&normalized)
-                        {
+                        let normalized = requiem_tui::composer::normalize_line_endings(&text);
+                        if !normalized.is_empty() && !app.composer_text_ends_with(&normalized) {
                             app.paste_input(&normalized);
                         }
                     }
                     _ => {
-                        app.push_system(
-                            "clipboard is empty or unavailable",
-                            NoticeLevel::Warning,
-                        );
+                        app.push_system("clipboard is empty or unavailable", NoticeLevel::Warning);
                     }
                 }
                 continue;
@@ -547,6 +543,10 @@ async fn run_fullscreen(
                             app.workdir = std::env::current_dir().ok();
                             app.set_mode(cfg.default_mode.as_str());
                             app.set_history(history.entries().to_vec());
+                            let proj_dir = std::env::current_dir()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|_| ".".into());
+                            app.push_welcome(&proj_dir);
                             app.push_system(
                                 "setup complete — new config is live",
                                 NoticeLevel::Success,

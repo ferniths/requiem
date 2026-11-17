@@ -171,10 +171,7 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    fn serialize_as_function<S: serde::Serializer>(
-        &self,
-        ser: S,
-    ) -> Result<S::Ok, S::Error> {
+    fn serialize_as_function<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut s = ser.serialize_struct("ToolCall", 2)?;
         s.serialize_field("id", &self.id)?;
@@ -186,8 +183,7 @@ impl ToolCall {
         // (including the 9router proxy) can deserialize it.
         let args_str = match &self.arguments {
             serde_json::Value::String(s) => s.clone(),
-            other => serde_json::to_string(other)
-                .unwrap_or_else(|_| "{}".to_string()),
+            other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
         };
         f.insert("arguments".into(), serde_json::Value::String(args_str));
         s.serialize_field("function", &f)?;
@@ -222,10 +218,8 @@ impl ToolCall {
                             match func.get("arguments") {
                                 Some(serde_json::Value::String(s)) => {
                                     // OpenAI carries arguments as a JSON string.
-                                    arguments =
-                                        serde_json::from_str(s).unwrap_or(serde_json::Value::String(
-                                            s.clone(),
-                                        ));
+                                    arguments = serde_json::from_str(s)
+                                        .unwrap_or(serde_json::Value::String(s.clone()));
                                 }
                                 Some(v) => arguments = v.clone(),
                                 None => arguments = serde_json::Value::String(String::new()),

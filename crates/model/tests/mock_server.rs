@@ -558,8 +558,7 @@ async fn outgoing_tool_calls_use_nested_function_shape() {
     client.chat(req).await.expect("chat");
 
     let last = server.last_request().expect("recorded request");
-    let json: serde_json::Value =
-        serde_json::from_str(&last.body).expect("body is valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&last.body).expect("body is valid JSON");
     let messages = json["messages"].as_array().expect("messages array");
 
     // messages[0] is the assistant message with the tool call.
@@ -573,7 +572,9 @@ async fn outgoing_tool_calls_use_nested_function_shape() {
     assert_eq!(tc["id"], "call_1");
     assert_eq!(tc["function"]["name"], "read_file");
     // arguments is a JSON-encoded string per the OpenAI spec.
-    let args_str = tc["function"]["arguments"].as_str().expect("arguments is a string");
+    let args_str = tc["function"]["arguments"]
+        .as_str()
+        .expect("arguments is a string");
     let parsed: serde_json::Value = serde_json::from_str(args_str).unwrap();
     assert_eq!(parsed, serde_json::json!({"path": "main.rs"}));
 }
@@ -611,8 +612,7 @@ async fn outgoing_tools_use_nested_function_shape() {
     client.chat(req).await.expect("chat");
 
     let last = server.last_request().expect("recorded request");
-    let json: serde_json::Value =
-        serde_json::from_str(&last.body).expect("body is valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&last.body).expect("body is valid JSON");
     let tool = &json["tools"][0];
     assert_eq!(
         tool.get("type").and_then(|v| v.as_str()),
