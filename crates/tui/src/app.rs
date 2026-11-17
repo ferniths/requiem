@@ -261,16 +261,18 @@ impl App {
     }
 
     /// Insert a full pasted text blob (bracketed-paste delivery) into the
-    /// input buffer at the cursor position. Newlines are preserved. The
-    /// input is NOT submitted — the user still presses Enter to send.
-    /// Suggestions are refreshed to reflect the new input content.
+    /// input buffer at the cursor position. Newlines are collapsed to
+    /// spaces so the single-line input stays clean.  The input is NOT
+    /// submitted — the user still presses Enter to send.  Suggestions are
+    /// refreshed to reflect the new input content.
     pub fn paste_input(&mut self, text: &str) {
         if self.cursor > self.input.chars().count() {
             self.cursor = self.input.chars().count();
         }
+        let flat: String = text.replace('\n', " ");
         let byte = char_to_byte(&self.input, self.cursor);
-        self.input.insert_str(byte, text);
-        self.cursor = byte + text.chars().count();
+        self.input.insert_str(byte, &flat);
+        self.cursor = byte + flat.chars().count();
         self.refresh_suggestions();
     }
 
@@ -630,6 +632,20 @@ impl App {
             }
             KeyCode::Enter => {
                 let line = self.input.trim().to_string();
+                // If the input still contains embedded newlines, it is a
+                // multi-line paste that was not delivered as a single
+                // bracketed-paste event (terminal without bracketed-paste
+                // support, or a keypress flood).  Collapse the newlines to
+                // spaces so the whole blob stays in the buffer as a single
+                // logical line; do NOT submit yet.
+                if self.input.contains('\n') {
+                    let collapsed: String = self.input.replace('\n', " ");
+                    self.cursor = 0;
+                    self.input = collapsed;
+                    self.cursor = 0;
+                    self.refresh_suggestions();
+                    return UiAction::None;
+                }
                 self.input.clear();
                 self.cursor = 0;
                 self.suggestions.clear();
@@ -1952,11 +1968,10 @@ mod tests {
         app.input = "abc".into();
         app.cursor = 1;
         app.paste_input("line1\nline2");
-        // "abc" → insert "line1\nline2" at char index 1 → "aline1\nline2bc"
-        // (newlines are preserved in the input buffer; the UI handles them)
-        assert_eq!(app.input, "aline1\nline2bc");
+        // "abc" → insert "line1 line2" (newlines→spaces) at char index 1
+        assert_eq!(app.input, "aline1 line2bc");
         // cursor is right after the pasted text (1 + 11 chars)
-        let pasted_len = "line1\nline2".chars().count();
+        let pasted_len = "line1 line2".chars().count();
         assert_eq!(app.cursor, 1 + pasted_len);
     }
 
@@ -1966,7 +1981,8 @@ mod tests {
         app.paste_input("hello\nworld");
         // No transcript entry was pushed — paste does not submit.
         assert!(app.entries.is_empty());
-        assert_eq!(app.input, "hello\nworld");
+        // Newlines collapsed to spaces.
+        assert_eq!(app.input, "hello world");
     }
 
     #[test]
