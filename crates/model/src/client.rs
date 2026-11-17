@@ -114,7 +114,7 @@ impl ModelClient {
             match self.do_chat(req).await {
                 Ok(r) => return Ok(r),
                 Err(e) if e.is_retryable() && self.retry.should_retry(attempt) => {
-                    let delay = self.retry.delay_for_attempt(attempt);
+                    let delay = crate::retry::delay_for_error(&self.retry, attempt, &e);
                     attempt += 1;
                     tracing::warn!(
                         "model request failed (retry {attempt}), backoff {delay:?}: {e}"
@@ -146,14 +146,15 @@ impl ModelClient {
     async fn do_chat(&self, req: &ChatRequest) -> Result<ModelResponse, RequiemError> {
         let body = req.to_json_bytes()?;
         let url = self.config.completions_url();
-        let http_req = self.authorize(
-            self.http
-                .post(&url)
-                .header(ACCEPT, HeaderValue::from_static("application/json"))
-                .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
-        )
-        .body(body)
-        .send();
+        let http_req = self
+            .authorize(
+                self.http
+                    .post(&url)
+                    .header(ACCEPT, HeaderValue::from_static("application/json"))
+                    .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            )
+            .body(body)
+            .send();
 
         let resp = match http_req.await {
             Ok(r) => r,
@@ -219,7 +220,7 @@ impl ModelClient {
             match self.connect_stream(&body).await {
                 Ok(r) => break r,
                 Err(e) if e.is_retryable() && self.retry.should_retry(attempt) => {
-                    let delay = self.retry.delay_for_attempt(attempt);
+                    let delay = crate::retry::delay_for_error(&self.retry, attempt, &e);
                     attempt += 1;
                     tracing::warn!("stream connect failed (retry {attempt}): {e}");
                     sleep(delay).await;
@@ -239,10 +240,7 @@ impl ModelClient {
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<TokenUsage> = None;
 
-        while let Some(chunk) = stream
-            .next()
-            .await
-        {
+        while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| RequiemError::Connection(e.to_string()))?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
             // SSE events are separated by newlines; a line may still be

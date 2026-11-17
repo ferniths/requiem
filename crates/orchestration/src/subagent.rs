@@ -35,9 +35,22 @@ pub fn spawn_subagent(
     spec: SubagentSpec,
     task_session: Id,
 ) -> Result<SubagentHandle, RequiemError> {
-    if parent.depth + 1 > MAX_DEPTH {
+    spawn_subagent_with_limit(parent, spec, task_session, MAX_DEPTH)
+}
+
+/// Spawn a subagent under a parent, with a configurable depth limit.
+///
+/// Use this variant when the limit comes from user configuration
+/// (`Config.max_agent_depth`) rather than the compile-time default.
+pub fn spawn_subagent_with_limit(
+    parent: &Agent,
+    spec: SubagentSpec,
+    task_session: Id,
+    max_depth: u32,
+) -> Result<SubagentHandle, RequiemError> {
+    if parent.depth + 1 > max_depth {
         return Err(RequiemError::InvalidState(format!(
-            "cannot spawn subagent at depth {} (max {MAX_DEPTH})",
+            "cannot spawn subagent at depth {} (max {max_depth})",
             parent.depth + 1
         )));
     }

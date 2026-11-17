@@ -1,0 +1,226 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.45s
+     Running unittests src\main.rs (target\debug\deps\requiem-366add8a70138392.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_cli-484ac8f36cf62fc0.exe)
+
+running 2 tests
+test config::tests::default_config_has_reasonable_values ... ok
+test config::tests::to_model_config_resolves_api_key_from_env ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\requiem-c755c4ef19229ef0.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_context-b17e8cd30392fe86.exe)
+
+running 6 tests
+test budget::tests::empty_history_fits_any_budget ... ok
+test compress::tests::dedup_consecutive_identical ... ok
+test budget::tests::usage_fraction_monotonic ... ok
+test compress::tests::small_history_passes_through ... ok
+test budget::tests::large_history_exceeds_budget ... ok
+test compress::tests::over_budget_compresses_tool_results ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_core-9149fb094af7bbb7.exe)
+
+running 4 tests
+test task::tests::progress_is_fraction_of_terminal ... ok
+test task::tests::add_and_reevaluate_unlocks_dependents ... ok
+test task::tests::cancel_recursive_cancels_children ... ok
+test task::tests::topological_order_respects_dependencies ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_memory-db9c88fab4ac2015.exe)
+
+running 3 tests
+test session::tests::insert_and_query_roundtrip ... ok
+test session::tests::delete_session_removes_records ... ok
+test session::tests::token_totals_aggregate ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_model-656556d1de07e6ff.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\mock_server.rs (target\debug\deps\mock_server-495e146b9f3274b7.exe)
+
+running 4 tests
+test chat_returns_parsed_response ... ok
+test test_connection_returns_model_name ... ok
+test chat_with_tool_calls ... ok
+test stream_drain_returns_chunks ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_obsidian-c24555b58fa31034.exe)
+
+running 13 tests
+test wikilink::tests::extracts_plain_wikilink ... ok
+test wikilink::tests::extracts_wikilink_with_alias ... ok
+test wikilink::tests::extracts_multiple_wikilinks ... ok
+test vault::tests::read_nonexistent_errors ... ok
+test wikilink::tests::case_insensitive_resolution ... ok
+test wikilink::tests::unresolved_note_returns_none ... ok
+test wikilink::tests::resolves_existing_note ... ok
+test vault::tests::write_and_read_roundtrip ... ok
+test vault::tests::note_count_tracks_files ... ok
+test vault::tests::change_log_is_appended ... ok
+test audit::tests::finds_broken_links ... ok
+test audit::tests::finds_orphans ... ok
+test audit::tests::finds_duplicates ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_orchestration-ad41b1bf27202c91.exe)
+
+running 1 test
+test agent_runtime::tests::concurrent_runs_return_results_in_order ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.95s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_permissions-6a4dcad8be04174d.exe)
+
+running 4 tests
+test tests::ask_mode_denies_writes ... ok
+test tests::auto_mode_allows_all ... ok
+test tests::code_mode_allows_writes_and_git ... ok
+test tests::plan_mode_denies_mutation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_project-4c058091747679e3.exe)
+
+running 5 tests
+test tests::unknown_ecosystem ... ok
+test tests::detects_node_project ... ok
+test tests::detects_python_project ... ok
+test tests::detects_git_repo ... ok
+test tests::detects_cargo_project ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_tools-99e1a1f4ad3ae92c.exe)
+
+running 15 tests
+test git::tests::execute_rejects_missing_action ... ok
+test git::tests::execute_rejects_unknown_action ... ok
+test git::tests::commit_requires_message ... ok
+test git::tests::schema_is_valid_json ... ok
+test subagent::tests::execute_rejects_missing_args ... ok
+test subagent::tests::execute_rejects_unknown_role ... ok
+test subagent::tests::schema_is_valid_json ... ok
+test obsidian::tests::schema_is_valid_json ... ok
+test obsidian::tests::execute_rejects_missing_action ... ok
+test file_ops::tests::edit_not_found_errors ... ok
+test search::tests::grep_finds_pattern ... ok
+test file_ops::tests::edit_replaces_occurrence ... ok
+test file_ops::tests::write_then_read_roundtrip ... ok
+test obsidian::tests::write_then_list ... ok
+test search::tests::glob_finds_rs_files ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\requiem_tui-db972da97abcd8a6.exe)
+
+running 18 tests
+test banner::tests::banner_contains_requiem_glyphs ... ok
+test banner::tests::banner_starts_with_expected_prefix ... ok
+test banner::tests::banner_is_15_lines ... ok
+test banner::tests::render_banner_returns_non_empty ... ok
+test dashboard::tests::agent_row_new_has_empty_parent ... ok
+test dashboard::tests::progress_is_fraction ... ok
+test dashboard::tests::running_count_filters_correctly ... ok
+test dashboard::tests::total_tokens_sums_all_agents ... ok
+test dashboard::tests::plain_renderer_produes_readable_output ... ok
+test dashboard::tests::empty_state_renders_cleanly ... ok
+test dashboard::tests::themed_renderer_empty_state ... ok
+test dashboard::tests::themed_renderer_shows_tree ... ok
+test theme::tests::accent_bold_produces_ansi ... ok
+test theme::tests::all_themes_construct ... ok
+test theme::tests::default_theme_has_accent ... ok
+test theme::tests::status_token_maps_correctly ... ok
+test theme::tests::theme_from_name_falls_back_to_default ... ok
+test theme::tests::theme_names_listed ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_context
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_memory
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_model
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_obsidian
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_orchestration
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_permissions
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_project
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_tools
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests requiem_tui
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

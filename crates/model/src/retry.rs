@@ -10,6 +10,8 @@
 
 use std::time::Duration;
 
+use requiem_core::error::RequiemError;
+
 /// A retry configuration.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
@@ -67,5 +69,71 @@ pub fn from_max_retries(max_retries: u32) -> RetryPolicy {
     RetryPolicy {
         max_retries,
         ..Default::default()
+    }
+}
+
+/// Compute the backoff delay for a specific retryable error, honoring the
+/// server-reported `retry_after_ms` for rate-limit responses.
+///
+/// For `RateLimited` errors the server's `retry_after_ms` is used directly
+/// (clamped to `[base_delay_ms, max_delay_ms]`). For all other transient
+/// errors the standard exponential backoff schedule applies.
+pub fn delay_for_error(policy: &RetryPolicy, attempt: u32, err: &RequiemError) -> Duration {
+    match err {
+        RequiemError::RateLimited { retry_after_ms } => {
+            let requested = *retry_after_ms;
+            let base = policy.base_delay_ms;
+            let cap = policy.max_delay_ms;
+            let clamped = requested.clamp(base, cap);
+            Duration::from_millis(clamped)
+        }
+        _ => policy.delay_for_attempt(attempt),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limited_honors_server_backoff() {
+        let policy = RetryPolicy::default();
+        let err = RequiemError::RateLimited {
+            retry_after_ms: 5_000,
+        };
+        let delay = delay_for_error(&policy, 0, &err);
+        // 5000ms is within [500, 30000], so it should pass through unchanged.
+        assert_eq!(delay.as_millis(), 5_000);
+    }
+
+    #[test]
+    fn rate_limited_clamped_to_max() {
+        let policy = RetryPolicy::default();
+        let err = RequiemError::RateLimited {
+            retry_after_ms: 99_999,
+        };
+        let delay = delay_for_error(&policy, 0, &err);
+        assert_eq!(delay.as_millis(), 30_000);
+    }
+
+    #[test]
+    fn rate_limited_clamped_to_min() {
+        let policy = RetryPolicy::default();
+        let err = RequiemError::RateLimited { retry_after_ms: 10 };
+        let delay = delay_for_error(&policy, 0, &err);
+        assert_eq!(delay.as_millis(), 500);
+    }
+
+    #[test]
+    fn connection_error_uses_backoff_schedule() {
+        let policy = RetryPolicy::default();
+        let err = RequiemError::Connection("refused".into());
+        let delay0 = delay_for_error(&policy, 0, &err);
+        let delay1 = delay_for_error(&policy, 1, &err);
+        // Backoff grows: 500ms * 2^0 (with jitter ~[500,750]) < 500*2^1 (with jitter)
+        assert!(delay0 <= delay1 || delay0.as_millis() >= 500);
+        // First attempt base is 500ms; with jitter in [0.5,1.5] it's [250,750]
+        assert!(delay0.as_millis() >= 250);
+        assert!(delay0.as_millis() <= 750);
     }
 }

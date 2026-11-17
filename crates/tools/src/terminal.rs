@@ -117,22 +117,20 @@ impl Tool for TerminalTool {
             .spawn()
             .map_err(|e| crate::ToolError::Terminal(format!("failed to spawn: {e}")))?;
 
-        let output = match tokio::time::timeout(
-            Duration::from_millis(timeout_ms),
-            child.wait_with_output(),
-        )
-        .await
-        {
-            Ok(Ok(out)) => out,
-            Ok(Err(e)) => return Err(crate::ToolError::Terminal(e.to_string())),
-            Err(_) => {
-                // The timeout dropped the child (kill_on_drop ensures the
-                // process is terminated).
-                return Err(crate::ToolError::Terminal(format!(
-                    "command timed out after {timeout_ms} ms and was killed"
-                )));
-            }
-        };
+        let output =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
+                .await
+            {
+                Ok(Ok(out)) => out,
+                Ok(Err(e)) => return Err(crate::ToolError::Terminal(e.to_string())),
+                Err(_) => {
+                    // The timeout dropped the child (kill_on_drop ensures the
+                    // process is terminated).
+                    return Err(crate::ToolError::Terminal(format!(
+                        "command timed out after {timeout_ms} ms and was killed"
+                    )));
+                }
+            };
 
         let (stdout, stdout_truncated) = truncate_output(&String::from_utf8_lossy(&output.stdout));
         let (stderr, stderr_truncated) = truncate_output(&String::from_utf8_lossy(&output.stderr));
@@ -154,11 +152,7 @@ mod tests {
     #[tokio::test]
     async fn runs_simple_command() {
         let tool = TerminalTool;
-        let cmd = if cfg!(windows) {
-            "echo hello"
-        } else {
-            "echo hello"
-        };
+        let cmd = "echo hello";
         let result = tool
             .execute(&serde_json::json!({"command": cmd}))
             .await
@@ -171,11 +165,7 @@ mod tests {
     #[tokio::test]
     async fn captures_nonzero_exit() {
         let tool = TerminalTool;
-        let cmd = if cfg!(windows) {
-            "exit /b 3"
-        } else {
-            "exit 3"
-        };
+        let cmd = if cfg!(windows) { "exit /b 3" } else { "exit 3" };
         let result = tool
             .execute(&serde_json::json!({"command": cmd}))
             .await

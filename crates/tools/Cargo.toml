@@ -11,6 +11,7 @@ requiem-model = { path = "../model" }
 requiem-orchestration = { path = "../orchestration" }
 requiem-obsidian = { path = "../obsidian" }
 async-trait = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

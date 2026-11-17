@@ -318,9 +318,18 @@ mod tests {
 
     #[test]
     fn glob_double_star_mid_pattern() {
-        assert!(glob_match(&["crates", "**", "src", "*.rs"], "crates/tools/src/lib.rs"));
-        assert!(glob_match(&["crates", "**", "src", "*.rs"], "crates/src/main.rs"));
-        assert!(!glob_match(&["crates", "**", "src", "*.rs"], "other/src/main.rs"));
+        assert!(glob_match(
+            &["crates", "**", "src", "*.rs"],
+            "crates/tools/src/lib.rs"
+        ));
+        assert!(glob_match(
+            &["crates", "**", "src", "*.rs"],
+            "crates/src/main.rs"
+        ));
+        assert!(!glob_match(
+            &["crates", "**", "src", "*.rs"],
+            "other/src/main.rs"
+        ));
     }
 
     #[test]
@@ -348,9 +357,17 @@ mod tests {
         std::fs::create_dir_all(root.join("src").join("deep")).unwrap();
         std::fs::create_dir_all(root.join("target").join("debug")).unwrap();
         std::fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
-        std::fs::write(root.join("src").join("deep").join("lib.rs"), "pub fn f() {}").unwrap();
+        std::fs::write(
+            root.join("src").join("deep").join("lib.rs"),
+            "pub fn f() {}",
+        )
+        .unwrap();
         std::fs::write(root.join("README.md"), "# test").unwrap();
-        std::fs::write(root.join("target").join("debug").join("junk.rs"), "// build").unwrap();
+        std::fs::write(
+            root.join("target").join("debug").join("junk.rs"),
+            "// build",
+        )
+        .unwrap();
         dir
     }
 
@@ -420,7 +437,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["count"], 1);
-        assert_eq!(result["matches"][0]["path"], root.join("a.rs").to_string_lossy().as_ref());
+        assert_eq!(
+            result["matches"][0]["path"],
+            root.join("a.rs").to_string_lossy().as_ref()
+        );
     }
 
     #[tokio::test]

@@ -126,9 +126,7 @@ pub struct ThemedRenderer {
 
 impl ThemedRenderer {
     pub fn new(theme: &Theme) -> Self {
-        Self {
-            theme: *theme,
-        }
+        Self { theme: *theme }
     }
 
     /// Render the dashboard with theme colors and a tree structure.
@@ -137,18 +135,20 @@ impl ThemedRenderer {
         let mut out = String::with_capacity(1024);
 
         // Header with session info.
-        let header = t.accent_bold("REQUIEM")
-            .to_string()
-            + &t.secondary(format!(" session {}", state.session_id)).to_string()
-            + &t.muted(format!("  {}/{} tasks", state.completed_tasks, state.total_tasks))
+        let header = t.accent_bold("REQUIEM").to_string()
+            + &t.secondary(format!(" session {}", state.session_id))
                 .to_string()
-            + &t
-                .info(format!(
-                    "  {}/{} agents",
-                    state.running_count(),
-                    state.agents.len()
-                ))
-                .to_string();
+            + &t.muted(format!(
+                "  {}/{} tasks",
+                state.completed_tasks, state.total_tasks
+            ))
+            .to_string()
+            + &t.info(format!(
+                "  {}/{} agents",
+                state.running_count(),
+                state.agents.len()
+            ))
+            .to_string();
         out.push_str(&header);
         out.push('\n');
 
@@ -452,19 +452,12 @@ pub fn render_task_dashboard(dash: &TaskDashboard, theme: &Theme) -> String {
     ];
 
     for (status, tok) in buckets {
-        let rows: Vec<&TaskRow> = dash
-            .tasks
-            .iter()
-            .filter(|r| r.status == status)
-            .collect();
+        let rows: Vec<&TaskRow> = dash.tasks.iter().filter(|r| r.status == status).collect();
         if rows.is_empty() {
             continue;
         }
         let header = format!("{} ({})", status.label(), rows.len());
-        out.push_str(&format!(
-            "{}\n",
-            color_label(&header, *tok, t)
-        ));
+        out.push_str(&format!("{}\n", color_label(&header, *tok, t)));
         // Sort this bucket by priority (highest first), then id.
         let mut rows = rows;
         rows.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
@@ -634,7 +627,10 @@ mod tests {
         let mut state = sample_state();
         state.agents[0].current_task = "日本語のタスク説明です".repeat(4);
         let themed = ThemedRenderer::new(&theme).render(&state);
-        assert!(themed.contains("…"), "long task must be truncated with an ellipsis");
+        assert!(
+            themed.contains("…"),
+            "long task must be truncated with an ellipsis"
+        );
 
         let plain = PlainRenderer.render(&state);
         assert!(plain.contains("…"));

@@ -1,0 +1,639 @@
+    Updating crates.io index
+     Locking 250 packages to latest compatible versions
+      Adding ab_glyph v0.2.32
+      Adding ab_glyph_rasterizer v0.1.10
+      Adding addr2line v0.27.1
+      Adding adler2 v2.0.1
+      Adding alsa v0.9.1
+      Adding alsa-sys v0.3.1
+      Adding android-activity v0.5.2
+      Adding android-properties v0.2.2
+      Adding anymap v0.12.1
+      Adding arrayvec v0.7.8
+      Adding as-raw-xcb-connection v1.0.1
+      Adding ash v0.37.3+1.3.251
+      Adding atomic-arena v0.1.2
+      Adding atomic_refcell v0.1.14
+      Adding backtrace v0.3.77
+      Adding bimap v0.6.3
+      Adding bindgen v0.72.1
+      Adding bit-set v0.5.3
+      Adding bit-vec v0.6.3
+      Adding bit_field v0.10.4
+      Adding bitflags v1.3.2
+      Adding block v0.1.6
+      Adding block-sys v0.2.1
+      Adding block2 v0.3.0
+      Adding bytemuck v1.25.2
+      Adding bytemuck_derive v1.12.1
+      Adding byteorder v1.5.0
+      Adding calloop v0.12.4
+      Adding cesu8 v1.1.0
+      Adding cexpr v0.6.0
+      Adding cfg_aliases v0.1.1
+      Adding clang-sys v1.9.1
+      Adding codespan-reporting v0.11.1
+      Adding color_quant v1.1.0
+      Adding com v0.6.0
+      Adding com_macros v0.6.0
+      Adding com_macros_support v0.6.0
+      Adding combine v4.6.9
+      Adding comfy v0.4.0
+      Adding comfy-color-backtrace v0.6.2
+      Adding comfy-core v0.4.0
+      Adding comfy-wgpu v0.4.0
+      Adding comfy_include_dir v0.7.3
+      Adding comfy_include_dir_macros v0.7.3
+      Adding concurrent-queue v2.5.0
+      Adding console_error_panic_hook v0.1.7
+      Adding console_log v1.1.0
+      Adding core-graphics v0.23.2
+      Adding core-graphics-types v0.1.3
+      Adding coreaudio-rs v0.11.3
+      Adding coreaudio-sys v0.2.18
+      Adding cpal v0.15.3
+      Adding crc32fast v1.5.5
+      Adding crossbeam v0.8.5
+      Adding crossbeam-channel v0.5.17
+      Adding crossbeam-deque v0.8.8
+      Adding crossbeam-epoch v0.9.21
+      Adding crossbeam-queue v0.3.14
+      Adding crossbeam-utils v0.8.23
+      Adding crunchy v0.2.4
+      Adding cursor-icon v1.2.0
+      Adding d3d12 v0.19.0
+      Adding dasp_sample v0.11.0
+      Adding dispatch v0.2.0
+      Adding dlib v0.5.3
+      Adding document-features v0.2.12
+      Adding ecolor v0.26.2
+      Adding egui v0.26.2
+      Adding egui-wgpu v0.26.2
+      Adding egui-winit v0.26.2
+      Adding egui_plot v0.26.2
+      Adding emath v0.26.2
+      Adding env_logger v0.10.2
+      Adding epaint v0.26.2
+      Adding etagere v0.2.15
+      Adding euclid v0.22.14
+      Adding exr v1.74.3
+      Adding extended v0.1.0
+      Adding fdeflate v0.3.7
+      Adding filetime v0.2.30
+      Adding flate2 v1.1.11
+      Adding fontdue v0.7.3
+      Adding foreign-types v0.5.0
+      Adding foreign-types-macros v0.2.4
+      Adding foreign-types-shared v0.3.1
+      Adding fsevent-sys v4.1.0
+      Adding futures-intrusive v0.5.0
+      Adding fxhash v0.2.1
+      Adding gethostname v1.1.0
+      Adding getrandom v0.3.4
+      Adding gimli v0.34.0
+      Adding gl_generator v0.14.0
+      Adding glam v0.24.2
+      Adding glam v0.25.0
+      Adding glob v0.3.4
+      Adding glow v0.13.1
+      Adding glutin_wgl_sys v0.5.0
+      Adding gpu-alloc v0.6.2
+      Adding gpu-alloc-types v0.3.1
+      Adding gpu-allocator v0.25.0
+      Adding gpu-descriptor v0.2.4
+      Adding gpu-descriptor-types v0.1.2
+      Adding half v2.7.1
+      Adding hashbrown v0.13.2
+      Adding hassle-rs v0.11.0
+      Adding hecs v0.10.5
+      Adding hermit-abi v0.5.3
+      Adding hexf-parse v0.2.1
+      Adding humantime v2.4.0
+      Adding icrate v0.0.4
+      Adding image v0.24.9
+      Adding inline_tweak v1.2.5
+      Adding inotify v0.9.6
+      Adding inotify-sys v0.1.8
+      Adding instant v0.1.13
+      Adding is-terminal v0.4.17
+      Adding itertools v0.12.1
+      Adding jni v0.21.1
+      Adding jni-sys v0.3.1
+      Adding jni-sys v0.4.1
+      Adding jni-sys-macros v0.4.1
+      Adding jobserver v0.1.35
+      Adding jpeg-decoder v0.3.2
+      Adding khronos-egl v6.0.0
+      Adding khronos_api v3.1.0
+      Adding kira v0.8.7
+      Adding kqueue v1.2.1
+      Adding kqueue-sys v1.1.2
+      Adding lebe v0.5.3
+      Adding libloading v0.7.4
+      Adding libloading v0.8.9
+      Adding litrs v1.0.1
+      Adding mach2 v0.4.3
+      Adding malloc_buf v0.0.6
+      Adding maplit v1.0.2
+      Adding metal v0.27.0
+      Adding minimal-lexical v0.2.1
+      Adding miniz_oxide v0.8.9
+      Adding miniz_oxide v0.9.1
+      Adding mint v0.5.9
+      Adding multiversion v0.8.1
+      Adding multiversion-macros v0.8.1
+      Adding naga v0.19.2
+      Adding ndk v0.8.0
+      Adding ndk-context v0.1.1
+      Adding ndk-sys v0.5.0+25.2.9519653
+      Adding nohash-hasher v0.2.0
+      Adding nom v7.1.3
+      Adding notify v6.1.1
+      Adding num-complex v0.4.6
+      Adding num-derive v0.4.2
+      Adding num_enum v0.7.6
+      Adding num_enum_derive v0.7.6
+      Adding objc v0.2.7
+      Adding objc-sys v0.3.5
+      Adding objc2 v0.4.1
+      Adding objc2-encode v3.0.0
+      Adding objc_exception v0.1.2
+      Adding object v0.40.0
+      Adding oboe v0.6.1
+      Adding oboe-sys v0.6.1
+      Adding orbclient v0.3.55
+      Adding ordered-float v3.9.2
+      Adding owned_ttf_parser v0.25.1
+      Adding plain v0.2.3
+      Adding png v0.17.16
+      Adding polling v3.11.0
+      Adding pollster v0.3.0
+      Adding ppv-lite86 v0.2.21
+      Adding presser v0.3.1
+      Adding proc-macro-crate v3.5.0
+      Adding profiling v1.0.18
+      Adding r-efi v5.3.0
+      Adding rand v0.8.8
+      Adding rand_chacha v0.3.1
+      Adding rand_core v0.6.4
+      Adding range-alloc v0.1.5
+      Adding raw-window-handle v0.6.2
+      Adding rayon v1.12.0
+      Adding rayon-core v1.13.0
+      Adding redox_syscall v0.3.5
+      Adding redox_syscall v0.9.5
+      Adding renderdoc-sys v1.1.0
+      Adding ringbuf v0.3.3
+      Adding rpassword v7.5.5
+      Adding rtoolbox v0.0.6
+      Adding rustc-demangle v0.1.28
+      Adding rustc-hash v1.1.0
+      Adding rustc-hash v2.1.3
+      Adding send_wrapper v0.6.0
+      Adding shlex v1.3.0
+      Adding simd-adler32 v0.3.10
+      Adding simple-easing v1.1.1
+      Adding slotmap v1.1.1
+      Adding smol_str v0.2.2
+      Adding spin v0.9.9
+      Adding spin_sleep v1.3.3
+      Adding spirv v0.3.0+sdk-1.3.268.0
+      Adding svg_fmt v0.4.5
+      Adding symphonia v0.5.5
+      Adding symphonia-codec-pcm v0.5.5
+      Adding symphonia-codec-vorbis v0.5.5
+      Adding symphonia-core v0.5.5
+      Adding symphonia-format-ogg v0.5.5
+      Adding symphonia-format-riff v0.5.5
+      Adding symphonia-metadata v0.5.5
+      Adding symphonia-utils-xiph v0.5.5
+      Adding syn v1.0.109
+      Adding target-features v0.1.6
+      Adding termcolor v1.4.1
+      Adding thunderdome v0.6.1
+      Adding toml_datetime v1.1.3+spec-1.1.0
+      Adding toml_edit v0.25.19+spec-1.1.0
+      Adding toml_parser v1.1.5+spec-1.1.0
+      Adding ttf-parser v0.15.2
+      Adding ttf-parser v0.25.1
+      Adding type-map v0.5.1
+      Adding unicode-xid v0.2.6
+      Adding wasip2 v1.0.4+wasi-0.2.12
+      Adding web-time v0.2.4
+      Adding wgpu v0.19.4
+      Adding wgpu-core v0.19.4
+      Adding wgpu-hal v0.19.5
+      Adding wgpu-types v0.19.2
+      Adding widestring v1.2.1
+      Adding windows v0.52.0
+      Adding windows v0.54.0
+      Adding windows-core v0.52.0
+      Adding windows-core v0.54.0
+      Adding windows-result v0.1.2
+      Adding windows-sys v0.45.0
+      Adding windows-targets v0.42.2
+      Adding windows_aarch64_gnullvm v0.42.2
+      Adding windows_aarch64_msvc v0.42.2
+      Adding windows_i686_gnu v0.42.2
+      Adding windows_i686_msvc v0.42.2
+      Adding windows_x86_64_gnu v0.42.2
+      Adding windows_x86_64_gnullvm v0.42.2
+      Adding windows_x86_64_msvc v0.42.2
+      Adding winit v0.29.15
+      Adding winnow v1.0.5
+      Adding wit-bindgen v0.57.1
+      Adding x11-dl v2.21.0
+      Adding x11rb v0.13.2
+      Adding x11rb-protocol v0.13.2
+      Adding xkbcommon-dl v0.4.2
+      Adding xkeysym v0.2.1
+      Adding xml-rs v0.8.29
+      Adding zlib-rs v0.6.8
+      Adding zune-inflate v0.2.54
+ Downloading crates ...
+  Downloaded anymap v0.12.1
+  Downloaded gpu-descriptor-types v0.1.2
+  Downloaded lebe v0.5.3
+  Downloaded comfy_include_dir v0.7.3
+  Downloaded extended v0.1.0
+  Downloaded fxhash v0.2.1
+  Downloaded cfg_aliases v0.1.1
+  Downloaded dasp_sample v0.11.0
+  Downloaded atomic-arena v0.1.2
+  Downloaded multiversion-macros v0.8.1
+  Downloaded ecolor v0.26.2
+  Downloaded gpu-descriptor v0.2.4
+  Downloaded color_quant v1.1.0
+  Downloaded maplit v1.0.2
+  Downloaded glutin_wgl_sys v0.5.0
+  Downloaded bit_field v0.10.4
+  Downloaded com_macros v0.6.0
+  Downloaded mint v0.5.9
+  Downloaded comfy_include_dir_macros v0.7.3
+  Downloaded pollster v0.3.0
+  Downloaded crossbeam v0.8.5
+  Downloaded atomic_refcell v0.1.14
+  Downloaded hassle-rs v0.11.0
+  Downloaded com v0.6.0
+  Downloaded com_macros_support v0.6.0
+  Downloaded inline_tweak v1.2.5
+  Downloaded ordered-float v3.9.2
+  Downloaded rtoolbox v0.0.6
+  Downloaded libloading v0.7.4
+  Downloaded d3d12 v0.19.0
+  Downloaded egui-winit v0.26.2
+  Downloaded etagere v0.2.15
+  Downloaded multiversion v0.8.1
+  Downloaded simple-easing v1.1.1
+  Downloaded egui-wgpu v0.26.2
+  Downloaded filetime v0.2.30
+  Downloaded bimap v0.6.3
+  Downloaded presser v0.3.1
+  Downloaded range-alloc v0.1.5
+  Downloaded svg_fmt v0.4.5
+  Downloaded symphonia-codec-pcm v0.5.5
+  Downloaded notify v6.1.1
+  Downloaded emath v0.26.2
+  Downloaded spin_sleep v1.3.3
+  Downloaded symphonia v0.5.5
+  Downloaded symphonia-utils-xiph v0.5.5
+  Downloaded rustc-demangle v0.1.28
+  Downloaded rpassword v7.5.5
+  Downloaded egui_plot v0.26.2
+  Downloaded comfy-color-backtrace v0.6.2
+  Downloaded num-complex v0.4.6
+  Downloaded symphonia-codec-vorbis v0.5.5
+  Downloaded symphonia-format-riff v0.5.5
+  Downloaded symphonia-metadata v0.5.5
+  Downloaded gpu-allocator v0.25.0
+  Downloaded symphonia-format-ogg v0.5.5
+  Downloaded thunderdome v0.6.1
+  Downloaded web-time v0.2.4
+  Downloaded ringbuf v0.3.3
+  Downloaded comfy-core v0.4.0
+  Downloaded comfy-wgpu v0.4.0
+  Downloaded backtrace v0.3.77
+  Downloaded hecs v0.10.5
+  Downloaded kira v0.8.7
+  Downloaded windows-core v0.52.0
+  Downloaded windows-core v0.54.0
+  Downloaded zune-inflate v0.2.54
+  Downloaded cpal v0.15.3
+  Downloaded wgpu-types v0.19.2
+  Downloaded comfy v0.4.0
+  Downloaded symphonia-core v0.5.5
+  Downloaded widestring v1.2.1
+  Downloaded hashbrown v0.13.2
+  Downloaded fontdue v0.7.3
+  Downloaded glow v0.13.1
+  Downloaded itertools v0.12.1
+  Downloaded ttf-parser v0.15.2
+  Downloaded wgpu v0.19.4
+  Downloaded wgpu-core v0.19.4
+  Downloaded egui v0.26.2
+  Downloaded exr v1.74.3
+  Downloaded wgpu-hal v0.19.5
+  Downloaded glam v0.24.2
+  Downloaded glam v0.25.0
+  Downloaded ash v0.37.3+1.3.251
+  Downloaded naga v0.19.2
+  Downloaded winit v0.29.15
+  Downloaded jpeg-decoder v0.3.2
+  Downloaded epaint v0.26.2
+  Downloaded image v0.24.9
+  Downloaded windows v0.54.0
+  Downloaded windows v0.52.0
+   Compiling smallvec v1.16.5
+   Compiling windows-sys v0.61.2
+   Compiling zerocopy v0.8.63
+   Compiling num-traits v0.2.19
+   Compiling getrandom v0.3.4
+   Compiling syn v2.0.119
+   Compiling ahash v0.8.12
+   Compiling bytemuck_derive v1.12.1
+   Compiling winapi v0.3.9
+   Compiling cfg_aliases v0.1.1
+   Compiling crossbeam-utils v0.8.23
+   Compiling arrayvec v0.7.8
+   Compiling bitflags v1.3.2
+   Compiling syn v1.0.109
+   Compiling parking_lot_core v0.9.12
+   Compiling khronos_api v3.1.0
+   Compiling parking_lot v0.12.5
+   Compiling crossbeam-epoch v0.9.21
+   Compiling simd-adler32 v0.3.10
+   Compiling xml-rs v0.8.29
+   Compiling ttf-parser v0.25.1
+   Compiling crossbeam-deque v0.8.8
+   Compiling log v0.4.35
+   Compiling bytemuck v1.25.2
+   Compiling icu_normalizer v2.4.0
+   Compiling libloading v0.8.9
+   Compiling chrono v0.4.45
+   Compiling adler2 v2.0.1
+   Compiling target-features v0.1.6
+   Compiling raw-window-handle v0.6.2
+   Compiling symphonia-core v0.5.5
+   Compiling gl_generator v0.14.0
+   Compiling ab_glyph_rasterizer v0.1.10
+   Compiling idna_adapter v1.2.2
+   Compiling emath v0.26.2
+   Compiling ecolor v0.26.2
+   Compiling glutin_wgl_sys v0.5.0
+   Compiling symphonia-metadata v0.5.5
+   Compiling windows-sys v0.48.0
+   Compiling windows-core v0.52.0
+   Compiling bit-vec v0.6.3
+   Compiling rayon-core v1.13.0
+   Compiling nohash-hasher v0.2.0
+   Compiling crc32fast v1.5.5
+   Compiling ash v0.37.3+1.3.251
+   Compiling khronos-egl v6.0.0
+   Compiling windows v0.52.0
+   Compiling bit-set v0.5.3
+   Compiling symphonia-utils-xiph v0.5.5
+   Compiling idna v1.1.0
+   Compiling com_macros_support v0.6.0
+   Compiling owned_ttf_parser v0.25.1
+   Compiling wgpu-hal v0.19.5
+   Compiling ab_glyph v0.2.32
+   Compiling windows-result v0.1.2
+   Compiling gpu-alloc-types v0.3.1
+   Compiling gpu-descriptor-types v0.1.2
+   Compiling spirv v0.3.0+sdk-1.3.268.0
+   Compiling presser v0.3.1
+   Compiling hexf-parse v0.2.1
+   Compiling rustc-hash v1.1.0
+   Compiling widestring v1.2.1
+   Compiling unicode-xid v0.2.6
+   Compiling gpu-alloc v0.6.2
+   Compiling windows-core v0.54.0
+   Compiling url v2.5.8
+   Compiling libloading v0.7.4
+   Compiling d3d12 v0.19.0
+   Compiling miniz_oxide v0.8.9
+   Compiling miniz_oxide v0.9.1
+   Compiling wgpu-core v0.19.4
+   Compiling winit v0.29.15
+   Compiling getrandom v0.2.17
+   Compiling winapi-util v0.1.11
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.5
+   Compiling com_macros v0.6.0
+   Compiling termcolor v1.4.1
+   Compiling same-file v1.0.6
+   Compiling schannel v0.1.30
+   Compiling walkdir v2.5.0
+   Compiling codespan-reporting v0.11.1
+   Compiling com v0.6.0
+   Compiling zerocopy-derive v0.8.63
+   Compiling thiserror-impl v1.0.69
+   Compiling tracing-attributes v0.1.31
+   Compiling tokio v1.54.1
+   Compiling native-tls v0.2.18
+   Compiling multiversion-macros v0.8.1
+   Compiling wgpu-types v0.19.2
+   Compiling profiling v1.0.18
+   Compiling range-alloc v0.1.5
+   Compiling cpal v0.15.3
+   Compiling filetime v0.2.30
+   Compiling renderdoc-sys v1.1.0
+   Compiling glow v0.13.1
+   Compiling extended v0.1.0
+   Compiling symphonia-format-riff v0.5.5
+   Compiling thiserror v1.0.69
+   Compiling tracing v0.1.44
+   Compiling flate2 v1.1.11
+   Compiling requiem-core v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\core)
+   Compiling gpu-allocator v0.25.0
+   Compiling naga v0.19.2
+   Compiling hassle-rs v0.11.0
+   Compiling multiversion v0.8.1
+   Compiling rand_core v0.6.4
+   Compiling windows v0.54.0
+   Compiling symphonia-format-ogg v0.5.5
+   Compiling symphonia-codec-vorbis v0.5.5
+   Compiling symphonia-codec-pcm v0.5.5
+   Compiling crossbeam-channel v0.5.17
+   Compiling fdeflate v0.3.7
+   Compiling zune-inflate v0.2.54
+   Compiling wgpu v0.19.4
+   Compiling mint v0.5.9
+   Compiling smol_str v0.2.2
+   Compiling dasp_sample v0.11.0
+   Compiling lebe v0.5.3
+   Compiling web-time v0.2.4
+   Compiling bit_field v0.10.4
+   Compiling cursor-icon v1.2.0
+   Compiling byteorder v1.5.0
+   Compiling rustc-demangle v0.1.28
+   Compiling glam v0.25.0
+   Compiling png v0.17.16
+   Compiling symphonia v0.5.5
+   Compiling backtrace v0.3.77
+   Compiling is-terminal v0.4.17
+   Compiling crossterm_winapi v0.9.1
+   Compiling euclid v0.22.14
+   Compiling crossbeam-queue v0.3.14
+   Compiling ringbuf v0.3.3
+   Compiling comfy_include_dir_macros v0.7.3
+   Compiling rustc-hash v2.1.3
+   Compiling jpeg-decoder v0.3.2
+   Compiling litrs v1.0.1
+   Compiling humantime v2.4.0
+   Compiling spin v0.9.9
+   Compiling atomic-arena v0.1.2
+   Compiling color_quant v1.1.0
+   Compiling ttf-parser v0.15.2
+   Compiling svg_fmt v0.4.5
+   Compiling document-features v0.2.12
+   Compiling etagere v0.2.15
+   Compiling ppv-lite86 v0.2.21
+   Compiling hashbrown v0.14.5
+   Compiling epaint v0.26.2
+   Compiling half v2.7.1
+   Compiling rand_chacha v0.3.1
+   Compiling exr v1.74.3
+   Compiling hashbrown v0.13.2
+   Compiling gpu-descriptor v0.2.4
+   Compiling hecs v0.10.5
+   Compiling egui v0.26.2
+   Compiling rand v0.8.8
+   Compiling fontdue v0.7.3
+   Compiling env_logger v0.10.2
+   Compiling comfy_include_dir v0.7.3
+   Compiling anstyle-wincon v3.0.11
+   Compiling type-map v0.5.1
+   Compiling crossbeam v0.8.5
+   Compiling comfy-color-backtrace v0.6.2
+   Compiling notify v6.1.1
+   Compiling fxhash v0.2.1
+   Compiling strum_macros v0.26.4
+   Compiling tokio-util v0.7.20
+   Compiling tokio-native-tls v0.3.1
+   Compiling tower v0.5.3
+   Compiling image v0.24.9
+   Compiling h2 v0.4.20
+   Compiling tower-http v0.6.11
+   Compiling spin_sleep v1.3.3
+   Compiling egui_plot v0.26.2
+   Compiling egui-winit v0.26.2
+   Compiling anstyle-query v1.1.5
+   Compiling rayon v1.12.0
+   Compiling itertools v0.12.1
+   Compiling num-complex v0.4.6
+   Compiling ordered-float v3.9.2
+   Compiling anymap v0.12.1
+   Compiling pollster v0.3.0
+   Compiling thunderdome v0.6.1
+   Compiling simple-easing v1.1.1
+   Compiling glam v0.24.2
+   Compiling inline_tweak v1.2.5
+   Compiling maplit v1.0.2
+   Compiling atomic_refcell v0.1.14
+   Compiling bimap v0.6.3
+   Compiling anstream v1.0.0
+   Compiling strum v0.26.3
+   Compiling icu_segmenter v2.4.0
+   Compiling hashlink v0.9.1
+   Compiling crossterm v0.28.1
+   Compiling hyper v1.12.0
+   Compiling terminal_size v0.4.4
+   Compiling futures-intrusive v0.5.0
+   Compiling textwrap v0.16.4
+   Compiling rusqlite v0.31.0
+   Compiling kira v0.8.7
+   Compiling ratatui v0.29.0
+   Compiling hyper-util v0.1.21
+   Compiling tempfile v3.27.0
+   Compiling comfy-core v0.4.0
+   Compiling clap_builder v4.6.7
+   Compiling dirs-sys v0.4.1
+   Compiling requiem-obsidian v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\obsidian)
+   Compiling crossterm v0.27.0
+   Compiling hyper-tls v0.6.0
+   Compiling reqwest v0.12.28
+   Compiling nu-ansi-term v0.50.3
+   Compiling rtoolbox v0.0.6
+   Compiling dirs v5.0.1
+   Compiling rpassword v7.5.5
+   Compiling requiem-tui v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\tui)
+   Compiling tracing-subscriber v0.3.23
+   Compiling requiem-memory v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\memory)
+   Compiling requiem-project v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\project)
+   Compiling requiem-model v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\model)
+   Compiling clap v4.6.7
+   Compiling requiem-permissions v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\permissions)
+   Compiling requiem-context v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\context)
+   Compiling requiem-orchestration v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\orchestration)
+   Compiling requiem-tools v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\tools)
+   Compiling egui-wgpu v0.26.2
+   Compiling comfy-wgpu v0.4.0
+   Compiling comfy v0.4.0
+   Compiling requiem-cli v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\cli)
+error[E0308]: mismatched types
+   --> crates\cli\src\main.rs:211:36
+    |
+211 | ...                   return ExitCode::SUCCESS;
+    |                              ^^^^^^^^^^^^^^^^^ expected `Result<String, Box<...>>`, found `ExitCode`
+    |
+    = note: expected enum `Result<std::string::String, Box<dyn std::error::Error + Send + Sync>>`
+             found struct `ExitCode`
+note: return type inferred to be `Result<std::string::String, Box<dyn std::error::Error + Send + Sync>>` here
+   --> crates\cli\src\main.rs:207:36
+    |
+207 | ...                   return run_session(None).await;
+    |                              ^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+   --> crates\cli\src\main.rs:184:5
+    |
+184 | /     match cli.command {
+185 | |         None => {
+186 | |             let config = Config::load_or_init().ok();
+187 | |             let is_tty = {
+...   |
+282 | |         },
+283 | |     }
+    | |_____^ expected `Result<String, Box<...>>`, found `ExitCode`
+    |
+    = note: expected enum `Result<std::string::String, Box<dyn std::error::Error + Send + Sync>>`
+             found struct `ExitCode`
+note: return type inferred to be `Result<std::string::String, Box<dyn std::error::Error + Send + Sync>>` here
+   --> crates\cli\src\main.rs:207:36
+    |
+207 | ...                   return run_session(None).await;
+    |                              ^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0271]: expected `{async block@crates\cli\src\main.rs:174:1: 174:15}` to be a future that resolves to `ExitCode`, but it resolves to `Result<String, Box<dyn Error + Send + Sync>>`
+   --> crates\cli\src\main.rs:174:1
+    |
+174 | #[tokio::main]
+    | ^^^^^^^^^^^^^^ expected `ExitCode`, found `Result<String, Box<...>>`
+    |
+    = note: expected struct `ExitCode`
+                 found enum `Result<std::string::String, Box<dyn std::error::Error + Send + Sync>>`
+    = note: required for the cast from `&{async block@crates\cli\src\main.rs:174:1: 174:15}` to `&dyn std::future::Future<Output = ExitCode>`
+    = note: this error originates in the attribute macro `tokio::main` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+   --> crates\cli\src\main.rs:184:5
+    |
+175 |   async fn main() -> ExitCode {
+    |                      -------- expected `ExitCode` because of return type
+...
+184 | /     match cli.command {
+185 | |         None => {
+186 | |             let config = Config::load_or_init().ok();
+187 | |             let is_tty = {
+...   |
+282 | |         },
+283 | |     }
+    | |_____^ expected `ExitCode`, found `Result<String, Box<...>>`
+    |
+    = note: expected struct `ExitCode`
+                 found enum `Result<std::string::String, Box<dyn std::error::Error + Send + Sync>>`
+
+Some errors have detailed explanations: E0271, E0308.
+For more information about an error, try `rustc --explain E0271`.
+error: could not compile `requiem-cli` (bin "requiem") due to 4 previous errors

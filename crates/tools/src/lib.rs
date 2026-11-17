@@ -15,7 +15,7 @@ pub use file_ops::{FileDeleteTool, FileEditTool, FileReadTool, FileWriteTool};
 pub use git::GitTool;
 pub use obsidian::ObsidianTool;
 pub use search::{GlobSearchTool, GrepSearchTool};
-pub use subagent::make_subagent_tool;
+pub use subagent::{make_parallel_subagent_tool, make_subagent_tool};
 pub use terminal::TerminalTool;
 
 use serde_json::Value;

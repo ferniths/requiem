@@ -39,7 +39,7 @@ pub fn run_wizard() -> Result<Config, String> {
 
     let mut config = existing_config_or_default();
     // The wizard previews render in the user's *current* theme.
-    let mut theme = theme_for(&config.theme);
+    let theme = theme_for(&config.theme);
     let mut step = 0usize;
 
     loop {
@@ -117,8 +117,10 @@ fn welcome(theme: &Theme) -> Result<(), String> {
     );
     println!(
         "{}",
-        theme.muted("  Ctrl-C cancels at any point; nothing is written until you\n  \
-             confirm on the final step. Answer `b` at any prompt to go back.")
+        theme.muted(
+            "  Ctrl-C cancels at any point; nothing is written until you\n  \
+             confirm on the final step. Answer `b` at any prompt to go back."
+        )
     );
     println!("\n{}", theme.info("[ Enter to begin · q to quit ]"));
 
@@ -139,8 +141,10 @@ fn step_connection(config: &mut Config, theme: &Theme) -> Result<Step, String> {
     );
     println!(
         "{}",
-        theme.muted("  Examples: http://localhost:11434/v1 (Ollama),\n  \
-             https://api.openai.com/v1, or any compatible proxy.")
+        theme.muted(
+            "  Examples: http://localhost:11434/v1 (Ollama),\n  \
+             https://api.openai.com/v1, or any compatible proxy."
+        )
     );
 
     loop {
@@ -172,9 +176,7 @@ fn validate_endpoint(input: &str) -> Result<String, String> {
         return Err("endpoint must not be empty".into());
     }
     if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        return Err(format!(
-            "'{trimmed}' must start with http:// or https://"
-        ));
+        return Err(format!("'{trimmed}' must start with http:// or https://"));
     }
     let rest = trimmed
         .trim_start_matches("https://")
@@ -215,14 +217,11 @@ fn step_api_key(config: &mut Config, theme: &Theme) -> Result<Step, String> {
         );
     }
 
-    loop {
-        match ask_masked()? {
-            Answer::Back => return Ok(Step::Back),
-            Answer::Keep => break,
-            Answer::Value(v) => {
-                config.api_key = v;
-                break;
-            }
+    match ask_masked()? {
+        Answer::Back => return Ok(Step::Back),
+        Answer::Keep => {}
+        Answer::Value(v) => {
+            config.api_key = v;
         }
     }
 
@@ -277,7 +276,11 @@ fn step_model(config: &mut Config, theme: &Theme) -> Result<Step, String> {
                     theme.success(format!("connection OK — model '{model}' responded"))
                 ),
                 Err(e) => {
-                    println!("{} {}", theme.error_bold("✗"), theme.error(classify_conn_error(&e)));
+                    println!(
+                        "{} {}",
+                        theme.error_bold("✗"),
+                        theme.error(classify_conn_error(&e))
+                    );
                     println!(
                         "  {}",
                         theme.muted("Continuing anyway — test later with `requiem model --test`.")
@@ -301,7 +304,9 @@ fn validate_model(model: &str) -> Result<(), String> {
         return Err("model name is suspiciously long (>128 chars)".into());
     }
     if trimmed.split_whitespace().count() != 1 {
-        return Err(format!("'{trimmed}' contains spaces — use the exact model id"));
+        return Err(format!(
+            "'{trimmed}' contains spaces — use the exact model id"
+        ));
     }
     Ok(())
 }
@@ -318,14 +323,14 @@ fn test_endpoint(endpoint: &str, model: &str, api_key: &str) -> Result<String, S
         max_context_tokens: Some(8_192),
         max_output_tokens: None,
     };
-    let client =
-        requiem_model::client::ModelClient::new(mc).map_err(|e| e.to_string())?;
+    let client = requiem_model::client::ModelClient::new(mc).map_err(|e| e.to_string())?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    rt.block_on(client.test_connection()).map_err(|e| e.to_string())
+    rt.block_on(client.test_connection())
+        .map_err(|e| e.to_string())
 }
 
 /// Turn a raw connection error into something a human can act on.
@@ -344,7 +349,7 @@ fn classify_conn_error(raw: &str) -> String {
     } else if lower.contains("dns") || lower.contains("name resolution") {
         "hostname did not resolve — check for typos in the endpoint URL".to_string()
     } else {
-        format!("{raw}")
+        raw.to_string()
     }
 }
 
@@ -373,7 +378,13 @@ fn step_agent_limits(config: &mut Config, theme: &Theme) -> Result<Step, String>
         NumberAnswer::Value(v) => v,
     };
     config.token_budget = budget;
-    let tasks = match ask_number(theme, "Max tasks per session", config.max_task_budget, 1, 100)? {
+    let tasks = match ask_number(
+        theme,
+        "Max tasks per session",
+        config.max_task_budget,
+        1,
+        100,
+    )? {
         NumberAnswer::Back => return Ok(Step::Back),
         NumberAnswer::Value(v) => v,
     };
@@ -393,7 +404,10 @@ fn step_agent_limits(config: &mut Config, theme: &Theme) -> Result<Step, String>
         Answer::Value(v) => match v.to_lowercase().as_str() {
             "y" | "yes" | "true" | "on" => config.dynamic_scaling = true,
             "n" | "no" | "false" | "off" => config.dynamic_scaling = false,
-            other => warn(theme, &format!("'{other}' is not y/n — keeping the current value")),
+            other => warn(
+                theme,
+                &format!("'{other}' is not y/n — keeping the current value"),
+            ),
         },
     }
 
@@ -495,7 +509,11 @@ fn step_vaults(config: &mut Config, theme: &Theme) -> Result<Step, String> {
         for (i, v) in existing.iter().enumerate() {
             println!(
                 "    {} {}. {}",
-                if i == 0 { theme.success("★") } else { theme.secondary(" ") },
+                if i == 0 {
+                    theme.success("★")
+                } else {
+                    theme.secondary(" ")
+                },
                 i + 1,
                 theme.secondary(v)
             );
@@ -512,7 +530,10 @@ fn step_vaults(config: &mut Config, theme: &Theme) -> Result<Step, String> {
         };
         if !keep {
             config.vaults.clear();
-            println!("  {}", theme.muted("Existing vaults cleared — add new ones below."));
+            println!(
+                "  {}",
+                theme.muted("Existing vaults cleared — add new ones below.")
+            );
         }
     }
 
@@ -590,8 +611,7 @@ fn step_appearance(config: &mut Config, theme: &Theme) -> Result<Step, String> {
         } else {
             String::new()
         };
-        let preview = variant
-            .accent_bold("REQUIEM")
+        let preview = variant.accent_bold("REQUIEM")
             + &variant.secondary(" — text sample ")
             + &variant.muted("muted ")
             + &variant.success("✓ok ");
@@ -600,11 +620,7 @@ fn step_appearance(config: &mut Config, theme: &Theme) -> Result<Step, String> {
 
     // Default = the CURRENT theme's index, not 1: pressing Enter must not
     // silently reset the user's theme.
-    let default_idx = names
-        .iter()
-        .position(|n| *n == config.theme)
-        .unwrap_or(0) as u32
-        + 1;
+    let default_idx = names.iter().position(|n| *n == config.theme).unwrap_or(0) as u32 + 1;
 
     let choice = match ask_number(theme, "Theme", default_idx, 1, names.len() as u32)? {
         NumberAnswer::Back => return Ok(Step::Back),
@@ -638,12 +654,19 @@ fn step_summary(config: &Config, theme: &Theme) -> Result<Step, String> {
         theme.secondary(config.max_task_budget.to_string()),
         theme.secondary(config.dynamic_scaling.to_string()),
     );
-    println!("  default mode  {}", theme.accent(config.default_mode.as_str()));
+    println!(
+        "  default mode  {}",
+        theme.accent(config.default_mode.as_str())
+    );
     if config.vaults.is_empty() {
         println!("  vaults        {}", theme.muted("(none)"));
     } else {
         for (i, v) in config.vaults.iter().enumerate() {
-            let tag = if i == 0 { theme.success("(default)") } else { String::new() };
+            let tag = if i == 0 {
+                theme.success("(default)")
+            } else {
+                String::new()
+            };
             println!("  vault         {} {}", theme.secondary(v), tag);
         }
     }
@@ -652,7 +675,11 @@ fn step_summary(config: &Config, theme: &Theme) -> Result<Step, String> {
     let path = Config::config_path()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    println!("\n  {} {}", theme.secondary("→"), theme.muted(format!("config will be written to {path}")));
+    println!(
+        "\n  {} {}",
+        theme.secondary("→"),
+        theme.muted(format!("config will be written to {path}"))
+    );
 
     println!(
         "\n{} {}",

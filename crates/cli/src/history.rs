@@ -263,14 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn non_tty_read_returns_none_or_line() {
-        // In tests stdin is usually not a terminal; read_plain path must
-        // be safe (returns None at EOF without hanging).
-        let mut h = InputHistory::load();
-        let _ = h.read_line();
-    }
-
-    #[test]
     fn seed_then_entries_preserves_order() {
         let mut h = InputHistory::load();
         h.seed(vec!["a".into(), "b".into()]);

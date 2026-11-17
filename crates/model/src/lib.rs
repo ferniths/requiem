@@ -24,4 +24,4 @@ pub use client::ModelClient;
 pub use config::ModelConfig;
 pub use request::{ChatMessage, Role as MsgRole, ToolCall, ToolDef};
 pub use response::{ModelResponse, TokenUsage};
-pub use retry::RetryPolicy;
+pub use retry::{delay_for_error, from_max_retries, RetryPolicy};

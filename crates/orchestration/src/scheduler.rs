@@ -52,6 +52,21 @@ impl Scheduler {
         }
     }
 
+    /// Build a scheduler that restores a previously-persisted task graph.
+    ///
+    /// Used on session resume: the graph state (task statuses, results,
+    /// failure reasons) is rehydrated from the checkpoint so in-flight
+    /// multi-agent work continues rather than starting fresh. The agent
+    /// registry is rebuilt empty; tasks that were `Running`/`Claimed`
+    /// at checkpoint time are treated as re-dispatchable.
+    pub fn restore(config: SchedulerConfig, graph: TaskGraph) -> Self {
+        Self {
+            graph,
+            registry: AgentRegistry::default(),
+            config,
+        }
+    }
+
     /// Add a root task to the graph.
     pub fn add_task(&mut self, task: requiem_core::task::Task) -> Id {
         let id = self.graph.add(task);
@@ -200,7 +215,10 @@ mod tests {
         let polled = s.poll_available();
         assert_eq!(polled.len(), 3);
         assert!(!polled.contains(&Id::new())); // sanity: no phantom ids
-        assert!(!held_check(&s, &aid, &polled), "held task not re-dispatched");
+        assert!(
+            !held_check(&s, &aid, &polled),
+            "held task not re-dispatched"
+        );
     }
 
     #[test]
@@ -223,10 +241,7 @@ mod tests {
         let claimed = s.claim(&id, &agent_id);
         assert_eq!(claimed.as_ref(), Some(&id));
         assert!(s.poll_available().iter().all(|i| i != &id));
-        assert_eq!(
-            s.graph.tasks.get(&id).unwrap().status,
-            TaskStatus::Claimed
-        );
+        assert_eq!(s.graph.tasks.get(&id).unwrap().status, TaskStatus::Claimed);
     }
 
     #[test]
@@ -242,6 +257,32 @@ mod tests {
         s.registry.agents.get_mut(&aid).unwrap().finish();
         // The agent finished: its slot frees up again.
         assert_eq!(s.poll_available().len(), 4);
+    }
+
+    #[test]
+    fn restore_preserves_graph_state() {
+        let mut original = scheduler_with_tasks(3);
+        let a = polled_ids(&original)[0].clone();
+        let _ = original.complete_task(&a, serde_json::json!({"done": true}));
+        // Mark one task failed.
+        let b = polled_ids(&original)[0].clone();
+        original.fail_task(&b, "boom");
+
+        // Restore into a fresh scheduler; graph state must survive.
+        let restored = Scheduler::restore(SchedulerConfig::default(), original.graph.clone());
+        assert_eq!(restored.graph.len(), 3);
+        assert_eq!(
+            restored.graph.get(&a).status,
+            TaskStatus::Completed,
+            "completed task status must survive restore"
+        );
+        assert_eq!(
+            restored.graph.get(&b).status,
+            TaskStatus::Failed,
+            "failed task status must survive restore"
+        );
+        // The registry is rebuilt empty on restore.
+        assert!(restored.registry.agents.is_empty());
     }
 
     // -- helpers ------------------------------------------------------------

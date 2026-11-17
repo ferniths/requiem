@@ -44,10 +44,7 @@ pub enum Event {
         delta: String,
     },
     /// A complete assistant message (non-streaming or end of stream).
-    AssistantMessage {
-        agent: String,
-        text: String,
-    },
+    AssistantMessage { agent: String, text: String },
     /// A tool call is starting.
     ToolCallStarted {
         agent: String,
@@ -74,10 +71,7 @@ pub enum Event {
         description: String,
     },
     /// Agent status changed.
-    AgentStatus {
-        agent: String,
-        status: String,
-    },
+    AgentStatus { agent: String, status: String },
     /// Token usage reported for one model call.
     Usage {
         agent: String,
@@ -102,15 +96,9 @@ pub enum Event {
         error_class: String,
     },
     /// A run was cancelled by the user.
-    RunCancelled {
-        agent: String,
-        task: Id,
-    },
+    RunCancelled { agent: String, task: Id },
     /// A free-form system notice (config changes, session events…).
-    Notice {
-        text: String,
-        level: NoticeLevel,
-    },
+    Notice { text: String, level: NoticeLevel },
 }
 
 /// Severity for `Event::Notice`.
@@ -140,7 +128,9 @@ impl Event {
     /// A short single-line summary for logs and the event ticker.
     pub fn summary(&self) -> String {
         match self {
-            Event::RunStarted { agent, description, .. } => {
+            Event::RunStarted {
+                agent, description, ..
+            } => {
                 format!("{agent} → started: {}", truncate_line(description, 60))
             }
             Event::TurnStarted { agent, turn } => format!("{agent} turn {turn}"),
@@ -148,21 +138,50 @@ impl Event {
             Event::AssistantMessage { agent, text } => {
                 format!("{agent} → {}", truncate_line(text, 72))
             }
-            Event::ToolCallStarted { agent, tool, summary } => {
+            Event::ToolCallStarted {
+                agent,
+                tool,
+                summary,
+            } => {
                 format!("{agent} → {tool}({})", truncate_line(summary, 48))
             }
-            Event::ToolCallFinished { agent, tool, ok, summary, duration_ms } => {
+            Event::ToolCallFinished {
+                agent,
+                tool,
+                ok,
+                summary,
+                duration_ms,
+            } => {
                 let mark = if *ok { "✓" } else { "✗" };
-                format!("{agent} {mark} {tool} ({}ms) {}", duration_ms, truncate_line(summary, 40))
+                format!(
+                    "{agent} {mark} {tool} ({}ms) {}",
+                    duration_ms,
+                    truncate_line(summary, 40)
+                )
             }
-            Event::AgentSpawned { parent, child, role, .. } => {
+            Event::AgentSpawned {
+                parent,
+                child,
+                role,
+                ..
+            } => {
                 format!("{parent} spawned {child} [{role}]")
             }
             Event::AgentStatus { agent, status } => format!("{agent} → {status}"),
-            Event::Usage { agent, input_tokens, output_tokens, .. } => {
+            Event::Usage {
+                agent,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
                 format!("{agent} usage: {input_tokens} in / {output_tokens} out")
             }
-            Event::RunCompleted { agent, input_tokens, output_tokens, .. } => {
+            Event::RunCompleted {
+                agent,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
                 format!("{agent} completed ({input_tokens} in / {output_tokens} out)")
             }
             Event::RunFailed { agent, error, .. } => format!("{agent} failed: {error}"),

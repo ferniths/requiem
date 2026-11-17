@@ -1457,6 +1457,8 @@ dependencies = [
  "clap",
  "crossterm 0.27.0",
  "dirs",
+ "futures",
+ "ratatui",
  "requiem-context",
  "requiem-core",
  "requiem-memory",
@@ -1589,6 +1591,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "requiem-core",
  "requiem-model",
  "requiem-obsidian",

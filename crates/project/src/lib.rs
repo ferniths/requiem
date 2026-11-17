@@ -199,7 +199,7 @@ mod tests {
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let mut f = std::fs::File::create(dir.path().join("src").join("main.rs")).unwrap();
-        let _ = f.write_all(b"fn main() {}").unwrap();
+        f.write_all(b"fn main() {}").unwrap();
 
         let profile = detect(dir.path()).unwrap();
         assert_eq!(profile.ecosystem, Ecosystem::Cargo);
@@ -221,7 +221,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pyproject.toml"), "").unwrap();
         let mut f = std::fs::File::create(dir.path().join("main.py")).unwrap();
-        let _ = f.write_all(b"print('hi')").unwrap();
+        f.write_all(b"print('hi')").unwrap();
 
         let profile = detect(dir.path()).unwrap();
         assert_eq!(profile.ecosystem, Ecosystem::Python);

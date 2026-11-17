@@ -61,6 +61,11 @@ impl CancelFlag {
         self.0.store(true, Ordering::SeqCst);
     }
 
+    /// Reset the cancellation flag (for reusing the same flag across runs).
+    pub fn reset(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
     /// Whether cancellation was requested.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
@@ -131,6 +136,58 @@ fn emit(events: Option<&EventTx>, event: Event) {
     if let Some(tx) = events {
         let _ = tx.send(event);
     }
+}
+
+/// A future that resolves when the cancel flag is set.
+///
+/// Polls the flag on a fixed tick so a long-running model call can be
+/// interrupted mid-flight via `tokio::select!` without waiting for the
+/// next turn boundary.
+struct CancelWatch<'a> {
+    flag: Option<&'a CancelFlag>,
+    tick_ms: u64,
+}
+
+impl<'a> CancelWatch<'a> {
+    fn new(flag: Option<&'a CancelFlag>) -> Self {
+        Self { flag, tick_ms: 50 }
+    }
+
+    /// Resolve when the cancel flag is set. If no flag is present, this
+    /// future never resolves.
+    async fn wait(&self) {
+        let Some(flag) = self.flag else {
+            // No cancel flag: park forever so the select! never picks this
+            // branch.
+            std::future::pending().await
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(self.tick_ms));
+        loop {
+            interval.tick().await;
+            if flag.is_cancelled() {
+                return;
+            }
+        }
+    }
+}
+
+/// Build the `Cancelled` error and emit the cancellation events.
+fn cancelled_error(run: &AgentRun, events: Option<&EventTx>) -> RequiemError {
+    emit(
+        events,
+        Event::RunCancelled {
+            agent: run.agent.name.clone(),
+            task: run.task.id.clone(),
+        },
+    );
+    emit(
+        events,
+        Event::AgentStatus {
+            agent: run.agent.name.clone(),
+            status: "cancelled".into(),
+        },
+    );
+    RequiemError::Cancelled
 }
 
 /// A compact, human-oriented summary of tool arguments for event feeds.
@@ -223,21 +280,7 @@ pub async fn run_agent_halted(
     for turn in 0..MAX_TURNS_PER_TASK {
         if let Some(flag) = cancel {
             if flag.is_cancelled() {
-                emit(
-                    events,
-                    Event::RunCancelled {
-                        agent: run.agent.name.clone(),
-                        task: run.task.id.clone(),
-                    },
-                );
-                emit(
-                    events,
-                    Event::AgentStatus {
-                        agent: run.agent.name.clone(),
-                        status: "cancelled".into(),
-                    },
-                );
-                return Err(RequiemError::Cancelled);
+                return Err(cancelled_error(run, events));
             }
         }
 
@@ -279,13 +322,27 @@ pub async fn run_agent_halted(
         };
 
         // Stream when there is a live consumer; otherwise take the fast path.
+        // Each model call is raced against the cancel flag so a Ctrl-C or
+        // /cancel interrupts a long stream immediately, not at the next
+        // turn boundary.
+        let watcher = CancelWatch::new(cancel);
         let resp: ModelResponse = if events.is_some() {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let streamed = client.chat_stream(&req, tx);
             // Consume deltas while the request is in flight.
             let mut delta_text = String::new();
-            let result = drive_stream(streamed, &mut rx, &mut delta_text, run, events).await;
-            match result {
+            let stream_result = if cancel.is_some() {
+                let streamed = client.chat_stream(&req, tx);
+                tokio::select! {
+                    res = drive_stream(streamed, &mut rx, &mut delta_text, run, events) => res,
+                    _ = watcher.wait() => {
+                        return Err(cancelled_error(run, events));
+                    }
+                }
+            } else {
+                let streamed = client.chat_stream(&req, tx);
+                drive_stream(streamed, &mut rx, &mut delta_text, run, events).await
+            };
+            match stream_result {
                 Ok(resp) => {
                     if resp.message.tool_calls.is_empty() {
                         emit(
@@ -325,7 +382,17 @@ pub async fn run_agent_halted(
                 }
             }
         } else {
-            match client.chat(req).await {
+            let chat_result = if cancel.is_some() {
+                tokio::select! {
+                    res = client.chat(req) => res,
+                    _ = watcher.wait() => {
+                        return Err(cancelled_error(run, events));
+                    }
+                }
+            } else {
+                client.chat(req).await
+            };
+            match chat_result {
                 Ok(r) => r,
                 Err(e) => {
                     emit(
@@ -459,9 +526,7 @@ pub async fn run_agent_halted(
 /// Drive a streaming request while draining deltas into the event feed.
 /// Returns the reassembled response when the stream completes.
 async fn drive_stream(
-    streamed: impl std::future::Future<
-        Output = Result<ModelResponse, RequiemError>,
-    >,
+    streamed: impl std::future::Future<Output = Result<ModelResponse, RequiemError>>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<requiem_model::response::StreamChunk>,
     delta_text: &mut String,
     run: &AgentRun,
@@ -622,8 +687,8 @@ mod tests {
 
         let agents: Vec<AgentRun> = (0..3)
             .map(|i| {
-                let agent = Agent::master(&format!("agent-{i}"), Id::new());
-                let task = Task::new(&format!("task-{i}"));
+                let agent = Agent::master(format!("agent-{i}"), Id::new());
+                let task = Task::new(format!("task-{i}"));
                 AgentRun::new(agent, task)
             })
             .collect();
@@ -635,5 +700,56 @@ mod tests {
         for r in &results {
             assert!(r.is_err(), "expected error with no server, got {r:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn in_flight_cancellation_interrupts_model_call() {
+        let cfg = requiem_model::config::ModelConfig {
+            endpoint: "http://localhost:9999".into(),
+            api_key: "test".into(),
+            model: "test-model".into(),
+            timeout_ms: 60_000, // long timeout so the model call would
+            // otherwise block far beyond the cancel poll interval
+            max_concurrency: 1,
+            max_retries: 1,
+            max_context_tokens: None,
+            max_output_tokens: None,
+        };
+        let client = ModelClient::new(cfg).unwrap();
+
+        let executor: std::sync::Arc<dyn ToolExecutor> =
+            std::sync::Arc::new(crate::test_executor::test_executor());
+
+        let agent = Agent::master("cancel-test", Id::new());
+        let task = Task::new("test cancellation");
+        let mut run = AgentRun::new(agent, task);
+
+        let flag = CancelFlag::new();
+        let events = tokio::sync::broadcast::channel(64).0.clone();
+
+        // Cancel immediately; the in-flight model call (which would time
+        // out after 60s) must be interrupted within ~50ms by the poller.
+        flag.cancel();
+        let start = std::time::Instant::now();
+        let result = run_agent_halted(
+            &client,
+            &executor,
+            &mut run,
+            &[],
+            Some(&events),
+            Some(&flag),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(RequiemError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        // The cancellation must happen well before the 60s timeout.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "cancellation took {elapsed:?}, expected < 5s"
+        );
     }
 }

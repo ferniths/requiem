@@ -116,7 +116,8 @@ impl MockServer {
                     raw.extend_from_slice(&buf[..n]);
                 }
                 let body = String::from_utf8_lossy(
-                    raw.get(header_end..(header_end + content_length)).unwrap_or(&[]),
+                    raw.get(header_end..(header_end + content_length))
+                        .unwrap_or(&[]),
                 )
                 .to_string();
 
@@ -138,7 +139,11 @@ impl MockServer {
                     }
                 };
                 let is_sse = next.starts_with("data:") || next.contains("\ndata:");
-                let ctype = if is_sse { "text/event-stream" } else { "application/json" };
+                let ctype = if is_sse {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     next.len(),
@@ -185,9 +190,7 @@ impl Drop for MockServer {
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn make_config(endpoint: &str, model: &str) -> ModelConfig {
@@ -431,7 +434,10 @@ async fn chat_stream_delivers_and_reassembles() {
             deltas.push(d);
         }
     }
-    assert_eq!(deltas, vec!["Hel".to_string(), "lo ".to_string(), "world".to_string()]);
+    assert_eq!(
+        deltas,
+        vec!["Hel".to_string(), "lo ".to_string(), "world".to_string()]
+    );
 }
 
 /// Streaming tool-call deltas must merge into a single complete call.
@@ -475,7 +481,9 @@ async fn http_errors_classify() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = [0u8; 4096];
             let _ = sock.read(&mut buf).await;
@@ -499,7 +507,13 @@ async fn http_errors_classify() {
         request_id: None,
     };
     let err = client.chat(req).await.unwrap_err();
-    assert!(matches!(err, requiem_core::error::RequiemError::Model { status: Some(401), .. }));
+    assert!(matches!(
+        err,
+        requiem_core::error::RequiemError::Model {
+            status: Some(401),
+            ..
+        }
+    ));
     // 401 is not retryable — the client must fail fast.
     assert!(!err.is_retryable());
 }

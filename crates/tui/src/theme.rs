@@ -11,7 +11,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
-use crate::color::{ansi_wrap, force_color_mode, color_mode, Attr, ColorMode, Rgb};
+use crate::color::{ansi_wrap, color_mode, force_color_mode, Attr, ColorMode, Rgb};
 
 /// A semantic color token in the REQUIEM palette.
 ///
@@ -164,16 +164,16 @@ impl Theme {
     pub fn ansi16_index(&self, token: Token) -> u8 {
         match token {
             Token::Background | Token::Surface | Token::SurfaceRaised => 0,
-            Token::Accent | Token::AccentDeep => 1,      // red
-            Token::AccentBright | Token::Error => 9,     // bright red
-            Token::Violet => 13,                         // bright magenta
-            Token::Text => 15,                           // bright white
-            Token::TextSecondary => 7,                   // white
-            Token::TextMuted | Token::Border => 8,       // bright black (grey)
-            Token::BorderActive => 5,                    // magenta
-            Token::Info => 6,                            // cyan
-            Token::Success => 2,                         // green
-            Token::Warning => 3,                         // yellow
+            Token::Accent | Token::AccentDeep => 1,  // red
+            Token::AccentBright | Token::Error => 9, // bright red
+            Token::Violet => 13,                     // bright magenta
+            Token::Text => 15,                       // bright white
+            Token::TextSecondary => 7,               // white
+            Token::TextMuted | Token::Border => 8,   // bright black (grey)
+            Token::BorderActive => 5,                // magenta
+            Token::Info => 6,                        // cyan
+            Token::Success => 2,                     // green
+            Token::Warning => 3,                     // yellow
         }
     }
 
@@ -330,11 +330,7 @@ impl Theme {
             ColorMode::Ansi256 => Color::Indexed(crate::color::to_ansi256(rgb)),
             ColorMode::Ansi16 => {
                 let idx = crate::color::to_ansi16(rgb);
-                if idx < 8 {
-                    Color::Indexed(idx)
-                } else {
-                    Color::Indexed(idx)
-                }
+                Color::Indexed(idx)
             }
         }
     }
@@ -346,12 +342,16 @@ impl Theme {
 
     /// A ratatui style for a token with a bold modifier.
     pub fn style_bold(&self, token: Token) -> Style {
-        Style::new().fg(self.ratatui_color(token)).add_modifier(Modifier::BOLD)
+        Style::new()
+            .fg(self.ratatui_color(token))
+            .add_modifier(Modifier::BOLD)
     }
 
     /// A ratatui style for a token with a dim modifier.
     pub fn style_dim(&self, token: Token) -> Style {
-        Style::new().fg(self.ratatui_color(token)).add_modifier(Modifier::DIM)
+        Style::new()
+            .fg(self.ratatui_color(token))
+            .add_modifier(Modifier::DIM)
     }
 
     /// The background style for panels (kept subtle: no hard fills unless
@@ -424,10 +424,7 @@ mod tests {
         assert_eq!(t.ansi16_index(Token::Success), 2);
         assert_eq!(t.ansi16_index(Token::Warning), 3);
         assert_eq!(t.ansi16_index(Token::Info), 6);
-        assert!(matches!(
-            t.ansi16_index(Token::Text),
-            7 | 15
-        ));
+        assert!(matches!(t.ansi16_index(Token::Text), 7 | 15));
         assert_eq!(t.ansi16_index(Token::TextMuted), 8);
     }
 
@@ -459,7 +456,10 @@ mod tests {
     fn nocolor_rendering_is_plain() {
         let t = Theme::default();
         // Colours are stripped, but bold survives so structure remains.
-        assert_eq!(t.paint_with(ColorMode::NoColor, Token::Accent, "plain"), "plain");
+        assert_eq!(
+            t.paint_with(ColorMode::NoColor, Token::Accent, "plain"),
+            "plain"
+        );
         assert_eq!(
             t.paint_attrs_with(ColorMode::NoColor, Token::Accent, &[Attr::Bold], "plain"),
             "\x1b[1mplain\x1b[0m"

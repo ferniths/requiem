@@ -123,8 +123,7 @@ impl Config {
             }
             Err(e) => return Err(ConfigError::Read(e.to_string())),
         };
-        let config: Config =
-            toml::from_str(&raw).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let config: Config = toml::from_str(&raw).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(config)
     }
 
@@ -151,7 +150,8 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| ConfigError::Write(e.to_string()))?;
         }
-        let raw = toml::to_string_pretty(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+        let raw =
+            toml::to_string_pretty(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
         std::fs::write(&path, raw).map_err(|e| ConfigError::Write(e.to_string()))?;
         Ok(())
     }
@@ -260,9 +260,11 @@ mod tests {
 
     #[test]
     fn initialized_flag_survives_roundtrip() {
-        let mut config = Config::default();
-        config.initialized = true;
-        config.model = "my-model".into();
+        let config = Config {
+            initialized: true,
+            model: "my-model".into(),
+            ..Default::default()
+        };
         let raw = toml::to_string_pretty(&config).unwrap();
         let parsed = Config::parse(&raw).unwrap();
         assert!(parsed.is_initialized());
@@ -283,8 +285,10 @@ endpoint = "http://localhost:8080/v1"
 
     #[test]
     fn api_key_is_roundtripped_but_never_logged() {
-        let mut config = Config::default();
-        config.api_key = "sk-super-secret".into();
+        let config = Config {
+            api_key: "sk-super-secret".into(),
+            ..Default::default()
+        };
         let raw = toml::to_string_pretty(&config).unwrap();
         let parsed = Config::parse(&raw).unwrap();
         assert_eq!(parsed.api_key, "sk-super-secret");
@@ -292,9 +296,11 @@ endpoint = "http://localhost:8080/v1"
 
     #[test]
     fn vaults_roundtrip_in_order() {
-        let mut config = Config::default();
-        config.vaults = vec!["C:/notes/main".into(), "C:/notes/work".into()];
-        config.initialized = true;
+        let config = Config {
+            vaults: vec!["C:/notes/main".into(), "C:/notes/work".into()],
+            initialized: true,
+            ..Default::default()
+        };
         let raw = toml::to_string_pretty(&config).unwrap();
         let parsed = Config::parse(&raw).unwrap();
         assert_eq!(parsed.vaults.len(), 2);

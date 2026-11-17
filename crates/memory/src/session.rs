@@ -40,6 +40,16 @@ impl Session {
     /// Open (or create) a session database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
         let conn = Connection::open(path).map_err(|e| MemoryError::Db(e.to_string()))?;
+        // WAL mode: crash-safe concurrent reads, atomic single-writer
+        // commits. A torn write in the main DB file can never corrupt
+        // committed data; the WAL file recovers on the next open.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| MemoryError::Db(e.to_string()))?;
+        // NORMAL is the recommended sync level for WAL: every commit is
+        // still durable, but fsync is only on checkpoint, not every
+        // transaction. Safe on modern file systems.
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| MemoryError::Db(e.to_string()))?;
         // Create the schema idempotently.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS session_records (
@@ -64,7 +74,65 @@ impl Session {
         )
         .map_err(|e| MemoryError::Db(e.to_string()))?;
 
+        // Task-graph checkpoints: one JSON blob per session, overwritten on
+        // each checkpoint. Used to resume in-flight multi-agent state after
+        // a crash.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS task_checkpoints (
+                session_id      TEXT PRIMARY KEY,
+                graph_json      TEXT NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+            [],
+        )
+        .map_err(|e| MemoryError::Db(e.to_string()))?;
+
         Ok(Self { conn })
+    }
+
+    /// Persist the current task graph as a checkpoint for the session.
+    ///
+    /// Overwrites any prior checkpoint for this session. The graph is
+    /// serialized to JSON so the checkpoint is independent of the Rust
+    /// type layout (forward-compatible).
+    pub fn save_task_graph(
+        &self,
+        session_id: &Uuid,
+        graph: &requiem_core::task::TaskGraph,
+    ) -> Result<(), MemoryError> {
+        let json = serde_json::to_string(graph).map_err(|e| MemoryError::Db(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO task_checkpoints (session_id, graph_json)
+                 VALUES (?1, ?2)",
+                params![session_id.to_string(), json],
+            )
+            .map(|_| ())
+            .map_err(|e| MemoryError::Db(e.to_string()))
+    }
+
+    /// Load the most recent task-graph checkpoint for a session.
+    ///
+    /// Returns `Ok(None)` if no checkpoint exists yet.
+    pub fn load_task_graph(
+        &self,
+        session_id: &Uuid,
+    ) -> Result<Option<requiem_core::task::TaskGraph>, MemoryError> {
+        let json: Result<String, rusqlite::Error> = self.conn.query_row(
+            "SELECT graph_json FROM task_checkpoints WHERE session_id = ?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        );
+
+        match json {
+            Ok(s) => {
+                let graph: requiem_core::task::TaskGraph =
+                    serde_json::from_str(&s).map_err(|e| MemoryError::Db(e.to_string()))?;
+                Ok(Some(graph))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MemoryError::Db(e.to_string())),
+        }
     }
 
     /// Insert a completed task record.
@@ -161,7 +229,11 @@ impl Session {
                 let sid: String = row.get(0)?;
                 let count: i64 = row.get(1)?;
                 let last: String = row.get(2)?;
-                Ok((Uuid::parse_str(&sid).unwrap_or_else(|_| Uuid::nil()), count as usize, last))
+                Ok((
+                    Uuid::parse_str(&sid).unwrap_or_else(|_| Uuid::nil()),
+                    count as usize,
+                    last,
+                ))
             })
             .map_err(|e| MemoryError::Db(e.to_string()))?;
         let mut out = Vec::new();
@@ -273,5 +345,43 @@ mod tests {
         let deleted = session.delete_session(&sid).unwrap();
         assert_eq!(deleted, 1);
         assert!(session.records_for_session(&sid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_graph_checkpoint_roundtrip() {
+        use requiem_core::task::{Task, TaskGraph};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ckpt.db");
+        let session = Session::open(&db_path).unwrap();
+        let sid = Uuid::new_v4();
+
+        // Build a graph with two tasks, one completed.
+        let mut graph = TaskGraph::default();
+        let a = graph.add(Task::new("A"));
+        let _b = graph.add(Task::new("B").depends_on(a.clone()));
+        let _ = graph.complete(a.clone(), serde_json::json!({"ok": true}));
+
+        // Save, then load in a fresh connection.
+        session.save_task_graph(&sid, &graph).unwrap();
+        let reloaded = session
+            .load_task_graph(&sid)
+            .unwrap()
+            .expect("checkpoint exists");
+
+        assert_eq!(reloaded.len(), graph.len());
+        assert_eq!(reloaded.get(&a).status, graph.get(&a).status);
+        assert!(reloaded.get(&a).result.is_some());
+    }
+
+    #[test]
+    fn load_task_graph_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("none.db");
+        let session = Session::open(&db_path).unwrap();
+        let sid = Uuid::new_v4();
+
+        let result = session.load_task_graph(&sid).unwrap();
+        assert!(result.is_none());
     }
 }

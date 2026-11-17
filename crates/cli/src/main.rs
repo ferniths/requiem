@@ -101,7 +101,9 @@ async fn main() -> ExitCode {
         }
         Some(Commands::Setup) => finish(run_setup(&theme), &theme),
         Some(Commands::Install { dir }) => finish(run_install(dir, &theme), &theme),
-        Some(Commands::Uninstall { dir, purge }) => finish(run_uninstall(dir, purge, &theme), &theme),
+        Some(Commands::Uninstall { dir, purge }) => {
+            finish(run_uninstall(dir, purge, &theme), &theme)
+        }
     }
 }
 
@@ -113,7 +115,7 @@ fn finish(result: BoxResult, theme: &Theme) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("{}", theme.error(&e.to_string()));
+            eprintln!("{}", theme.error(e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -167,7 +169,7 @@ async fn run_default(theme: &Theme) -> ExitCode {
                     finish(requiem_cli::session::run_session(None).await, theme)
                 }
                 Err(e) => {
-                    eprintln!("{}", theme.error(&format!("setup cancelled: {e}")));
+                    eprintln!("{}", theme.error(format!("setup cancelled: {e}")));
                     eprintln!(
                         "{}",
                         theme.muted("run `requiem setup` any time to configure REQUIEM")
@@ -177,7 +179,7 @@ async fn run_default(theme: &Theme) -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("{}", theme.error(&e.to_string()));
+            eprintln!("{}", theme.error(e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -265,17 +267,23 @@ fn run_install(dir: Option<std::path::PathBuf>, theme: &Theme) -> BoxResult {
 
     println!(
         "{}",
-        theme.success(&format!("✓ installed to {}", target.display()))
+        theme.success(format!("✓ installed to {}", target.display()))
     );
 
     // Verify the installed copy actually runs — installing a broken or
     // wrong-architecture binary should fail loudly here.
-    match std::process::Command::new(&target).arg("--version").output() {
+    match std::process::Command::new(&target)
+        .arg("--version")
+        .output()
+    {
         Ok(out) if out.status.success() => {
             let v = String::from_utf8_lossy(&out.stdout);
             let v = v.trim();
             if !v.is_empty() {
-                println!("{}", theme.muted(&format!("  installed binary reports: {v}")));
+                println!(
+                    "{}",
+                    theme.muted(format!("  installed binary reports: {v}"))
+                );
             }
         }
         Ok(out) => {
@@ -288,7 +296,7 @@ fn run_install(dir: Option<std::path::PathBuf>, theme: &Theme) -> BoxResult {
         Err(e) => {
             println!(
                 "{}",
-                theme.warning(&format!(
+                theme.warning(format!(
                     "  warning: could not launch the installed binary to verify it ({e})"
                 ))
             );
@@ -298,7 +306,7 @@ fn run_install(dir: Option<std::path::PathBuf>, theme: &Theme) -> BoxResult {
     if !is_dir_on_path(&target_dir) {
         println!(
             "{}",
-            theme.warning(&format!(
+            theme.warning(format!(
                 "⚠ {} is not on PATH — add it, or run via the full path: {}",
                 target_dir.display(),
                 target.display()
@@ -360,7 +368,10 @@ fn run_uninstall(dir: Option<std::path::PathBuf>, purge: bool, theme: &Theme) ->
         // user may have installed elsewhere or via a package manager).
         println!(
             "{}",
-            theme.muted(&format!("· {} not found — nothing to remove", target.display()))
+            theme.muted(format!(
+                "· {} not found — nothing to remove",
+                target.display()
+            ))
         );
     }
 
@@ -417,10 +428,16 @@ fn print_version_line(theme: &Theme) {
 fn print_cli_usage(theme: &Theme) {
     println!("{}", theme.accent_bold("usage:"));
     let lines = [
-        ("requiem", "interactive session (auto-runs setup on first launch)"),
+        (
+            "requiem",
+            "interactive session (auto-runs setup on first launch)",
+        ),
         ("requiem session --resume <id>", "resume a previous session"),
         ("requiem setup", "configure endpoint, key, model, vaults"),
-        ("requiem model [--test]", "show or probe the configured model"),
+        (
+            "requiem model [--test]",
+            "show or probe the configured model",
+        ),
         ("requiem banner | help | install | uninstall", "misc"),
     ];
     for (cmd, desc) in lines {
@@ -435,7 +452,10 @@ fn print_cli_usage(theme: &Theme) {
 
 /// The slash-command reference available inside a session.
 fn print_slash_help(theme: &Theme) {
-    println!("{}", theme.accent_bold("slash commands (inside a session):"));
+    println!(
+        "{}",
+        theme.accent_bold("slash commands (inside a session):")
+    );
     for (group, cmds) in requiem_cli::commands::list_commands_grouped() {
         println!("  {}", theme.violet(group));
         for (name, desc) in cmds {

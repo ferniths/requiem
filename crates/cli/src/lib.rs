@@ -8,5 +8,3 @@ pub mod config;
 pub mod history;
 pub mod session;
 pub mod setup;
-
-pub use commands::CommandResult;

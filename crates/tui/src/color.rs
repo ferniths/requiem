@@ -68,22 +68,22 @@ pub enum ColorMode {
 
 /// The 16 base ANSI colours, in SGR foreground order (30-37, 90-97).
 const ANSI16: [Rgb; 16] = [
-    Rgb(0x00, 0x00, 0x00),   // 0 black
-    Rgb(0xBB, 0x00, 0x00),   // 1 red
-    Rgb(0x00, 0xBB, 0x00),   // 2 green
-    Rgb(0xBB, 0xBB, 0x00),   // 3 yellow
-    Rgb(0x00, 0x00, 0xBB),   // 4 blue
-    Rgb(0xBB, 0x00, 0xBB),   // 5 magenta
-    Rgb(0x00, 0xBB, 0xBB),   // 6 cyan
-    Rgb(0xBB, 0xBB, 0xBB),   // 7 white
-    Rgb(0x55, 0x55, 0x55),   // 8 bright black
-    Rgb(0xFF, 0x55, 0x55),   // 9 bright red
-    Rgb(0x55, 0xFF, 0x55),   // 10 bright green
-    Rgb(0xFF, 0xFF, 0x55),   // 11 bright yellow
-    Rgb(0x55, 0x55, 0xFF),   // 12 bright blue
-    Rgb(0xFF, 0x55, 0xFF),   // 13 bright magenta
-    Rgb(0x55, 0xFF, 0xFF),   // 14 bright cyan
-    Rgb(0xFF, 0xFF, 0xFF),   // 15 bright white
+    Rgb(0x00, 0x00, 0x00), // 0 black
+    Rgb(0xBB, 0x00, 0x00), // 1 red
+    Rgb(0x00, 0xBB, 0x00), // 2 green
+    Rgb(0xBB, 0xBB, 0x00), // 3 yellow
+    Rgb(0x00, 0x00, 0xBB), // 4 blue
+    Rgb(0xBB, 0x00, 0xBB), // 5 magenta
+    Rgb(0x00, 0xBB, 0xBB), // 6 cyan
+    Rgb(0xBB, 0xBB, 0xBB), // 7 white
+    Rgb(0x55, 0x55, 0x55), // 8 bright black
+    Rgb(0xFF, 0x55, 0x55), // 9 bright red
+    Rgb(0x55, 0xFF, 0x55), // 10 bright green
+    Rgb(0xFF, 0xFF, 0x55), // 11 bright yellow
+    Rgb(0x55, 0x55, 0xFF), // 12 bright blue
+    Rgb(0xFF, 0x55, 0xFF), // 13 bright magenta
+    Rgb(0x55, 0xFF, 0xFF), // 14 bright cyan
+    Rgb(0xFF, 0xFF, 0xFF), // 15 bright white
 ];
 
 /// Nearest base-16 ANSI colour index for an RGB value.
@@ -150,6 +150,7 @@ pub enum Attr {
 /// Foreground SGR parameter string for `rgb` under `mode`.
 /// Returns `None` when colour is disabled.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn fg_params(mode: ColorMode, rgb: Rgb) -> Option<String> {
     match mode {
         ColorMode::NoColor => None,
@@ -222,7 +223,8 @@ pub fn ansi_wrap(mode: ColorMode, fg: FgSpec, attrs: &[Attr], text: &str) -> Str
             }
         }
         mode => {
-            let mut params: Vec<String> = attrs.iter().map(|a| attr_param(*a).to_string()).collect();
+            let mut params: Vec<String> =
+                attrs.iter().map(|a| attr_param(*a).to_string()).collect();
             if let Some(idx) = fg.hand_index() {
                 if idx < 8 {
                     params.push(format!("3{idx}"));
@@ -334,7 +336,9 @@ pub fn auto_detect(is_tty: bool) -> ColorMode {
     if std::env::var("WT_SESSION").is_ok() {
         return ColorMode::TrueColor;
     }
-    let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    let term = std::env::var("TERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if term.contains("256color") {
         return ColorMode::Ansi256;
     }
@@ -376,7 +380,12 @@ mod tests {
 
     #[test]
     fn nocolor_strips_everything() {
-        let s = ansi_wrap(ColorMode::NoColor, FgSpec::Rgb(Rgb(255, 0, 0)), &[Attr::Bold], "x");
+        let s = ansi_wrap(
+            ColorMode::NoColor,
+            FgSpec::Rgb(Rgb(255, 0, 0)),
+            &[Attr::Bold],
+            "x",
+        );
         assert_eq!(s, "\x1b[1mx\x1b[0m");
         let s = ansi_wrap(ColorMode::NoColor, FgSpec::Rgb(Rgb(255, 0, 0)), &[], "x");
         assert_eq!(s, "x");
@@ -406,7 +415,10 @@ mod tests {
 
     #[test]
     fn empty_text_stays_empty() {
-        assert_eq!(ansi_wrap(ColorMode::TrueColor, FgSpec::Rgb(Rgb(1, 2, 3)), &[], ""), "");
+        assert_eq!(
+            ansi_wrap(ColorMode::TrueColor, FgSpec::Rgb(Rgb(1, 2, 3)), &[], ""),
+            ""
+        );
     }
 
     #[test]

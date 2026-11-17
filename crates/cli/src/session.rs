@@ -18,16 +18,18 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use requiem_cli::commands as slash;
-use requiem_cli::config::Config;
+use crate::commands as slash;
+use crate::config::Config;
 use requiem_core::events::{Event, NoticeLevel};
 use requiem_core::mode::Mode;
 use requiem_orchestration::agent_runtime::{
     run_agent_halted, AgentRun, CancelFlag, EventTx, ToolExecutor,
 };
+use requiem_orchestration::scheduler::{Scheduler, SchedulerConfig, SharedScheduler};
 use requiem_permissions::PermissionGate;
 use requiem_tools::{GrepSearchTool, ObsidianTool, Tool};
 use requiem_tui::app::{App, CommandHints, UiAction};
@@ -40,21 +42,21 @@ const UI_TICK: Duration = Duration::from_millis(50);
 
 /// A registered tool bridge: shared tool map + shared permission gate.
 struct ToolBridge {
-    tools: Arc<std::sync::Mutex<HashMap<String, Box<dyn Tool>>>>,
+    tools: Arc<std::sync::Mutex<HashMap<String, Arc<dyn Tool>>>>,
     gate: Arc<RwLock<PermissionGate>>,
 }
 
 impl ToolBridge {
     fn new(gate: PermissionGate) -> Self {
-        let tools: HashMap<String, Box<dyn Tool>> = [
-            Box::new(requiem_tools::FileReadTool) as Box<dyn Tool>,
-            Box::new(requiem_tools::FileWriteTool),
-            Box::new(requiem_tools::FileEditTool),
-            Box::new(requiem_tools::FileDeleteTool),
-            Box::new(requiem_tools::TerminalTool),
-            Box::new(requiem_tools::GitTool),
-            Box::new(requiem_tools::GlobSearchTool),
-            Box::new(requiem_tools::GrepSearchTool),
+        let tools: HashMap<String, Arc<dyn Tool>> = [
+            Arc::new(requiem_tools::FileReadTool) as Arc<dyn Tool>,
+            Arc::new(requiem_tools::FileWriteTool),
+            Arc::new(requiem_tools::FileEditTool),
+            Arc::new(requiem_tools::FileDeleteTool),
+            Arc::new(requiem_tools::TerminalTool),
+            Arc::new(requiem_tools::GitTool),
+            Arc::new(requiem_tools::GlobSearchTool),
+            Arc::new(requiem_tools::GrepSearchTool),
         ]
         .into_iter()
         .map(|t| (t.name().to_string(), t))
@@ -70,7 +72,7 @@ impl ToolBridge {
         *self.gate.write().await = PermissionGate::for_mode(mode);
     }
 
-    fn add_tool(&self, tool: Box<dyn Tool>) {
+    fn add_tool(&self, tool: Arc<dyn Tool>) {
         self.tools
             .lock()
             .unwrap()
@@ -123,7 +125,7 @@ impl ToolBridge {
 
 /// The async executor the agent runtime calls.
 struct BridgeExecutor {
-    tools: Arc<std::sync::Mutex<HashMap<String, Box<dyn Tool>>>>,
+    tools: Arc<std::sync::Mutex<HashMap<String, Arc<dyn Tool>>>>,
     gate: Arc<RwLock<PermissionGate>>,
 }
 
@@ -145,36 +147,35 @@ impl ToolExecutor for BridgeExecutor {
                 _ => true,
             };
             if !allowed {
-                return Err(requiem_core::error::RequiemError::PermissionDenied(format!(
-                    "tool '{name}' is denied in the current mode"
-                )));
+                return Err(requiem_core::error::RequiemError::PermissionDenied(
+                    format!("tool '{name}' is denied in the current mode"),
+                ));
             }
         }
-        let tool = {
+        let tool: Arc<dyn Tool> = {
             let map = self.tools.lock().unwrap();
-            map.get(name).map(|t| t as &dyn Tool)
-        };
-        match tool {
-            Some(tool) => {
-                tool.execute(arguments)
-                    .await
-                    .map_err(|e| requiem_core::error::RequiemError::Tool {
+            match map.get(name).cloned() {
+                Some(t) => t,
+                None => {
+                    return Err(requiem_core::error::RequiemError::Tool {
                         tool: name.to_string(),
-                        message: e.to_string(),
+                        message: "unknown tool".to_string(),
                     })
+                }
             }
-            None => Err(requiem_core::error::RequiemError::Tool {
+        };
+        tool.execute(arguments)
+            .await
+            .map_err(|e| requiem_core::error::RequiemError::Tool {
                 tool: name.to_string(),
-                message: "unknown tool".to_string(),
-            }),
-        }
+                message: e.to_string(),
+            })
     }
 }
 
 /// What a slash command asks the driver to do next.
 enum Directive {
     Continue,
-    CancelRun,
     Exit,
     /// Re-run setup: leave full-screen, run the wizard, come back.
     RunSetup,
@@ -186,14 +187,16 @@ pub async fn run_session(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let config = match Config::load() {
         Ok(c) => c,
-        Err(requiem_cli::config::ConfigError::NotInitialized) => {
+        Err(crate::config::ConfigError::NotInitialized) => {
             return Err("no configuration found — run `requiem setup` first".into());
         }
         Err(e) => return Err(e.to_string().into()),
     };
     requiem_tui::init_color_mode();
     let theme = theme_from_name(&config.theme);
-    let client = Arc::new(requiem_model::client::ModelClient::new(config.to_model_config())?);
+    let client = Arc::new(requiem_model::client::ModelClient::new(
+        config.to_model_config(),
+    )?);
     let hints = build_command_hints();
 
     let session_id = resume.unwrap_or_else(Uuid::new_v4);
@@ -211,19 +214,14 @@ pub async fn run_session(
 
     // Vault tool from configured vaults (first = default).
     if !config.vaults.is_empty() {
-        let roots: Vec<std::path::PathBuf> = config
-            .vaults
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect();
-        bridge.add_tool(Box::new(ObsidianTool::with_vaults(roots)));
+        let roots: Vec<std::path::PathBuf> =
+            config.vaults.iter().map(std::path::PathBuf::from).collect();
+        bridge.add_tool(std::sync::Arc::new(ObsidianTool::with_vaults(roots)));
     }
 
     // Seed the full-screen app with prior records on resume.
     let prior = if resume.is_some() {
-        store
-            .records_for_session(&session_id)
-            .unwrap_or_default()
+        store.records_for_session(&session_id).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -247,14 +245,7 @@ pub async fn run_session(
         .await?
     } else {
         run_plain(
-            &config,
-            theme,
-            client,
-            bridge,
-            event_tx,
-            &store,
-            session_id,
-            prior,
+            &config, theme, client, bridge, event_tx, &store, session_id, prior,
         )
         .await?
     };
@@ -267,12 +258,15 @@ fn build_command_hints() -> CommandHints {
     let mut hints = CommandHints::default();
     for (name, desc) in slash::list_commands() {
         hints.names.push(name.to_string());
-        hints.descriptions.insert(name.to_string(), desc.to_string());
+        hints
+            .descriptions
+            .insert(name.to_string(), desc.to_string());
         let args = slash::suggest_args(name);
         if !args.is_empty() {
-            hints
-                .args
-                .insert(name.to_string(), args.iter().map(|s| s.to_string()).collect());
+            hints.args.insert(
+                name.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            );
         }
     }
     hints
@@ -352,8 +346,22 @@ async fn run_fullscreen(
     let mut tasks_ok: usize = prior.iter().filter(|r| r.success).count();
     let mut tasks_in_flight = false;
     let cancel = CancelFlag::new();
-    // Pending cancel request from /stop while a run spawns.
-    let mut run_handle: Option<tokio::task::JoinHandle<()>> = None;
+    // The scheduler is the source of truth for task state. On resume,
+    // restore the last checkpointed task graph so in-flight multi-agent
+    // work continues rather than starting fresh.
+    let scheduler: SharedScheduler = Arc::new(std::sync::Mutex::new({
+        let cfg = SchedulerConfig {
+            max_agents: config.max_concurrency as usize,
+            ..Default::default()
+        };
+        if let Some(graph) = store.load_task_graph(&session_id).unwrap_or_default() {
+            Scheduler::restore(cfg, graph)
+        } else {
+            Scheduler::new(cfg)
+        }
+    }));
+    // Multiple concurrent task runs (bounded by max_concurrency).
+    let mut active_runs: Vec<(requiem_core::Id, tokio::task::JoinHandle<()>)> = Vec::new();
     // Finished runs are delivered here so the UI loop can persist their
     // records; the JoinHandle alone would lose the AgentRun state.
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<AgentRun>();
@@ -368,26 +376,44 @@ async fn run_fullscreen(
 
         // 2. Reap completed runs. The JoinHandle catches panics; the done
         //    channel delivers the final AgentRun for persistence.
-        if tasks_in_flight && run_handle.as_ref().is_some_and(|h| h.is_finished()) {
-            if let Some(handle) = run_handle.take() {
-                match handle.await {
-                    Ok(()) => {} // completion arrives via the done channel
-                    Err(e) => {
-                        tasks_in_flight = false;
-                        app.set_running(false);
-                        app.push_system(
-                            &format!("task run crashed: {e}"),
-                            NoticeLevel::Error,
-                        );
-                    }
+        if active_runs.iter().any(|(_, h)| h.is_finished()) {
+            let mut still_active = Vec::new();
+            for (task_id, handle) in active_runs.drain(..) {
+                if handle.is_finished() {
+                    // Reap — completion arrives via the done channel.
+                    let _ = handle.await;
+                } else {
+                    still_active.push((task_id, handle));
                 }
             }
+            active_runs = still_active;
         }
         while let Ok(run) = done_rx.try_recv() {
             let ok = run.final_response.is_some();
             persist_run(store, session_id, &run);
             tasks_ok += usize::from(ok);
-            tasks_in_flight = false;
+            // Update the scheduler's task graph.
+            let task_id = run.task.id.clone();
+            {
+                let mut sched = scheduler.lock().unwrap();
+                if ok {
+                    let result = run
+                        .final_response
+                        .as_ref()
+                        .and_then(|r| r.text())
+                        .map(|s| serde_json::Value::String(s.to_string()))
+                        .unwrap_or(serde_json::Value::Null);
+                    sched.complete_task(&task_id, result);
+                } else {
+                    sched.fail_task(&task_id, "run did not complete");
+                }
+                // Checkpoint the updated graph so a crash or restart can
+                // resume multi-agent state, not just finished records.
+                let _ = store.save_task_graph(&session_id, &sched.graph);
+            }
+            if active_runs.is_empty() {
+                tasks_in_flight = false;
+            }
         }
 
         // 3. Draw.
@@ -403,71 +429,59 @@ async fn run_fullscreen(
         else {
             continue;
         };
-        match cev {
-            CEvent::Key(key) => {
-                let action = app.handle_key(key);
-                let directive = handle_action(
-                    &mut app,
-                    action,
-                    config,
-                    &client,
-                    &bridge,
-                    store,
-                    session_id,
-                    &event_tx,
-                    &cancel,
-                    &mut tasks_total,
-                    &mut tasks_in_flight,
-                    &mut run_handle,
-                    &done_tx,
-                    &mut history,
-                )
-                .await;
-                match directive {
-                    Directive::Continue => {}
-                    Directive::CancelRun => {}
-                    Directive::Exit => break Ok(final_summary(
-                        store,
-                        session_id,
-                        tasks_total,
-                        tasks_ok,
-                    )),
-                    Directive::RunSetup => {
-                        // Leave full-screen, run the wizard, rebuild.
-                        let _ = disable_raw_mode();
-                        let _ = crossterm::execute!(
-                            std::io::stdout(),
-                            LeaveAlternateScreen
-                        );
-                        match crate::setup::run_wizard() {
-                            Ok(cfg) => {
-                                let t = theme_from_name(&cfg.theme);
-                                app = App::new(
-                                    t,
-                                    build_command_hints(),
-                                    session_label.to_string(),
-                                    client.model().to_string(),
-                                );
-                                app.set_mode(cfg.default_mode.as_str());
-                                app.set_history(history.entries().to_vec());
-                                app.push_system(
-                                    "setup complete — new config is live",
-                                    NoticeLevel::Success,
-                                );
-                            }
-                            Err(e) => {
-                                app.push_system(
-                                    &format!("setup cancelled: {e}"),
-                                    NoticeLevel::Warning,
-                                );
-                            }
+        if let Ok(CEvent::Key(key)) = cev {
+            let action = app.handle_key(key);
+            let directive = handle_action(
+                &mut app,
+                action,
+                config,
+                &client,
+                &bridge,
+                store,
+                session_id,
+                &event_tx,
+                &cancel,
+                &mut tasks_total,
+                &mut tasks_in_flight,
+                &mut active_runs,
+                &done_tx,
+                &mut history,
+                &scheduler,
+            )
+            .await;
+            match directive {
+                Directive::Continue => {}
+                Directive::Exit => {
+                    break Ok(final_summary(store, session_id, tasks_total, tasks_ok))
+                }
+                Directive::RunSetup => {
+                    // Leave full-screen, run the wizard, rebuild.
+                    let _ = disable_raw_mode();
+                    let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+                    match crate::setup::run_wizard() {
+                        Ok(cfg) => {
+                            let t = theme_from_name(&cfg.theme);
+                            app = App::new(
+                                t,
+                                build_command_hints(),
+                                session_label.to_string(),
+                                client.model().to_string(),
+                            );
+                            app.set_mode(cfg.default_mode.as_str());
+                            app.set_history(history.entries().to_vec());
+                            app.push_system(
+                                "setup complete — new config is live",
+                                NoticeLevel::Success,
+                            );
                         }
-                        enable_raw_mode()?;
-                        crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+                        Err(e) => {
+                            app.push_system(&format!("setup cancelled: {e}"), NoticeLevel::Warning);
+                        }
                     }
+                    enable_raw_mode()?;
+                    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
                 }
             }
-            _ => {}
         }
     };
 
@@ -496,9 +510,10 @@ async fn handle_action(
     cancel: &CancelFlag,
     tasks_total: &mut usize,
     tasks_in_flight: &mut bool,
-    run_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    active_runs: &mut Vec<(requiem_core::Id, tokio::task::JoinHandle<()>)>,
     done_tx: &tokio::sync::mpsc::UnboundedSender<AgentRun>,
     history: &mut InputHistory,
+    scheduler: &SharedScheduler,
 ) -> Directive {
     match action {
         UiAction::None => Directive::Continue,
@@ -535,9 +550,10 @@ async fn handle_action(
                     cancel,
                     tasks_total,
                     tasks_in_flight,
-                    run_handle,
+                    active_runs,
                     done_tx,
                     history,
+                    scheduler,
                 )
                 .await
             }
@@ -554,7 +570,7 @@ async fn dispatch_slash(
     client: &Arc<requiem_model::client::ModelClient>,
     bridge: &ToolBridge,
     _store: &requiem_memory::session::Session,
-    _session_id: Uuid,
+    session_id: Uuid,
     event_tx: &EventTx,
     cancel: &CancelFlag,
     tasks_in_flight: &bool,
@@ -748,7 +764,10 @@ async fn dispatch_slash(
                 app.push_system(&format!("theme → {rest} (saved)"), NoticeLevel::Success);
             } else {
                 app.push_system(
-                    &format!("unknown theme '{rest}' — options: {}", THEME_NAMES.join(", ")),
+                    &format!(
+                        "unknown theme '{rest}' — options: {}",
+                        THEME_NAMES.join(", ")
+                    ),
                     NoticeLevel::Warning,
                 );
             }
@@ -821,13 +840,10 @@ async fn dispatch_slash(
                         }
                         app.push_system(&out, NoticeLevel::Info);
                     }
-                    Err(e) => {
-                        app.push_system(&format!("could not list sessions: {e}"), NoticeLevel::Error)
-                    }
+                    Err(e) => app
+                        .push_system(&format!("could not list sessions: {e}"), NoticeLevel::Error),
                 },
-                None => {
-                    app.push_system("could not open the session database", NoticeLevel::Error)
-                }
+                None => app.push_system("could not open the session database", NoticeLevel::Error),
             }
             Directive::Continue
         }
@@ -874,10 +890,7 @@ fn unknown_command(app: &mut App, cmd: &str) {
             NoticeLevel::Warning,
         );
     } else {
-        let list: Vec<String> = suggestions
-            .iter()
-            .map(|s| format!("/{s}"))
-            .collect();
+        let list: Vec<String> = suggestions.iter().map(|s| format!("/{s}")).collect();
         app.push_system(
             &format!("unknown command /{cmd} — did you mean {}?", list.join(", ")),
             NoticeLevel::Warning,
@@ -938,16 +951,27 @@ async fn start_task(
     cancel: &CancelFlag,
     tasks_total: &mut usize,
     tasks_in_flight: &mut bool,
-    run_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    active_runs: &mut Vec<(requiem_core::Id, tokio::task::JoinHandle<()>)>,
     done_tx: &tokio::sync::mpsc::UnboundedSender<AgentRun>,
     _history: &mut InputHistory,
+    scheduler: &SharedScheduler,
 ) -> Directive {
-    if *tasks_in_flight {
-        app.push_system(
-            "a task is already running — /stop cancels it first",
-            NoticeLevel::Warning,
-        );
-        return Directive::Continue;
+    // Use the scheduler as the concurrency gate: it tracks which tasks
+    // are running and how many agent slots are free.
+    {
+        let mut sched = scheduler.lock().unwrap();
+        let free_slots = sched.poll_available().len();
+        if free_slots == 0 && !sched.has_pending_work() {
+            // No slots free and no queued work — reject.
+            app.push_system(
+                &format!(
+                    "max concurrency reached ({}) — wait for a task to finish",
+                    config.max_concurrency
+                ),
+                NoticeLevel::Warning,
+            );
+            return Directive::Continue;
+        }
     }
     if *tasks_total >= config.max_task_budget as usize {
         app.push_system(
@@ -962,28 +986,57 @@ async fn start_task(
 
     // Reset the cancel flag for the new run (previous run may have
     // cancelled it).
-    *cancel = CancelFlag::new();
+    cancel.reset();
 
     app.push_user_line(line);
     *tasks_total += 1;
 
     // The subagent tool binds this run's event feed + cancel flag.
+    // Pass the *full* tool set (minus spawn_subagent itself to avoid
+    // infinite nesting at this level) so children can actually do work.
     if bridge.is_tool_allowed("spawn_subagent").await {
         let child_executor = bridge.share();
         let parent = requiem_core::agent::Agent::master(
             "master",
             requiem_core::Id::from(session_id.to_string()),
         );
+        let child_tools: Vec<requiem_model::request::ToolDef> = {
+            let names: Vec<String> = bridge
+                .tools
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|n| n.as_str() != "spawn_subagent" && n.as_str() != "spawn_subagents")
+                .cloned()
+                .collect();
+            names
+                .iter()
+                .filter_map(|n| bridge.tools.lock().unwrap().get(n).map(|t| t.tool_def()))
+                .collect()
+        };
         let sub_tool = requiem_tools::make_subagent_tool(
+            client.clone(),
+            child_executor.clone(),
+            parent.clone(),
+            requiem_core::Id::from(session_id.to_string()),
+            child_tools.clone(),
+        )
+        .with_max_depth(config.max_agent_depth)
+        .with_events(event_tx.clone())
+        .with_cancel(cancel.clone());
+        bridge.add_tool(std::sync::Arc::new(sub_tool));
+
+        let parallel_tool = requiem_tools::make_parallel_subagent_tool(
             client.clone(),
             child_executor,
             parent,
             requiem_core::Id::from(session_id.to_string()),
-            Vec::new(),
+            child_tools,
         )
+        .with_max_depth(config.max_agent_depth)
         .with_events(event_tx.clone())
         .with_cancel(cancel.clone());
-        bridge.add_tool(Box::new(sub_tool));
+        bridge.add_tool(std::sync::Arc::new(parallel_tool));
     }
 
     let tools = bridge.tool_defs().await;
@@ -992,30 +1045,37 @@ async fn start_task(
         requiem_core::Id::from(session_id.to_string()),
     );
     let task = requiem_core::task::Task::new(line);
+    let task_id = task.id.clone();
+
+    // Register the task in the scheduler's graph and claim it.
+    {
+        let mut sched = scheduler.lock().unwrap();
+        sched.add_task(task.clone());
+        let agent_id = requiem_core::agent::AgentId("master".into());
+        let _ = sched.claim(&task_id, &agent_id);
+        sched.start_task(&task_id);
+    }
+
     let mut run = AgentRun::new(agent, task);
     let client = client.clone();
     let executor = bridge.share();
     let tx = event_tx.clone();
     let flag = cancel.clone();
+    let done_tx_owned = done_tx.clone();
 
     *tasks_in_flight = true;
     let handle = tokio::spawn(async move {
-        let _ = run_agent_halted(&client, &executor, &mut run, &tools, Some(&tx), Some(&flag)).await;
-        // Deliver the final run state (tokens, response) back to the UI
-        // loop for record persistence.
-        let _ = done_tx.send(run);
+        let _ =
+            run_agent_halted(&client, &executor, &mut run, &tools, Some(&tx), Some(&flag)).await;
+        let _ = done_tx_owned.send(run);
     });
-    *run_handle = Some(handle);
+    active_runs.push((task_id, handle));
     Directive::Continue
 }
 
 /// Persist a finished run's outcome as a session record. Mirrors the
 /// plain-mode record layout so `/resume` sees both paths identically.
-fn persist_run(
-    store: &requiem_memory::session::Session,
-    session_id: Uuid,
-    run: &AgentRun,
-) {
+fn persist_run(store: &requiem_memory::session::Session, session_id: Uuid, run: &AgentRun) {
     let resp_text = run
         .final_response
         .as_ref()
@@ -1024,7 +1084,7 @@ fn persist_run(
     let rec = requiem_memory::session::SessionRecord {
         session_id,
         task_description: run.task.description.clone(),
-        role: run.agent.role.clone(),
+        role: run.agent.role.to_string(),
         final_response_json: resp_text,
         tokens_input: run.token_totals.input as u32,
         tokens_output: run.token_totals.output as u32,
@@ -1058,6 +1118,7 @@ fn fmt_u32_tokens(n: u32) -> String {
 // ── Plain (non-TTY) mode ─────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::while_let_loop)]
 async fn run_plain(
     config: &Config,
     theme: Theme,
@@ -1068,7 +1129,7 @@ async fn run_plain(
     session_id: Uuid,
     prior: Vec<requiem_memory::session::SessionRecord>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let renderer = requiem_tui::ThemedRenderer::new(&theme);
+    let _renderer = requiem_tui::ThemedRenderer::new(&theme);
     println!("{}", requiem_tui::banner::render_themed(&theme));
     println!(
         "{}",
@@ -1091,6 +1152,11 @@ async fn run_plain(
     let cancel = CancelFlag::new();
     let mut tasks_total: usize = prior.len();
     let mut tasks_ok: usize = prior.iter().filter(|r| r.success).count();
+    let scheduler: SharedScheduler =
+        Arc::new(std::sync::Mutex::new(Scheduler::new(SchedulerConfig {
+            max_agents: config.max_concurrency as usize,
+            ..Default::default()
+        })));
 
     loop {
         let Some(line) = history.read_line() else {
@@ -1102,9 +1168,9 @@ async fn run_plain(
         }
 
         if line.starts_with('/') {
-            let mut parts = line[1..].split_whitespace();
+            let rest_stripped = line.strip_prefix('/').unwrap();
+            let mut parts = rest_stripped.split_whitespace();
             let cmd = parts.next().unwrap_or("").to_string();
-            let rest = parts.collect::<Vec<_>>().join(" ");
             match cmd.as_str() {
                 "exit" | "quit" => break,
                 "help" => {
@@ -1154,7 +1220,7 @@ async fn run_plain(
             );
             continue;
         }
-        *cancel = CancelFlag::new();
+        cancel.reset();
         tasks_total += 1;
         println!(
             "  ▸ task #{tasks_total} — {} — running…",
@@ -1163,22 +1229,50 @@ async fn run_plain(
                 .slash()
         );
 
-        // Subagent tool for this run.
+        // Subagent tool for this run: give the child the full tool set
+        // (minus spawn_subagent) so it can actually do work.
         if bridge.is_tool_allowed("spawn_subagent").await {
             let parent = requiem_core::agent::Agent::master(
                 "master",
                 requiem_core::Id::from(session_id.to_string()),
             );
+            let child_tools: Vec<requiem_model::request::ToolDef> = {
+                let names: Vec<String> = bridge
+                    .tools
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|n| n.as_str() != "spawn_subagent" && n.as_str() != "spawn_subagents")
+                    .cloned()
+                    .collect();
+                names
+                    .iter()
+                    .filter_map(|n| bridge.tools.lock().unwrap().get(n).map(|t| t.tool_def()))
+                    .collect()
+            };
             let sub_tool = requiem_tools::make_subagent_tool(
+                client.clone(),
+                bridge.share(),
+                parent.clone(),
+                requiem_core::Id::from(session_id.to_string()),
+                child_tools.clone(),
+            )
+            .with_max_depth(config.max_agent_depth)
+            .with_events(event_tx.clone())
+            .with_cancel(cancel.clone());
+            bridge.add_tool(std::sync::Arc::new(sub_tool));
+
+            let parallel_tool = requiem_tools::make_parallel_subagent_tool(
                 client.clone(),
                 bridge.share(),
                 parent,
                 requiem_core::Id::from(session_id.to_string()),
-                Vec::new(),
+                child_tools,
             )
+            .with_max_depth(config.max_agent_depth)
             .with_events(event_tx.clone())
             .with_cancel(cancel.clone());
-            bridge.add_tool(Box::new(sub_tool));
+            bridge.add_tool(std::sync::Arc::new(parallel_tool));
         }
 
         let tools = bridge.tool_defs().await;
@@ -1187,12 +1281,21 @@ async fn run_plain(
             requiem_core::Id::from(session_id.to_string()),
         );
         let task = requiem_core::task::Task::new(&line);
+        let task_id = task.id.clone();
+        {
+            let mut sched = scheduler.lock().unwrap();
+            sched.add_task(task.clone());
+            let agent_id = requiem_core::agent::AgentId("master".into());
+            let _ = sched.claim(&task_id, &agent_id);
+            sched.start_task(&task_id);
+        }
         let mut run = AgentRun::new(agent, task);
 
         let mut event_rx = event_tx.subscribe();
-        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<
-            (AgentRun, Result<(), requiem_core::error::RequiemError>),
-        >();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            AgentRun,
+            Result<(), requiem_core::error::RequiemError>,
+        )>();
         {
             let client = client.clone();
             let executor = bridge.share();
@@ -1236,8 +1339,16 @@ async fn run_plain(
                             }
                             final_run = Some(run);
                             match result {
-                                Ok(()) => tasks_ok += 1,
-                                Err(e) => final_err = Some(e),
+                                Ok(()) => {
+                                    tasks_ok += 1;
+                                    let mut sched = scheduler.lock().unwrap();
+                                    sched.complete_task(&task_id, serde_json::Value::Null);
+                                }
+                                Err(e) => {
+                                    final_err = Some(e);
+                                    let mut sched = scheduler.lock().unwrap();
+                                    sched.fail_task(&task_id, "run failed");
+                                }
                             }
                             break;
                         }

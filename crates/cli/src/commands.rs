@@ -19,23 +19,34 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("dashboard", "View", "open the live dashboard overlay"),
     CommandSpec::new("agents", "View", "list agents and their state"),
     CommandSpec::new("tasks", "View", "list tasks and their status"),
-    CommandSpec::new("status", "View", "session status: mode, model, tokens, tasks"),
+    CommandSpec::new(
+        "status",
+        "View",
+        "session status: mode, model, tokens, tasks",
+    ),
     CommandSpec::new("events", "View", "recent runtime events"),
     // ── Config ──────────────────────────────────────────────────────
-    CommandSpec::new("model", "Config", "show or test the configured model")
-        .with_args(&["--test"]),
+    CommandSpec::new("model", "Config", "show or test the configured model").with_args(&["--test"]),
     CommandSpec::new("theme", "Config", "list themes or switch: /theme [name]")
         .with_args(&["[name]"]),
     CommandSpec::new("setup", "Config", "re-run the interactive setup wizard"),
     CommandSpec::new("vault", "Config", "list configured Obsidian vaults"),
-    CommandSpec::new("permissions", "Config", "show the permission rules for the current mode"),
+    CommandSpec::new(
+        "permissions",
+        "Config",
+        "show the permission rules for the current mode",
+    ),
     CommandSpec::new("budget", "Config", "show token and task budget usage"),
     // ── Memory ──────────────────────────────────────────────────────
     CommandSpec::new("sessions", "Memory", "list past sessions"),
     CommandSpec::new("resume", "Memory", "resume a past session: /resume <id>")
         .with_args(&["<session-id>"]),
-    CommandSpec::new("brain", "Memory", "search the Obsidian brain: /brain <query>")
-        .with_args(&["<query>"]),
+    CommandSpec::new(
+        "brain",
+        "Memory",
+        "search the Obsidian brain: /brain <query>",
+    )
+    .with_args(&["<query>"]),
     // ── Help ────────────────────────────────────────────────────────
     CommandSpec::new("help", "Help", "show this help"),
     CommandSpec::new("exit", "Help", "leave the session (alias: /quit)"),
@@ -103,10 +114,7 @@ pub fn list_commands_grouped() -> Vec<(&'static str, Vec<(&'static str, &'static
 
 /// Flat listing (name, description) for plain help output.
 pub fn list_commands() -> Vec<(&'static str, &'static str)> {
-    COMMANDS
-        .iter()
-        .map(|c| (c.name, c.description))
-        .collect()
+    COMMANDS.iter().map(|c| (c.name, c.description)).collect()
 }
 
 /// Suggest commands that start with the given (lowercased) prefix.
@@ -143,8 +151,13 @@ pub fn accepts_arg(name: &str, arg: &str) -> bool {
     let arg_lower = arg.to_lowercase();
     spec.args.iter().any(|hint| {
         let hint = hint.trim_matches(|c| c == '[' || c == ']' || c == '<' || c == '>');
-        // Bracketed hints are free-form values, not literal flags.
-        hint.starts_with('-') || hint.starts_with("--") || arg_lower.contains(hint) || hint == arg_lower
+        if hint.starts_with('-') {
+            // Flag-style hint: the arg must match it exactly.
+            arg_lower == hint.to_lowercase()
+        } else {
+            // Free-form value hint: accept any non-flag argument.
+            !arg_lower.starts_with('-')
+        }
     })
 }
 
@@ -166,15 +179,30 @@ mod tests {
     #[test]
     fn registry_contains_all_required_commands() {
         let required = [
-            "ask", "plan", "code", "auto", "debug", "research", "agents", "tasks",
-            "dashboard", "status", "model", "theme", "setup", "vault", "brain",
-            "sessions", "resume", "permissions", "budget", "help", "exit",
+            "ask",
+            "plan",
+            "code",
+            "auto",
+            "debug",
+            "research",
+            "agents",
+            "tasks",
+            "dashboard",
+            "status",
+            "model",
+            "theme",
+            "setup",
+            "vault",
+            "brain",
+            "sessions",
+            "resume",
+            "permissions",
+            "budget",
+            "help",
+            "exit",
         ];
         for name in required {
-            assert!(
-                lookup(name).is_some(),
-                "command /{name} must be registered"
-            );
+            assert!(lookup(name).is_some(), "command /{name} must be registered");
         }
     }
 

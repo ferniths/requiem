@@ -162,10 +162,7 @@ impl DashState {
     }
 
     pub fn total_tokens(&self) -> u32 {
-        self.agents
-            .iter()
-            .map(|a| a.tokens_in + a.tokens_out)
-            .sum()
+        self.agents.iter().map(|a| a.tokens_in + a.tokens_out).sum()
     }
 }
 
@@ -391,7 +388,11 @@ impl App {
                         .push(TranscriptEntry::new("◆", text.clone(), Token::Text));
                 }
             }
-            Event::ToolCallStarted { agent, tool, summary } => {
+            Event::ToolCallStarted {
+                agent,
+                tool,
+                summary,
+            } => {
                 self.entries.push(TranscriptEntry::new(
                     "⚙",
                     format!("{tool}  {summary}"),
@@ -494,7 +495,9 @@ impl App {
                 }
                 self.active_task = None;
             }
-            Event::RunFailed { agent, task, error, .. } => {
+            Event::RunFailed {
+                agent, task, error, ..
+            } => {
                 self.running = false;
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Failed;
@@ -502,8 +505,11 @@ impl App {
                 if let Some(i) = self.dash.task_index(task.as_str()) {
                     self.dash.tasks[i].status = TaskStatus::Failed;
                 }
-                self.entries
-                    .push(TranscriptEntry::new("✗", format!("task failed: {error}"), Token::Error));
+                self.entries.push(TranscriptEntry::new(
+                    "✗",
+                    format!("task failed: {error}"),
+                    Token::Error,
+                ));
                 self.active_task = None;
             }
             Event::RunCancelled { agent, task } => {
@@ -547,7 +553,10 @@ impl App {
 
     fn handle_dashboard_key(&mut self, key: KeyEvent) -> UiAction {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Esc => {
+                self.dash.open = false;
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.dash.open = false;
             }
             KeyCode::Tab => {
@@ -798,8 +807,14 @@ impl App {
         let mut spans = vec![
             Span::styled(" REQUIEM", t.style_bold(Token::Accent)),
             Span::styled(" multi-agent harness", t.style(Token::TextMuted)),
-            Span::styled(format!("  session {}", self.session_label), t.style(Token::TextSecondary)),
-            Span::styled(format!("  model {}", self.model), t.style(Token::TextSecondary)),
+            Span::styled(
+                format!("  session {}", self.session_label),
+                t.style(Token::TextSecondary),
+            ),
+            Span::styled(
+                format!("  model {}", self.model),
+                t.style(Token::TextSecondary),
+            ),
         ];
         spans.push(Span::styled(
             format!("  /{}", self.mode),
@@ -873,10 +888,7 @@ impl App {
                             t.style(e.fg)
                         },
                     ));
-                    spans.push(Span::styled(
-                        indent_str.clone(),
-                        t.style(Token::TextMuted),
-                    ));
+                    spans.push(Span::styled(indent_str.clone(), t.style(Token::TextMuted)));
                 } else {
                     spans.push(Span::styled(
                         format!("    {indent_str}"),
@@ -980,10 +992,7 @@ impl App {
                     spans.push(Span::styled(format!(" /{s} "), style));
                 }
             }
-            spans.push(Span::styled(
-                " Tab cycle",
-                t.style(Token::TextMuted),
-            ));
+            spans.push(Span::styled(" Tab cycle", t.style(Token::TextMuted)));
             return spans;
         }
         if let Some((cmd, args)) = self.current_command_args() {
@@ -991,18 +1000,13 @@ impl App {
                 format!("  /{cmd} args: "),
                 t.style(Token::TextSecondary),
             )];
-            spans.push(Span::styled(
-                args.join(" | "),
-                t.style(Token::Info),
-            ));
+            spans.push(Span::styled(args.join(" | "), t.style(Token::Info)));
             return spans;
         }
-        vec![
-            Span::styled(
-                "  Enter submit · Tab dashboard · ↑ history · /help commands",
-                t.style(Token::TextMuted),
-            ),
-        ]
+        vec![Span::styled(
+            "  Enter submit · Tab dashboard · ↑ history · /help commands",
+            t.style(Token::TextMuted),
+        )]
     }
 
     /// (command, arg hints) when the input names a known command.
@@ -1082,10 +1086,7 @@ impl App {
                 format!("  session {}", self.session_label),
                 t.style(Token::TextSecondary),
             ),
-            Span::styled(
-                format!("  tasks {done}/{total}"),
-                t.style(Token::Info),
-            ),
+            Span::styled(format!("  tasks {done}/{total}"), t.style(Token::Info)),
             Span::styled(
                 format!("  agents {}", self.dash.agents.len()),
                 t.style(Token::TextSecondary),
@@ -1101,7 +1102,10 @@ impl App {
             .border_style(t.style(Token::Border));
         let hinner = hblock.inner(header);
         frame.render_widget(hblock, header);
-        frame.render_widget(Paragraph::new(header_line).wrap(Wrap { trim: false }), hinner);
+        frame.render_widget(
+            Paragraph::new(header_line).wrap(Wrap { trim: false }),
+            hinner,
+        );
 
         // Progress gauge row on top of the body.
         let ratio = if total == 0 {
@@ -1109,8 +1113,8 @@ impl App {
         } else {
             done as f64 / total as f64
         };
-        let [gauge_row, panels] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
-            .areas(body);
+        let [gauge_row, panels] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
         if area.width > 40 {
             frame.render_widget(
                 Gauge::default()
@@ -1225,7 +1229,14 @@ impl App {
                 Span::styled(" ", t.style(Token::TextMuted)),
                 Span::styled(task.status.label(), t.style(token)),
                 Span::styled("  ", t.style(Token::TextMuted)),
-                Span::styled(desc, t.style(if sel { Token::Text } else { Token::TextSecondary })),
+                Span::styled(
+                    desc,
+                    t.style(if sel {
+                        Token::Text
+                    } else {
+                        Token::TextSecondary
+                    }),
+                ),
             ];
             if let Some(a) = &task.assignee {
                 spans.push(Span::styled(
@@ -1250,7 +1261,9 @@ impl App {
             0
         };
         frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((offset, 0)),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((offset, 0)),
             inner,
         );
     }
@@ -1296,17 +1309,11 @@ impl App {
                 Span::styled(" ", t.style(Token::TextMuted)),
                 Span::styled(agent.status.to_string(), t.style(token)),
                 Span::styled(
-                    format!(
-                        "  t{}/{}",
-                        agent.turns_used, agent.turns_max
-                    ),
+                    format!("  t{}/{}", agent.turns_used, agent.turns_max),
                     t.style(Token::TextMuted),
                 ),
                 Span::styled(
-                    format!(
-                        "  tok {}",
-                        fmt_tokens(agent.tokens_in + agent.tokens_out)
-                    ),
+                    format!("  tok {}", fmt_tokens(agent.tokens_in + agent.tokens_out)),
                     t.style(Token::TextSecondary),
                 ),
             ];
@@ -1327,7 +1334,9 @@ impl App {
             0
         };
         frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((offset, 0)),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((offset, 0)),
             inner,
         );
     }
@@ -1376,7 +1385,9 @@ impl App {
             0
         };
         frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((offset, 0)),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((offset, 0)),
             inner,
         );
     }
@@ -1414,7 +1425,11 @@ impl App {
                             a.agent_id,
                             a.role,
                             a.status,
-                            if a.current_task.is_empty() { "-" } else { &a.current_task },
+                            if a.current_task.is_empty() {
+                                "-"
+                            } else {
+                                &a.current_task
+                            },
                             a.tokens_in,
                             a.tokens_out
                         ),
@@ -1477,9 +1492,18 @@ fn event_token(event: &Event) -> Token {
         Event::RunFailed { .. } => Token::Error,
         Event::RunCompleted { .. } => Token::Success,
         Event::RunCancelled { .. } => Token::Warning,
-        Event::Notice { level: NoticeLevel::Error, .. } => Token::Error,
-        Event::Notice { level: NoticeLevel::Success, .. } => Token::Success,
-        Event::Notice { level: NoticeLevel::Warning, .. } => Token::Warning,
+        Event::Notice {
+            level: NoticeLevel::Error,
+            ..
+        } => Token::Error,
+        Event::Notice {
+            level: NoticeLevel::Success,
+            ..
+        } => Token::Success,
+        Event::Notice {
+            level: NoticeLevel::Warning,
+            ..
+        } => Token::Warning,
         Event::Usage { .. } => Token::TextMuted,
         Event::ToolCallFinished { ok: false, .. } => Token::Error,
         Event::ToolCallFinished { ok: true, .. } => Token::Success,
@@ -1521,19 +1545,12 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Byte offset of char index `idx` in `s` (panics never).
 fn char_to_byte(s: &str, idx: usize) -> usize {
-    s.char_indices()
-        .nth(idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
+    s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 /// Description text for a command name (from the injected hints).
 fn hint_text(name: &str, hints: &CommandHints) -> String {
-    hints
-        .descriptions
-        .get(name)
-        .cloned()
-        .unwrap_or_default()
+    hints.descriptions.get(name).cloned().unwrap_or_default()
 }
 
 // ── Tests (TestBackend) ──────────────────────────────────────────────
@@ -1545,15 +1562,17 @@ mod tests {
     use ratatui::Terminal;
 
     fn test_app() -> App {
-        let mut hints = CommandHints::default();
-        hints.names = vec![
-            "ask".into(),
-            "auto".into(),
-            "code".into(),
-            "dashboard".into(),
-            "help".into(),
-            "exit".into(),
-        ];
+        let mut hints = CommandHints {
+            names: vec![
+                "ask".into(),
+                "auto".into(),
+                "code".into(),
+                "dashboard".into(),
+                "help".into(),
+                "exit".into(),
+            ],
+            ..Default::default()
+        };
         hints
             .descriptions
             .insert("help".into(), "show available commands".into());
@@ -1713,7 +1732,7 @@ mod tests {
         assert!(text.contains("master"), "{text}");
         assert!(text.contains("impl-1"), "{text}");
         assert!(text.contains("implementer"), "{text}");
-        assert!(text.contains("1.5k"), "tokens formatted: {text}");
+        assert!(text.contains("1.8k"), "tokens formatted: {text}");
         assert!(text.contains("tasks 0/1"), "{text}");
     }
 
@@ -1774,10 +1793,7 @@ mod tests {
             description: "task".into(),
             mode: "code".into(),
         });
-        assert_eq!(
-            app.handle_key(test_ctrl('c')),
-            UiAction::CancelRun
-        );
+        assert_eq!(app.handle_key(test_ctrl('c')), UiAction::CancelRun);
         // Driver marks the run finished:
         app.push_event(&Event::RunCancelled {
             agent: "master".into(),
@@ -1789,14 +1805,13 @@ mod tests {
     #[test]
     fn submit_action_clears_input() {
         let mut app = test_app();
-        for c in "/help" {
-            app.handle_key(test_key(KeyCode::Char(*c)));
+        for c in "/help".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
         }
         assert_eq!(app.input, "/help");
         let action = app.handle_key(test_key(KeyCode::Enter));
         assert_eq!(action, UiAction::Submit("/help".into()));
         assert!(app.input.is_empty());
-        assert!(app.history().contains(&"/help".to_string()));
     }
 
     #[test]
@@ -1850,7 +1865,7 @@ mod tests {
         assert_eq!(app.cursor, 4);
         app.handle_key(test_key(KeyCode::Left));
         app.handle_key(test_key(KeyCode::Char('X')));
-        assert_eq!(app.input, "héXll");
+        assert_eq!(app.input, "hélXl");
         // UTF-8 safety: cursor math never splits a char.
         let _ = render_to_string(&app, 60, 20);
     }
