@@ -8,6 +8,7 @@ use crate::{Result, Tool};
 /// `message` (for commit), `paths` (array, for add).
 pub struct GitTool;
 
+#[async_trait::async_trait]
 impl Tool for GitTool {
     fn name(&self) -> &str {
         "run_git"
@@ -46,7 +47,7 @@ impl Tool for GitTool {
         })
     }
 
-    fn execute(&self, args: &Value) -> Result<Value> {
+    async fn execute(&self, args: &Value) -> Result<Value> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
         if action.is_empty() {
             return Err(crate::ToolError::InvalidArgument(
@@ -126,27 +127,27 @@ mod tests {
         assert_eq!(tool.name(), "run_git");
     }
 
-    #[test]
-    fn execute_rejects_missing_action() {
+    #[tokio::test]
+    async fn execute_rejects_missing_action() {
         let tool = GitTool;
         let args = serde_json::json!({});
-        let result = tool.execute(&args);
+        let result = tool.execute(&args).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn execute_rejects_unknown_action() {
+    #[tokio::test]
+    async fn execute_rejects_unknown_action() {
         let tool = GitTool;
         let args = serde_json::json!({"action": "frobinate"});
-        let result = tool.execute(&args);
+        let result = tool.execute(&args).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn commit_requires_message() {
+    #[tokio::test]
+    async fn commit_requires_message() {
         let tool = GitTool;
         let args = serde_json::json!({"action": "commit"});
-        let result = tool.execute(&args);
+        let result = tool.execute(&args).await;
         assert!(result.is_err());
     }
 }

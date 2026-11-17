@@ -142,6 +142,35 @@ impl Session {
         Ok((in_sum as u32, out_sum as u32))
     }
 
+    /// All sessions with at least one record, newest activity first.
+    ///
+    /// Returns `(session_id, record_count, last_activity_rfc3339)`.
+    pub fn list_sessions(&self) -> Result<Vec<(Uuid, usize, String)>, MemoryError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, COUNT(*), MAX(created_at)
+                 FROM session_records
+                 GROUP BY session_id
+                 ORDER BY MAX(created_at) DESC
+                 LIMIT 50",
+            )
+            .map_err(|e| MemoryError::Db(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let sid: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                let last: String = row.get(2)?;
+                Ok((Uuid::parse_str(&sid).unwrap_or_else(|_| Uuid::nil()), count as usize, last))
+            })
+            .map_err(|e| MemoryError::Db(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| MemoryError::Db(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
     /// Delete all records for a session.
     pub fn delete_session(&self, session_id: &Uuid) -> Result<u64, MemoryError> {
         let n = self

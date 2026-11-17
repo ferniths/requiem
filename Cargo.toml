@@ -1,11 +1,10 @@
-[package]
-name = "requiem"
-version = "0.1.0"
-edition = "2021"
-description = "REQUIEM — high-performance, cross-platform, multi-agent CLI coding and knowledge-management harness"
-license = "MIT"
-authors = ["Fern"]
-publish = false
+# REQUIEM workspace manifest.
+#
+# This is a *virtual* manifest: the workspace root defines no package of its
+# own. The canonical, installable REQUIEM binary lives in `crates/cli` and is
+# named `requiem` (see crates/cli/Cargo.toml). Keeping the root package-less
+# guarantees that `cargo build --release` builds every workspace member and
+# that exactly one `requiem` executable exists in `target/release/`.
 
 [workspace]
 members = ["crates/*"]
@@ -62,8 +61,10 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 walkdir = "2"
 tempfile = "3"
-colored = "2"
 textwrap = "0.16"
+
+# secrets (masked terminal input)
+rpassword = "7"
 
 # internal crates
 requiem-core = { path = "crates/core" }
@@ -77,9 +78,6 @@ requiem-obsidian = { path = "crates/obsidian" }
 requiem-memory = { path = "crates/memory" }
 requiem-tui = { path = "crates/tui" }
 requiem-cli = { path = "crates/cli" }
-
-[features]
-default = []
 
 [profile.release]
 opt-level = 3

@@ -30,6 +30,17 @@ impl std::fmt::Display for AgentStatus {
     }
 }
 
+/// The glyph shown next to an agent's status in the dashboard.
+fn agent_status_glyph(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Idle => "○",
+        AgentStatus::Running => "▶",
+        AgentStatus::Waiting => "⏸",
+        AgentStatus::Done => "●",
+        AgentStatus::Failed => "✗",
+    }
+}
+
 /// One row in the dashboard: an agent and its current task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRow {
@@ -215,17 +226,14 @@ impl ThemedRenderer {
         let mut out = String::new();
         out.push_str(prefix);
 
-        // Status indicator.
-        let status_icon = match agent.status {
-            AgentStatus::Idle => "○",
-            AgentStatus::Running => "▶",
-            AgentStatus::Waiting => "⏸",
-            AgentStatus::Done => "●",
-            AgentStatus::Failed => "✗",
-        };
+        // Status indicator: a colored glyph followed by the status label,
+        // both in the status color.
         let status_str = agent.status.to_string();
-        out.push_str(&t.status(&status_str).to_string());
-        out.push_str(status_icon);
+        let token = t.status_token(&status_str);
+        let glyph = agent_status_glyph(agent.status);
+        out.push_str(&t.paint(token, glyph));
+        out.push(' ');
+        out.push_str(&t.paint(token, &status_str));
         out.push(' ');
 
         // Agent ID and role.
@@ -236,29 +244,17 @@ impl ThemedRenderer {
         };
         out.push_str(&t.primary(&label).to_string());
 
-        // Task (truncated).
+        // Task (truncated on a char boundary — byte slicing panics on
+        // multi-byte UTF-8).
         if !agent.current_task.is_empty() {
-            let task_display: String = {
-                let task = &agent.current_task;
-                if task.len() > 24 {
-                    format!("{}…", &task[..24])
-                } else {
-                    task.clone()
-                }
-            };
-            out.push_str(&format!(
-                "  {}",
-                t.secondary(task_display)
-            ));
+            let task_display = truncate_str(&agent.current_task, 24);
+            out.push_str(&format!("  {}", t.secondary(task_display)));
         }
 
         // Turns and tokens.
         out.push_str(&format!(
             "  {}  {}\n",
-            t.muted(format!(
-                "turns {}/{}",
-                agent.turns_used, agent.turns_max
-            )),
+            t.muted(format!("turns {}/{}", agent.turns_used, agent.turns_max)),
             t.muted(format!("tok {}", agent.tokens_in + agent.tokens_out))
         ));
 
@@ -294,14 +290,9 @@ impl DashboardRenderer for PlainRenderer {
         out.push_str(&"-".repeat(72));
         out.push('\n');
         for agent in &state.agents {
-            let task_display: String = {
-                let t = &agent.current_task;
-                if t.len() > 22 {
-                    format!("{}…", &t[..22])
-                } else {
-                    t.clone()
-                }
-            };
+            // Truncate on a char boundary — byte slicing panics on
+            // multi-byte UTF-8.
+            let task_display = truncate_str(&agent.current_task, 22);
             out.push_str(&format!(
                 "{:<8} {:<14} {:<10} {:<24} {:>6}/{:<4} {:>8}\n",
                 agent.agent_id,
@@ -319,6 +310,221 @@ impl DashboardRenderer for PlainRenderer {
             state.total_tokens()
         ));
         out
+    }
+}
+
+// ── Task dashboard ──────────────────────────────────────────────────
+
+/// The status of a task in the task dashboard, mirroring
+/// `requiem_core::task::TaskStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    #[default]
+    Pending,
+    Available,
+    Claimed,
+    Running,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    /// A short label for TUI rendering.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Available => "AVAILABLE",
+            Self::Claimed => "CLAIMED",
+            Self::Running => "RUNNING",
+            Self::Blocked => "BLOCKED",
+            Self::Completed => "DONE",
+            Self::Failed => "FAILED",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+}
+
+/// One row in the task dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskRow {
+    pub id: String,
+    pub description: String,
+    pub status: TaskStatus,
+    pub priority: u8,
+    /// Short ids of the tasks this one depends on.
+    pub dependencies: Vec<String>,
+    /// The agent currently assigned, if any.
+    pub assignee: Option<String>,
+}
+
+/// The full task-dashboard state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskDashboard {
+    pub tasks: Vec<TaskRow>,
+}
+
+impl TaskDashboard {
+    /// Count tasks in each status bucket.
+    pub fn counts(&self) -> [usize; 8] {
+        let mut c = [0usize; 8];
+        for t in &self.tasks {
+            c[match t.status {
+                TaskStatus::Pending => 0,
+                TaskStatus::Available => 1,
+                TaskStatus::Claimed => 2,
+                TaskStatus::Running => 3,
+                TaskStatus::Blocked => 4,
+                TaskStatus::Completed => 5,
+                TaskStatus::Failed => 6,
+                TaskStatus::Cancelled => 7,
+            }] += 1;
+        }
+        c
+    }
+}
+
+/// Render the task dashboard grouped by status, with priorities and
+/// dependency annotations.
+pub fn render_task_dashboard(dash: &TaskDashboard, theme: &Theme) -> String {
+    use crate::theme::Token;
+    let t = theme;
+    let mut out = String::with_capacity(1024);
+
+    let counts = dash.counts();
+
+    out.push_str(&t.accent_bold("REQUIEM tasks").to_string());
+    // Summary line: e.g. "3 running · 2 pending · 1 failed".
+    let summary_items: Vec<(&Token, &str, usize)> = vec![
+        (&Token::Info, "running", counts[3]),
+        (&Token::TextSecondary, "available", counts[1]),
+        (&Token::Warning, "pending", counts[0]),
+        (&Token::Warning, "blocked", counts[4]),
+        (&Token::Success, "done", counts[5]),
+        (&Token::Error, "failed", counts[6]),
+        (&Token::TextMuted, "cancelled", counts[7]),
+    ];
+    let summary: Vec<String> = summary_items
+        .iter()
+        .filter(|(_, _, n)| *n > 0)
+        .map(|(tok, label, n)| {
+            let s = format!("{label} {n}");
+            match tok {
+                Token::Info => t.info(&s).to_string(),
+                Token::Warning => t.warning(&s).to_string(),
+                Token::Success => t.success(&s).to_string(),
+                Token::Error => t.error(&s).to_string(),
+                Token::TextMuted => t.muted(&s).to_string(),
+                _ => t.secondary(&s).to_string(),
+            }
+        })
+        .collect();
+    let summary_str = if summary.is_empty() {
+        "(no tasks yet)".to_string()
+    } else {
+        summary.join(" · ")
+    };
+    out.push_str(&format!(
+        "{}\n",
+        t.secondary(format!("  — {} total · {}", dash.tasks.len(), summary_str))
+    ));
+    out.push('\n');
+    out.push_str(&t.border("─".repeat(60)).to_string());
+    out.push('\n');
+
+    if dash.tasks.is_empty() {
+        out.push_str(&t.muted("  (no tasks in this session yet)").to_string());
+        return out;
+    }
+
+    // Group by status in a fixed order: active first, terminal last.
+    let buckets: [(TaskStatus, &Token); 8] = [
+        (TaskStatus::Running, &Token::Info),
+        (TaskStatus::Claimed, &Token::TextSecondary),
+        (TaskStatus::Available, &Token::TextSecondary),
+        (TaskStatus::Blocked, &Token::Warning),
+        (TaskStatus::Pending, &Token::Warning),
+        (TaskStatus::Completed, &Token::Success),
+        (TaskStatus::Failed, &Token::Error),
+        (TaskStatus::Cancelled, &Token::TextMuted),
+    ];
+
+    for (status, tok) in buckets {
+        let rows: Vec<&TaskRow> = dash
+            .tasks
+            .iter()
+            .filter(|r| r.status == status)
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let header = format!("{} ({})", status.label(), rows.len());
+        out.push_str(&format!(
+            "{}\n",
+            color_label(&header, *tok, t)
+        ));
+        // Sort this bucket by priority (highest first), then id.
+        let mut rows = rows;
+        rows.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
+        for row in rows.iter() {
+            let prio_tag = if row.priority > 0 {
+                format!(" [p{}]", row.priority)
+            } else {
+                String::new()
+            };
+            let assignee = row
+                .assignee
+                .as_ref()
+                .map(|a| format!("  {}", t.muted(format!("← {a}"))))
+                .unwrap_or_default();
+            let deps = if row.dependencies.is_empty() {
+                String::new()
+            } else {
+                let deps_str = row.dependencies.join(", ");
+                format!("  {}", t.muted(format!("⧗ {deps_str}")))
+            };
+            let desc = truncate_str(&row.description, 32);
+            out.push_str(&format!(
+                "  {}  {}{}{}\n",
+                t.muted(&row.id),
+                t.secondary(desc),
+                t.muted(prio_tag),
+                assignee
+            ));
+            if !deps.is_empty() {
+                out.push_str(&deps);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Color a short status header using the given token.
+fn color_label(s: &str, tok: crate::theme::Token, t: &Theme) -> String {
+    use crate::theme::Token;
+    match tok {
+        Token::Info => t.info(s).to_string(),
+        Token::Warning => t.warning(s).to_string(),
+        Token::Success => t.success(s).to_string(),
+        Token::Error => t.error(s).to_string(),
+        Token::TextMuted => t.muted(s).to_string(),
+        _ => t.secondary(s).to_string(),
+    }
+}
+
+/// Truncate a string to `max` chars, appending an ellipsis.
+fn truncate_str(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
     }
 }
 
@@ -422,9 +628,113 @@ mod tests {
     }
 
     #[test]
+    fn renderers_survive_multibyte_task_text() {
+        // Byte-slice truncation used to panic on multi-byte characters.
+        let theme = Theme::default();
+        let mut state = sample_state();
+        state.agents[0].current_task = "日本語のタスク説明です".repeat(4);
+        let themed = ThemedRenderer::new(&theme).render(&state);
+        assert!(themed.contains("…"), "long task must be truncated with an ellipsis");
+
+        let plain = PlainRenderer.render(&state);
+        assert!(plain.contains("…"));
+    }
+
+    #[test]
+    fn status_glyph_precedes_status_label() {
+        // Regression: the glyph used to be appended raw after the
+        // painted status text (wrong order, uncolored glyph).
+        let theme = Theme::default();
+        let renderer = ThemedRenderer::new(&theme);
+        let state = sample_state();
+        let out = renderer.render(&state);
+        let row = out.lines().find(|l| l.contains("agent-1")).unwrap();
+        let glyph_pos = row.find('▶').expect("running glyph present");
+        let label_pos = row.find("running").expect("status label present");
+        assert!(glyph_pos < label_pos, "glyph must precede the label");
+    }
+
+    #[test]
     fn agent_row_new_has_empty_parent() {
         let row = AgentRow::new("a1", "master");
         assert!(row.is_master());
         assert!(row.parent.is_empty());
+    }
+
+    #[test]
+    fn task_dashboard_groups_by_status() {
+        let theme = Theme::default();
+        let dash = TaskDashboard {
+            tasks: vec![
+                TaskRow {
+                    id: "t1".into(),
+                    description: "Implement the parser".into(),
+                    status: TaskStatus::Running,
+                    priority: 5,
+                    dependencies: vec!["t0".into()],
+                    assignee: Some("agent-1".into()),
+                },
+                TaskRow {
+                    id: "t0".into(),
+                    description: "Set up scaffolding".into(),
+                    status: TaskStatus::Completed,
+                    priority: 9,
+                    dependencies: vec![],
+                    assignee: None,
+                },
+                TaskRow {
+                    id: "t2".into(),
+                    description: "Wire up the tests".into(),
+                    status: TaskStatus::Blocked,
+                    priority: 1,
+                    dependencies: vec!["t1".into()],
+                    assignee: None,
+                },
+            ],
+        };
+        let out = render_task_dashboard(&dash, &theme);
+        assert!(out.contains("REQUIEM tasks"));
+        assert!(out.contains("RUNNING"));
+        assert!(out.contains("BLOCKED"));
+        assert!(out.contains("DONE"));
+        // Dependencies are annotated.
+        assert!(out.contains("⧗ t0"));
+        // Priority is shown for high-priority tasks.
+        assert!(out.contains("[p9]"));
+        // Assignee is shown.
+        assert!(out.contains("← agent-1"));
+    }
+
+    #[test]
+    fn task_dashboard_empty_state() {
+        let theme = Theme::default();
+        let dash = TaskDashboard::default();
+        let out = render_task_dashboard(&dash, &theme);
+        assert!(out.contains("no tasks yet"));
+        assert!(out.contains("no tasks in this session"));
+    }
+
+    #[test]
+    fn task_counts_sum_to_total() {
+        let dash = TaskDashboard {
+            tasks: vec![
+                TaskRow {
+                    status: TaskStatus::Running,
+                    ..Default::default()
+                },
+                TaskRow {
+                    status: TaskStatus::Failed,
+                    ..Default::default()
+                },
+                TaskRow {
+                    status: TaskStatus::Failed,
+                    ..Default::default()
+                },
+            ],
+        };
+        let c = dash.counts();
+        assert_eq!(c[3], 1); // running
+        assert_eq!(c[6], 2); // failed
+        assert_eq!(c.iter().sum::<usize>(), 3);
     }
 }

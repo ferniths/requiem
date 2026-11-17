@@ -10,6 +10,11 @@ Write-Host "REQUIEM — Windows installer" -ForegroundColor Cyan
 Write-Host "  project root: $RootDir" -ForegroundColor DarkGray
 Write-Host ""
 
+# ── 0. Prerequisites ─────────────────────────────────────────────────
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    throw "cargo not found on PATH — install Rust from https://rustup.rs first"
+}
+
 # ── 1. Build release ─────────────────────────────────────────────────
 Write-Host "Building release binary…"
 Push-Location $RootDir
@@ -39,7 +44,14 @@ $InstallPath = Join-Path $InstallDir "requiem.exe"
 Copy-Item -Path $Target -Destination $InstallPath -Force
 Write-Host "  ✓ installed to $InstallPath" -ForegroundColor Green
 
-# ── 4. Add to user PATH ───────────────────────────────────────────────
+# ── 4. Verify the installed binary actually runs ─────────────────────
+$versionOut = & $InstallPath --version 2>&1
+if ($LASTEXITCODE -ne 0 -or -not $versionOut) {
+    throw "Installed binary failed '--version' — installation is broken"
+}
+Write-Host "  ✓ verified: $versionOut" -ForegroundColor Green
+
+# ── 5. Add to user PATH ───────────────────────────────────────────────
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $pathParts = $userPath -split ";" | Where-Object { $_ -ne "" }
 $alreadyOnPath = $pathParts -contains $InstallDir

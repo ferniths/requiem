@@ -24,6 +24,12 @@ pub fn render_themed(theme: &Theme) -> String {
     theme.accent(BANNER).to_string()
 }
 
+/// The embedded banner text. Available after installation, independent of
+/// the source repository.
+pub fn banner() -> &'static str {
+    BANNER
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

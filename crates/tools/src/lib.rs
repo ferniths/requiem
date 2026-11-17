@@ -50,8 +50,10 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 /// A tool that an agent can call.
 ///
 /// Each tool exposes its name, a human-readable description, a JSON schema
-/// for its arguments, and a synchronous `execute` method. The orchestration
-/// layer wraps `execute` in an async context when needed.
+/// for its arguments, and an asynchronous `execute` method. Async execution
+/// lets tools await subprocesses, model runs and timeouts without blocking
+/// the scheduler thread.
+#[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     /// The tool's name (used in model API `tool_calls`).
     fn name(&self) -> &str;
@@ -68,7 +70,7 @@ pub trait Tool: Send + Sync {
     }
 
     /// Execute the tool with the given arguments.
-    fn execute(&self, args: &Value) -> Result<Value>;
+    async fn execute(&self, args: &Value) -> Result<Value>;
 }
 
 #[cfg(test)]

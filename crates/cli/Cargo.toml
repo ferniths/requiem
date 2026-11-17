@@ -26,7 +26,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
-colored = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -34,3 +34,4 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+rpassword = "7"

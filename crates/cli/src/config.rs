@@ -1,7 +1,16 @@
-//! TOML config loading with first-run setup.
+//! TOML config loading.
 //!
-//! On first run, a default config is written to `~/.requiem/config.toml`.
-//! On subsequent runs, the existing config is loaded (never overwritten).
+//! The config lives at `~/.requiem/config.toml`. Loading never writes:
+//! [`Config::load`] reads the file and errors with
+//! [`ConfigError::NotInitialized`] when it is missing, and
+//! [`Config::load_or_init`] additionally materializes a default file on
+//! very first run. A freshly created default is *not* marked initialized —
+//! [`Config::is_initialized`] is what drives the setup wizard, so the
+//! wizard actually launches on first run instead of being skipped.
+//!
+//! Migration: configs written before the `initialized` field existed
+//! deserialize with `initialized = false`, so the wizard runs once more,
+//! then flips the flag when saved.
 
 use std::path::PathBuf;
 
@@ -57,6 +66,13 @@ pub struct Config {
     /// Paths to Obsidian vaults. The first entry is the default vault.
     #[serde(default)]
     pub vaults: Vec<String>,
+
+    // ── First-run marker ────────────────────────────────────────
+    /// Whether the user has completed the setup wizard. A config file
+    /// existing on disk is NOT enough — the wizard writes this flag when
+    /// the user confirms the final step.
+    #[serde(default)]
+    pub initialized: bool,
 }
 
 fn default_max_concurrency() -> u32 {
@@ -94,38 +110,65 @@ impl Config {
         Ok(home.join(".requiem").join("config.toml"))
     }
 
-    /// Load the config, writing a default file on first run.
-    pub fn load_or_init() -> Result<Self, ConfigError> {
+    /// Load the config from disk without writing anything.
+    ///
+    /// Returns [`ConfigError::NotInitialized`] when the config file does
+    /// not exist yet.
+    pub fn load() -> Result<Self, ConfigError> {
         let path = Self::config_path()?;
-        if path.is_file() {
-            let raw =
-                std::fs::read_to_string(&path).map_err(|e| ConfigError::Read(e.to_string()))?;
-            let config: Config =
-                toml::from_str(&raw).map_err(|e| ConfigError::Parse(e.to_string()))?;
-            Ok(config)
-        } else {
-            let config = Self::default();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| ConfigError::Write(e.to_string()))?;
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ConfigError::NotInitialized)
             }
-            let raw = toml::to_string_pretty(&config)
-                .map_err(|e| ConfigError::Serialize(e.to_string()))?;
-            std::fs::write(&path, raw).map_err(|e| ConfigError::Write(e.to_string()))?;
-            Ok(config)
+            Err(e) => return Err(ConfigError::Read(e.to_string())),
+        };
+        let config: Config =
+            toml::from_str(&raw).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        Ok(config)
+    }
+
+    /// Load the config, writing a default file when none exists yet.
+    ///
+    /// The freshly written default is NOT initialized, so
+    /// [`Config::is_initialized`] is false and the setup wizard launches
+    /// on the next interactive run.
+    pub fn load_or_init() -> Result<Self, ConfigError> {
+        match Self::load() {
+            Ok(config) => Ok(config),
+            Err(ConfigError::NotInitialized) => {
+                let config = Self::default();
+                config.save()?;
+                Ok(config)
+            }
+            Err(e) => Err(e),
         }
     }
 
-    /// Whether the config has been initialized (endpoint and model are set
-    /// to non-default values, or a config file exists on disk).
-    pub fn is_initialized(&self) -> bool {
-        let path = Self::config_path().ok();
-        if let Some(p) = &path {
-            if p.is_file() {
-                return true;
-            }
+    /// Persist the config to disk (creating parent directories).
+    pub fn save(&self) -> Result<(), ConfigError> {
+        let path = Self::config_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ConfigError::Write(e.to_string()))?;
         }
-        // Also consider it initialized if the endpoint is not the default.
-        self.endpoint != "http://localhost:11434/v1" || self.model != "gpt-4o"
+        let raw = toml::to_string_pretty(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+        std::fs::write(&path, raw).map_err(|e| ConfigError::Write(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Whether the user has completed setup.
+    ///
+    /// This is the semantic flag written by the wizard — not a file-exists
+    /// heuristic, which used to defeat the first-run wizard entirely (the
+    /// mere act of loading created the file).
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Parse a config from raw TOML (used by the wizard to re-load an
+    /// existing config defensively and by tests).
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        toml::from_str(raw).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
     /// Build a `ModelConfig` from this config.
@@ -165,6 +208,7 @@ impl Default for Config {
             theme: "default".to_string(),
             default_mode: "code".to_string(),
             vaults: Vec::new(),
+            initialized: false,
         }
     }
 }
@@ -173,6 +217,8 @@ impl Default for Config {
 pub enum ConfigError {
     #[error("cannot resolve home directory")]
     NoHomeDir,
+    #[error("not initialized yet (no config file)")]
+    NotInitialized,
     #[error("failed to read config: {0}")]
     Read(String),
     #[error("failed to parse config: {0}")]
@@ -196,6 +242,13 @@ mod tests {
     }
 
     #[test]
+    fn default_config_is_not_initialized() {
+        // The wizard must launch on first run: a fresh default config is
+        // never marked initialized.
+        assert!(!Config::default().is_initialized());
+    }
+
+    #[test]
     fn to_model_config_resolves_api_key_from_env() {
         let config = Config {
             api_key: String::new(),
@@ -203,5 +256,48 @@ mod tests {
         };
         let mc = config.to_model_config();
         assert!(mc.api_key.is_empty()); // no env var set in test
+    }
+
+    #[test]
+    fn initialized_flag_survives_roundtrip() {
+        let mut config = Config::default();
+        config.initialized = true;
+        config.model = "my-model".into();
+        let raw = toml::to_string_pretty(&config).unwrap();
+        let parsed = Config::parse(&raw).unwrap();
+        assert!(parsed.is_initialized());
+        assert_eq!(parsed.model, "my-model");
+    }
+
+    #[test]
+    fn legacy_config_without_flag_is_not_initialized() {
+        // A config written before the field existed: wizard re-runs once.
+        let legacy = r#"
+model = "old-model"
+endpoint = "http://localhost:8080/v1"
+"#;
+        let parsed = Config::parse(legacy).unwrap();
+        assert_eq!(parsed.model, "old-model");
+        assert!(!parsed.is_initialized());
+    }
+
+    #[test]
+    fn api_key_is_roundtripped_but_never_logged() {
+        let mut config = Config::default();
+        config.api_key = "sk-super-secret".into();
+        let raw = toml::to_string_pretty(&config).unwrap();
+        let parsed = Config::parse(&raw).unwrap();
+        assert_eq!(parsed.api_key, "sk-super-secret");
+    }
+
+    #[test]
+    fn vaults_roundtrip_in_order() {
+        let mut config = Config::default();
+        config.vaults = vec!["C:/notes/main".into(), "C:/notes/work".into()];
+        config.initialized = true;
+        let raw = toml::to_string_pretty(&config).unwrap();
+        let parsed = Config::parse(&raw).unwrap();
+        assert_eq!(parsed.vaults.len(), 2);
+        assert_eq!(parsed.vaults[0], "C:/notes/main");
     }
 }

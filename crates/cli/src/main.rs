@@ -1,22 +1,27 @@
 //! REQUIEM CLI entry point.
 //!
-//! Parses arguments, loads config, initializes the model client, and
-//! dispatches subcommands. The `session` subcommand runs an interactive
-//! REPL loop with permissions gating and context compression.
+//! Parses arguments and dispatches subcommands:
+//!
+//! * **default** (no subcommand) — boots the interactive session; on a
+//!   fresh install (or a legacy config without the initialized flag) it
+//!   auto-launches the setup wizard first.
+//! * `session` — interactive multi-agent session (full-screen TUI on a
+//!   TTY, plain event-printing loop when piped).
+//! * `setup` — the configuration wizard.
+//! * `model` — show or probe the configured model endpoint.
+//! * `banner` / `help` — themed banner and slash-command reference.
+//! * `install` / `uninstall` — put the real binary on PATH (and take it
+//!   back off).
 
 use clap::{Parser, Subcommand};
-use colored::Colorize;
-use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::process::ExitCode;
-use std::sync::Arc;
 use uuid::Uuid;
 
 use requiem_cli::config::Config;
-use requiem_core::mode::Mode;
-use requiem_permissions::PermissionGate;
-use requiem_tools::Tool;
-use requiem_tui::dashboard::{DashboardRenderer, ThemedRenderer};
-use requiem_tui::theme::theme_from_name;
+use requiem_tui::theme::{theme_from_name, Theme};
+
+type BoxResult = Result<String, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Parser)]
 #[command(name = "requiem", version, about = "REQUIEM multi-agent CLI harness")]
@@ -27,139 +32,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show the startup banner and version info.
+    /// Show the startup banner.
     Banner,
     /// Show or test the configured model.
     Model {
-        /// Test the model connection with a simple probe.
+        /// Probe the endpoint with a real request.
         #[arg(long)]
         test: bool,
     },
-    /// Show available slash commands.
+    /// List the slash commands available inside a session.
     Help,
-    /// Start an interactive session.
+    /// Start an interactive multi-agent session.
     Session {
-        /// A specific session ID to resume.
+        /// Resume a previous session by ID.
         #[arg(long)]
         resume: Option<Uuid>,
     },
-    /// Interactive first-run setup: configure endpoint, API key, model, vault.
+    /// Interactive configuration: endpoint, API key, model, agents, vaults.
     Setup,
-    /// Install the binary into PATH (creates a symlink/junction or copies).
+    /// Copy this binary into a PATH-visible install location.
     Install {
-        /// Target directory (default: user's AppData\Local\Microsoft\WindowsApps or ~\bin).
+        /// Target directory (default: %LOCALAPPDATA%\bin, or ~/.local/bin).
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
     },
-}
-
-/// A tool executor that bridges the sync `Tool` trait into the async
-/// `ToolExecutor` trait required by the agent runtime, with a
-/// permissions gate that enforces the current mode.
-struct SyncToolExecutor {
-    tools: Arc<std::sync::Mutex<HashMap<String, Box<dyn requiem_tools::Tool>>>>,
-    gate: Arc<PermissionGate>,
-}
-
-impl SyncToolExecutor {
-    fn new(gate: PermissionGate) -> Self {
-        let tools = std::sync::Mutex::new(
-            [
-                Box::new(requiem_tools::FileReadTool) as Box<dyn requiem_tools::Tool>,
-                Box::new(requiem_tools::FileWriteTool),
-                Box::new(requiem_tools::FileEditTool),
-                Box::new(requiem_tools::FileDeleteTool),
-                Box::new(requiem_tools::TerminalTool),
-                Box::new(requiem_tools::GitTool),
-                Box::new(requiem_tools::GlobSearchTool),
-                Box::new(requiem_tools::GrepSearchTool),
-            ]
-            .into_iter()
-            .map(|t| (t.name().to_string(), t))
-            .collect::<HashMap<String, Box<dyn requiem_tools::Tool>>>(),
-        );
-        let tools = Arc::new(tools);
-        Self {
-            tools,
-            gate: Arc::new(gate),
-        }
-    }
-
-    /// Replace the permission gate (called on mode switch).
-    fn set_gate(&mut self, gate: PermissionGate) {
-        self.gate = Arc::new(gate);
-    }
-
-    /// Register an additional tool in the shared map.
-    fn add_tool(&mut self, tool: Box<dyn requiem_tools::Tool>) {
-        self.tools
-            .lock()
-            .unwrap()
-            .insert(tool.name().to_string(), tool);
-    }
-
-    /// A clone that shares the same tools map (cheap `Arc` clone).
-    fn share(&self) -> Self {
-        Self {
-            tools: self.tools.clone(),
-            gate: self.gate.clone(),
-        }
-    }
-
-    /// Build the list of `ToolDef`s to advertise to the model.
-    /// Only includes tools that the current permission gate allows.
-    fn tool_defs(&self) -> Vec<requiem_model::request::ToolDef> {
-        self.tools
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|t| self.is_tool_allowed(t.name()))
-            .map(|t| t.tool_def())
-            .collect()
-    }
-
-    /// Check whether a tool is allowed under the current mode.
-    fn is_tool_allowed(&self, name: &str) -> bool {
-        let gate = &*self.gate;
-        match name {
-            "write_file" | "edit_file" | "delete_file" => gate.can_write_file().is_allowed(),
-            "run_terminal" => gate.can_run_terminal(true).is_allowed(),
-            "run_git" => gate.can_mutate_git().is_allowed(),
-            "spawn_subagent" => gate.can_spawn_agent().is_allowed(),
-            "obsidian" => gate.can_write_file().is_allowed(),
-            "read_file" | "glob_search" | "grep_search" => true,
-            _ => true,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl requiem_orchestration::agent_runtime::ToolExecutor for SyncToolExecutor {
-    async fn execute(
-        &self,
-        name: &str,
-        arguments: &serde_json::Value,
-    ) -> Result<serde_json::Value, requiem_core::error::RequiemError> {
-        // Permission check before execution.
-        if !self.is_tool_allowed(name) {
-            return Err(requiem_core::error::RequiemError::PermissionDenied(
-                format!("tool '{name}' is denied in the current mode"),
-            ));
-        }
-        match self.tools.lock().unwrap().get(name) {
-            Some(tool) => {
-                tool.execute(arguments)
-                    .map_err(|e| requiem_core::error::RequiemError::Tool {
-                        tool: name.to_string(),
-                        message: e.to_string(),
-                    })
-            }
-            None => Err(requiem_core::error::RequiemError::Tool {
-                tool: name.to_string(),
-                message: "unknown tool".to_string(),
-            }),
-        }
-    }
+    /// Remove the installed `requiem` binary.
+    Uninstall {
+        /// Install directory to remove from (default: the standard one).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Also delete the config directory (~/.requiem).
+        #[arg(long, default_value_t = false)]
+        purge: bool,
+    },
 }
 
 #[tokio::main]
@@ -170,449 +75,119 @@ async fn main() -> ExitCode {
         )
         .init();
 
+    // Resolve the colour capability once, before anything prints.
+    requiem_tui::init_color_mode();
+
     let cli = Cli::parse();
+    let theme = configured_theme();
 
     match cli.command {
-        None => {
-            let config = Config::load_or_init().ok();
-            if let Some(cfg) = &config {
-                if !cfg.is_initialized() {
-                    show_banner_and_help();
-                    println!(
-                        "\n{} No config found. Run `requiem setup` to configure your model endpoint.\n",
-                        "⚠".yellow().bold()
-                    );
-                    return ExitCode::SUCCESS;
-                }
-            }
-            show_banner_and_help();
-            ExitCode::SUCCESS
-        }
+        None => run_default(&theme).await,
         Some(Commands::Banner) => {
-            let banner = std::fs::read_to_string("REQUIEM-ASCII-BANNER.txt").unwrap_or_default();
-            println!("{banner}");
+            print_banner(&theme);
+            print_version_line(&theme);
             ExitCode::SUCCESS
         }
-        Some(Commands::Model { test }) => match run_model_command(test).await {
-            Ok(msg) => {
-                println!("{msg}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("{}", e.to_string().red());
-                ExitCode::FAILURE
-            }
-        },
+        Some(Commands::Model { test }) => finish(run_model_command(test).await, &theme),
         Some(Commands::Help) => {
-            for (name, desc) in requiem_cli::commands::list_commands() {
-                println!("{name:<12} {desc}");
-            }
+            print_banner(&theme);
+            print_cli_usage(&theme);
+            print_slash_help(&theme);
             ExitCode::SUCCESS
         }
-        Some(Commands::Session { resume }) => match run_session(resume).await {
-            Ok(msg) => {
-                println!("{msg}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("{}", e.to_string().red());
-                ExitCode::FAILURE
-            }
-        },
-        Some(Commands::Setup) => match run_setup() {
-            Ok(msg) => {
-                println!("{msg}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("{}", e.to_string().red());
-                ExitCode::FAILURE
-            }
-        },
-        Some(Commands::Install { dir }) => match run_install(dir) {
-            Ok(msg) => {
-                println!("{msg}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("{}", e.to_string().red());
-                ExitCode::FAILURE
-            }
-        },
+        Some(Commands::Session { resume }) => {
+            print_banner(&theme);
+            finish(requiem_cli::session::run_session(resume).await, &theme)
+        }
+        Some(Commands::Setup) => finish(run_setup(&theme), &theme),
+        Some(Commands::Install { dir }) => finish(run_install(dir, &theme), &theme),
+        Some(Commands::Uninstall { dir, purge }) => finish(run_uninstall(dir, purge, &theme), &theme),
     }
 }
 
-/// Run an interactive session with a REPL loop.
-async fn run_session(
-    resume: Option<Uuid>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let config = Config::load_or_init().map_err(|e| e.to_string())?;
-    let theme = theme_from_name(&config.theme);
-    let renderer = ThemedRenderer::new(&theme);
-
-    let client = reqwest_client(&config)?;
-
-    let mut mode = Mode::from_slash(&format!("/{}", config.default_mode)).unwrap_or(Mode::Code);
-    let gate = PermissionGate::for_mode(mode);
-    let mut executor = SyncToolExecutor::new(gate);
-
-    let db_path = session_db_path()?;
-    let session = std::rc::Rc::new(
-        requiem_memory::session::Session::open(&db_path).map_err(|e| e.to_string())?,
-    );
-    let session_id = resume.unwrap_or_else(Uuid::new_v4);
-
-    let mut total_tasks: usize = 0;
-    let mut completed_tasks: usize = 0;
-    let task_session_id = requiem_core_id();
-
-    println!("{}", requiem_tui_banner(&theme));
-    println!(
-        "{} session {session_id} — mode: {} — type a task or a slash command\n",
-        "REQUIEM".yellow().bold(),
-        mode.slash()
-    );
-
-    let stdin = std::io::stdin();
-    loop {
-        print!("{} ", "›".cyan().bold());
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => {
-                // EOF (Ctrl-D) — clean exit.
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("read error: {e}");
-                break;
-            }
+/// Print an Ok/Err outcome as themed output with matching exit code.
+fn finish(result: BoxResult, theme: &Theme) -> ExitCode {
+    match result {
+        Ok(msg) => {
+            println!("{}", theme.success(&msg));
+            ExitCode::SUCCESS
         }
-
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
+        Err(e) => {
+            eprintln!("{}", theme.error(&e.to_string()));
+            ExitCode::FAILURE
         }
-
-        // --- Slash commands ---
-        if line.starts_with('/') {
-            let cmd = line.trim();
-
-            match cmd {
-                "/exit" | "/quit" => {
-                    println!("exiting session {session_id}");
-                    break;
-                }
-                "/help" => {
-                    show_repl_help(&theme);
-                    continue;
-                }
-                "/setup" => {
-                    println!(
-                        "{} re-running setup wizard…",
-                        "▸".cyan().bold()
-                    );
-                    if let Ok(cfg) = requiem_cli::setup::run_wizard() {
-                        println!(
-                            "{} config updated. New theme: {}",
-                            "✓".green().bold(),
-                            cfg.theme
-                        );
-                    }
-                    continue;
-                }
-                "/theme" => {
-                    println!("{}", "Available themes:".yellow().bold());
-                    for name in requiem_tui::THEME_NAMES {
-                        let t = theme_from_name(name);
-                        let marker = if name == &config.theme {
-                            "✓ "
-                        } else {
-                            "  "
-                        };
-                        println!(
-                            "  {}{} {} — {}{}",
-                            marker,
-                            t.accent(name),
-                            t.secondary("preview:"),
-                            t.info("hello world"),
-                            t.muted(" muted text"),
-                        );
-                    }
-                    continue;
-                }
-                "/model" => {
-                    match client.test_connection().await {
-                        Ok(model) => println!("model reachable: {model}"),
-                        Err(e) => println!("model unreachable: {e}"),
-                    }
-                    continue;
-                }
-                "/ask" => {
-                    mode = Mode::Ask;
-                    executor.set_gate(PermissionGate::for_mode(mode));
-                    println!("mode: ask — read-only, no writes");
-                    continue;
-                }
-                "/plan" => {
-                    mode = Mode::Plan;
-                    executor.set_gate(PermissionGate::for_mode(mode));
-                    println!("mode: plan — plan-sandbox writes only");
-                    continue;
-                }
-                "/code" => {
-                    mode = Mode::Code;
-                    executor.set_gate(PermissionGate::for_mode(mode));
-                    println!("mode: code — approved writes and builds");
-                    continue;
-                }
-                "/auto" => {
-                    mode = Mode::Auto;
-                    executor.set_gate(PermissionGate::for_mode(mode));
-                    println!("mode: auto — fully autonomous");
-                    continue;
-                }
-                "/debug" => {
-                    mode = Mode::Debug;
-                    executor.set_gate(PermissionGate::for_mode(mode));
-                    println!("mode: debug — reproduce, fix, verify");
-                    continue;
-                }
-                "/research" => {
-                    mode = Mode::Research;
-                    executor.set_gate(PermissionGate::for_mode(mode));
-                    println!("mode: research — parallel findings, vault writes");
-                    continue;
-                }
-                _ => {
-                    println!("unknown command: {cmd} — type /help for available commands");
-                    continue;
-                }
-            }
-        }
-
-        // --- Task submission (any non-slash line) ---
-        let task = requiem_core::task::Task::new(&line);
-        total_tasks += 1;
-
-        let agent = requiem_core::agent::Agent::master(
-            "master",
-            requiem_core::Id::from(task_session_id.as_str().to_string()),
-        );
-        let mut run =
-            requiem_orchestration::agent_runtime::AgentRun::new(agent.clone(), task.clone());
-
-        println!(
-            "{} task #{} — mode: {} — running…\n",
-            "▸".cyan(),
-            total_tasks,
-            mode.slash()
-        );
-
-        let mut tools = executor.tool_defs();
-
-        // Add the subagent tool when the current mode allows spawning.
-        if executor.is_tool_allowed("spawn_subagent") {
-            let client_arc: Arc<requiem_model::client::ModelClient> = Arc::new(client.clone());
-            let child_executor: Arc<dyn requiem_orchestration::agent_runtime::ToolExecutor> =
-                Arc::new(executor.share());
-            let sub_tool = requiem_tools::make_subagent_tool(
-                client_arc,
-                child_executor,
-                agent.clone(),
-                task_session_id.clone(),
-                tools.clone(),
-            );
-            tools.push(sub_tool.tool_def());
-            executor.add_tool(Box::new(sub_tool));
-        }
-
-        // Add the obsidian vault tool when the mode allows writes.
-        if executor.is_tool_allowed("obsidian") {
-            let vault_root = dirs::home_dir()
-                .map(|h| h.join(".requiem").join("vault"))
-                .unwrap_or_default();
-            std::fs::create_dir_all(&vault_root).ok();
-            let obs_tool = requiem_tools::ObsidianTool::new(vault_root);
-            tools.push(obs_tool.tool_def());
-            executor.add_tool(Box::new(obs_tool));
-        }
-
-        let executor_arc: Arc<dyn requiem_orchestration::agent_runtime::ToolExecutor> =
-            Arc::new(executor.share());
-
-        let result = requiem_orchestration::agent_runtime::run_agent(
-            &client,
-            &executor_arc,
-            &mut run,
-            &tools,
-        )
-        .await;
-
-        // Render dashboard after the run.
-        let dash =
-            requiem_tui_dashboard(&run, total_tasks, completed_tasks, &session_id.to_string(), &renderer);
-        println!("{dash}");
-
-        let task_success = match result {
-            Ok(_) => {
-                completed_tasks += 1;
-                if let Some(resp) = &run.final_response {
-                    println!("{}", render_final(resp));
-                }
-                true
-            }
-            Err(e) => {
-                println!("task #{} failed: {e}", total_tasks);
-                false
-            }
-        };
-
-        // Persist the session record.
-        let usage = run
-            .final_response
-            .as_ref()
-            .and_then(|r| r.usage)
-            .map_or((0, 0), |u| (u.input, u.output));
-        let rec = requiem_memory::session::SessionRecord {
-            session_id,
-            task_description: line.clone(),
-            role: "master".into(),
-            final_response_json: run.final_response.as_ref().and_then(|r| {
-                r.message
-                    .content
-                    .as_ref()
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            }),
-            tokens_input: usage.0,
-            tokens_output: usage.1,
-            success: task_success,
-            timestamp_rfc3339: chrono::Utc::now().to_rfc3339(),
-        };
-        let _ = session.insert_record(&rec);
     }
-
-    let (tin, tout) = session.session_token_totals(&session_id).unwrap_or((0, 0));
-    Ok(format!(
-        "session {session_id} complete — {completed_tasks}/{total_tasks} tasks succeeded, {tin} in / {tout} out tokens"
-    ))
 }
 
-fn requiem_tui_banner(theme: &requiem_tui::Theme) -> String {
-    requiem_tui::banner::render_themed(theme)
-}
+// ── Default path ─────────────────────────────────────────────────────
 
-fn requiem_tui_dashboard(
-    run: &requiem_orchestration::agent_runtime::AgentRun,
-    total: usize,
-    completed: usize,
-    session_id: &str,
-    renderer: &ThemedRenderer,
-) -> String {
-    let usage = run
-        .final_response
-        .as_ref()
-        .and_then(|r| r.usage)
-        .map_or((0, 0), |u| (u.input, u.output));
-    let mut state = requiem_tui::DashboardState {
-        agents: vec![requiem_tui::AgentRow::new("master", "master")],
-        total_tasks: total,
-        completed_tasks: completed,
-        session_id: session_id.to_string(),
-    };
-    if let Some(row) = state.agents.first_mut() {
-        row.status = if run.final_response.is_some() {
-            requiem_tui::AgentStatus::Done
-        } else {
-            requiem_tui::AgentStatus::Failed
-        };
-        row.current_task = run.task.description.clone();
-        row.turns_used = run.turns;
-        row.tokens_in = usage.0;
-        row.tokens_out = usage.1;
-    }
-    renderer.render(&state)
-}
+/// The no-subcommand entry point: auto-launch the setup wizard on a
+/// fresh install, then drop into an interactive session.
+async fn run_default(theme: &Theme) -> ExitCode {
+    let is_tty = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
 
-fn render_final(resp: &requiem_model::response::ModelResponse) -> String {
-    resp.message
-        .content
-        .as_ref()
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "(no text content)".into())
-}
-
-fn show_repl_help(theme: &requiem_tui::Theme) {
-    println!();
-    for (group, cmds) in requiem_cli::commands::list_commands_grouped() {
-        println!(
-            "  {}",
-            theme.accent_bold(group)
-        );
-        for (name, desc) in cmds {
+    match Config::load() {
+        Ok(config) if config.is_initialized() => {
+            if is_tty {
+                print_banner(theme);
+                finish(requiem_cli::session::run_session(None).await, theme)
+            } else {
+                // Piped/redirected usage without a subcommand: help text,
+                // not a surprise REPL hanging on stdin.
+                print_banner(theme);
+                print_cli_usage(theme);
+                print_slash_help(theme);
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(_) | Err(requiem_cli::config::ConfigError::NotInitialized) => {
+            // Fresh install or legacy config: the wizard runs once, then
+            // the config is marked initialized.
+            if !is_tty {
+                print_banner(theme);
+                print_cli_usage(theme);
+                eprintln!(
+                    "{}",
+                    theme.error("not configured yet — run `requiem setup` first")
+                );
+                return ExitCode::FAILURE;
+            }
+            print_banner(theme);
             println!(
-                "    {} {}",
-                theme.secondary(format!("{name:<10}")),
-                theme.muted(desc)
+                "{}",
+                theme.info("▸ First launch detected — starting the setup wizard…")
             );
+            match requiem_cli::setup::run_wizard() {
+                Ok(_) => {
+                    println!("{}", theme.success_bold("✓ setup complete"));
+                    println!(
+                        "{}",
+                        theme.info("▸ launching session… (type /help for commands)")
+                    );
+                    finish(requiem_cli::session::run_session(None).await, theme)
+                }
+                Err(e) => {
+                    eprintln!("{}", theme.error(&format!("setup cancelled: {e}")));
+                    eprintln!(
+                        "{}",
+                        theme.muted("run `requiem setup` any time to configure REQUIEM")
+                    );
+                    ExitCode::SUCCESS
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", theme.error(&e.to_string()));
+            ExitCode::FAILURE
         }
     }
-    println!(
-        "  {} — submit a task to the agent",
-        theme.secondary("(any text)")
-    );
-    println!();
 }
 
-fn session_db_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let home = dirs::home_dir().ok_or("cannot resolve home directory")?;
-    let dir = home.join(".requiem");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("sessions.db"))
-}
+// ── Subcommands ──────────────────────────────────────────────────────
 
-fn requiem_core_id() -> requiem_core::Id {
-    requiem_core::Id::new()
-}
-
-fn reqwest_client(
-    config: &Config,
-) -> Result<requiem_model::client::ModelClient, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(requiem_model::client::ModelClient::new(
-        config.to_model_config(),
-    )?)
-}
-
-fn show_banner_and_help() {
-    let theme = theme_from_name("default");
-    println!("{}", requiem_tui_banner(&theme));
-    println!(
-        "\n{} — multi-agent CLI harness\n",
-        "REQUIEM".yellow().bold()
-    );
-    println!("{}", "usage:".cyan().bold());
-    println!("  requiem banner          show this banner");
-    println!("  requiem setup            interactive first-run configuration");
-    println!("  requiem model [--test]  show or test the configured model");
-    println!("  requiem help            list slash commands");
-    println!("  requiem session [--resume <uuid>]   start an interactive session");
-    println!("  requiem install [--dir <path>]     install into PATH\n");
-    println!("{}", "slash commands (in session):".cyan().bold());
-    for (name, desc) in requiem_cli::commands::list_commands() {
-        println!(
-            "  {} {}",
-            theme.accent(name),
-            theme.secondary(desc)
-        );
-    }
-}
-
-async fn run_model_command(test: bool) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let config = Config::load_or_init().map_err(|e| e.to_string())?;
+/// `requiem model [--test]`.
+async fn run_model_command(test: bool) -> BoxResult {
+    let config = load_config_for_cli()?;
     let client = requiem_model::client::ModelClient::new(config.to_model_config())?;
     if test {
         let model = client.test_connection().await.map_err(|e| e.to_string())?;
@@ -629,18 +204,29 @@ async fn run_model_command(test: bool) -> Result<String, Box<dyn std::error::Err
     }
 }
 
-/// Interactive first-run setup: runs the 7-step wizard from `setup.rs`,
-/// then optionally creates the vault directory.
-fn run_setup() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+/// Any config that loads is usable for informational commands; a missing
+/// config file is a clean, actionable error.
+fn load_config_for_cli() -> Result<Config, String> {
+    match Config::load() {
+        Ok(c) => Ok(c),
+        Err(requiem_cli::config::ConfigError::NotInitialized) => {
+            Err("no configuration yet — run `requiem setup` first".into())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `requiem setup`: the wizard, plus optional vault creation.
+fn run_setup(theme: &Theme) -> BoxResult {
     let config = requiem_cli::setup::run_wizard()?;
 
-    // Create the vault directory if configured.
+    // Offer to materialize a configured vault that does not exist yet.
     if let Some(first_vault) = config.vaults.first() {
         let vault_path = std::path::PathBuf::from(first_vault);
         if !vault_path.is_dir() {
             println!(
                 "{} vault directory {} does not exist — create it? [y/N]: ",
-                "▸".cyan().bold(),
+                theme.info("▸"),
                 vault_path.display()
             );
             let mut answer = String::new();
@@ -655,72 +241,214 @@ fn run_setup() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     Ok("setup complete — run `requiem session` to start".into())
 }
 
-/// Prompt for a value; if the user just presses Enter, keep the existing value.
-#[allow(dead_code)]
-fn prompt_override(current: &mut String) {
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).ok();
-    let trimmed = input.trim().to_string();
-    if !trimmed.is_empty() {
-        *current = trimmed;
-    }
-}
-
-/// Install the current binary into a PATH-visible location so `requiem`
-/// can be invoked from any directory.
-fn run_install(
-    dir: Option<std::path::PathBuf>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+/// `requiem install`: copy the real binary into a PATH-visible dir and
+/// verify the installed copy runs.
+fn run_install(dir: Option<std::path::PathBuf>, theme: &Theme) -> BoxResult {
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot resolve current executable path: {e}"))?;
 
     let target_dir = match dir {
         Some(d) => d,
-        None => {
-            // On Windows, use %LOCALAPPDATA%\bin (or create it).
-            let local = std::env::var("LOCALAPPDATA")
-                .ok()
-                .map(|p| std::path::PathBuf::from(p).join("bin"))
-                .filter(|p| p.is_dir() || p.parent().map(|pp| pp.is_dir()).unwrap_or(false));
-            local.ok_or("cannot resolve install directory; use --dir <path>")?
-        }
+        None => default_install_dir()?,
     };
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| format!("cannot create {}: {e}", target_dir.display()))?;
 
-    std::fs::create_dir_all(&target_dir)?;
-
-    // Always install as "requiem" (with the platform exe suffix).
     let target_name = if cfg!(windows) {
-        "requiem.exe".to_string()
+        "requiem.exe"
     } else {
-        "requiem".to_string()
+        "requiem"
     };
-    let target = target_dir.join(&target_name);
-    std::fs::copy(&exe, &target)?;
+    let target = target_dir.join(target_name);
+    std::fs::copy(&exe, &target)
+        .map_err(|e| format!("cannot copy to {}: {e}", target.display()))?;
 
-    println!("{} installed to {}", "✓".green().bold(), target.display());
+    println!(
+        "{}",
+        theme.success(&format!("✓ installed to {}", target.display()))
+    );
 
-    // Check if the target dir is on PATH.
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    let target_canonical = target_dir.canonicalize().ok();
-    let is_on_path = path_env
-        .split(';')
-        .filter_map(|p| std::path::Path::new(p).canonicalize().ok())
-        .any(|p| Some(p) == target_canonical);
+    // Verify the installed copy actually runs — installing a broken or
+    // wrong-architecture binary should fail loudly here.
+    match std::process::Command::new(&target).arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            let v = String::from_utf8_lossy(&out.stdout);
+            let v = v.trim();
+            if !v.is_empty() {
+                println!("{}", theme.muted(&format!("  installed binary reports: {v}")));
+            }
+        }
+        Ok(out) => {
+            return Err(format!(
+                "installed binary exited with {} on `--version` — install is broken",
+                out.status
+            )
+            .into());
+        }
+        Err(e) => {
+            println!(
+                "{}",
+                theme.warning(&format!(
+                    "  warning: could not launch the installed binary to verify it ({e})"
+                ))
+            );
+        }
+    }
 
-    if !is_on_path {
+    if !is_dir_on_path(&target_dir) {
         println!(
-            "\n{} {} is not on PATH.",
-            "⚠".yellow().bold(),
-            target_dir.display()
-        );
-        println!(
-            "Add it to your PATH environment variable, or run via full path: {}",
-            target.display()
+            "{}",
+            theme.warning(&format!(
+                "⚠ {} is not on PATH — add it, or run via the full path: {}",
+                target_dir.display(),
+                target.display()
+            ))
         );
     }
 
-    Ok(format!(
-        "installed to {target_display}",
-        target_display = target.display()
-    ))
+    Ok("install complete".into())
+}
+
+/// The platform-standard install directory for the `requiem` binary.
+fn default_install_dir() -> Result<std::path::PathBuf, String> {
+    if cfg!(windows) {
+        let local = std::env::var("LOCALAPPDATA")
+            .map(|p| std::path::PathBuf::from(p).join("bin"))
+            .map_err(|_| "cannot resolve %LOCALAPPDATA%; use --dir <path>".to_string())?;
+        Ok(local)
+    } else {
+        let home = dirs::home_dir().ok_or_else(|| "cannot resolve home directory".to_string())?;
+        Ok(home.join(".local").join("bin"))
+    }
+}
+
+/// Whether `dir` resolves to an entry the shell will find on PATH.
+fn is_dir_on_path(dir: &std::path::Path) -> bool {
+    let path_env = match std::env::var("PATH") {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let dir_canonical = dir.canonicalize().ok();
+    if dir_canonical.is_none() {
+        return false;
+    }
+    std::env::split_paths(&path_env)
+        .filter_map(|p| p.canonicalize().ok())
+        .any(|p| Some(p) == dir_canonical)
+}
+
+/// `requiem uninstall`: remove the binary, optionally purge the config.
+fn run_uninstall(dir: Option<std::path::PathBuf>, purge: bool, theme: &Theme) -> BoxResult {
+    let install_dir = match dir {
+        Some(d) => d,
+        None => default_install_dir()?,
+    };
+    let target_name = if cfg!(windows) {
+        "requiem.exe"
+    } else {
+        "requiem"
+    };
+    let target = install_dir.join(target_name);
+
+    let mut removed = Vec::new();
+    if target.is_file() {
+        std::fs::remove_file(&target)
+            .map_err(|e| format!("cannot remove {}: {e}", target.display()))?;
+        removed.push(target.display().to_string());
+    } else {
+        // Not present at the standard location — report, don't fail (the
+        // user may have installed elsewhere or via a package manager).
+        println!(
+            "{}",
+            theme.muted(&format!("· {} not found — nothing to remove", target.display()))
+        );
+    }
+
+    if purge {
+        let config_dir = dirs::home_dir().map(|h| h.join(".requiem"));
+        if let Some(cfg_dir) = config_dir {
+            if cfg_dir.is_dir() {
+                std::fs::remove_dir_all(&cfg_dir)?;
+                removed.push(cfg_dir.display().to_string());
+            }
+        }
+    }
+
+    let mut msg = "uninstalled requiem".to_string();
+    if !removed.is_empty() {
+        msg.push_str(&format!(" — removed {}", removed.join(", ")));
+    }
+    if !purge {
+        msg.push_str("\n  config kept at ~/.requiem (add --purge to remove it)");
+    }
+    Ok(msg)
+}
+
+// ── Output helpers ───────────────────────────────────────────────────
+
+/// The theme from the existing config, or the REQUIEM default.
+fn configured_theme() -> Theme {
+    match Config::load() {
+        Ok(c) => theme_from_name(&c.theme),
+        Err(_) => theme_from_name("default"),
+    }
+}
+
+/// Print the compile-time banner, exactly themed.
+fn print_banner(theme: &Theme) {
+    println!("{}", requiem_tui::banner::render_themed(theme));
+    println!();
+}
+
+/// One-line version + model summary under the banner.
+fn print_version_line(theme: &Theme) {
+    let version = env!("CARGO_PKG_VERSION");
+    let model = Config::load()
+        .map(|c| c.model)
+        .unwrap_or_else(|_| "not configured".to_string());
+    println!(
+        "v{} · model: {}",
+        theme.accent_bold(version),
+        theme.secondary(model)
+    );
+}
+
+/// CLI-level usage block.
+fn print_cli_usage(theme: &Theme) {
+    println!("{}", theme.accent_bold("usage:"));
+    let lines = [
+        ("requiem", "interactive session (auto-runs setup on first launch)"),
+        ("requiem session --resume <id>", "resume a previous session"),
+        ("requiem setup", "configure endpoint, key, model, vaults"),
+        ("requiem model [--test]", "show or probe the configured model"),
+        ("requiem banner | help | install | uninstall", "misc"),
+    ];
+    for (cmd, desc) in lines {
+        println!(
+            "  {} {}",
+            theme.accent(format!("{cmd:<38}")),
+            theme.secondary(desc)
+        );
+    }
+    println!();
+}
+
+/// The slash-command reference available inside a session.
+fn print_slash_help(theme: &Theme) {
+    println!("{}", theme.accent_bold("slash commands (inside a session):"));
+    for (group, cmds) in requiem_cli::commands::list_commands_grouped() {
+        println!("  {}", theme.violet(group));
+        for (name, desc) in cmds {
+            println!(
+                "    {} {}",
+                theme.secondary(format!("/{name:<10}")),
+                theme.muted(desc)
+            );
+        }
+    }
+    println!(
+        "  {}",
+        theme.muted("(any other text is submitted as a task to the agent)")
+    );
+    println!();
 }

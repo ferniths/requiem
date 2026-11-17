@@ -9,6 +9,5 @@ publish = false
 requiem-core = { path = "../core" }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
-colored = { workspace = true }
 textwrap = { workspace = true }
 serde = { workspace = true }

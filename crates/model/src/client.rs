@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use futures::StreamExt;
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use tokio::time::sleep;
 
@@ -131,48 +132,28 @@ impl ModelClient {
     /// end, and returns the parsed chunks in arrival order. A mid-stream
     /// HTTP failure is returned as the `Err`.
     pub async fn stream_drain(&self, req: &ChatRequest) -> Result<Vec<StreamChunk>, RequiemError> {
-        self.acquire_slot().await?;
-        let mut sreq = req.clone();
-        sreq.stream = true;
-        let body = sreq.to_json_bytes()?;
-
-        let client = self.http.clone();
-        let config = self.config.clone();
-        let retry = self.retry.clone();
-
-        let mut attempt = 0u32;
-        let resp = loop {
-            match send_stream(&client, &config, &body, attempt).await {
-                Ok(r) => break r,
-                Err(e) if e.is_retryable() && retry.should_retry(attempt) => {
-                    let delay = retry.delay_for_attempt(attempt);
-                    attempt += 1;
-                    tracing::warn!("stream connect failed (retry {attempt}): {e}");
-                    sleep(delay).await;
-                }
-                Err(e) => {
-                    self.release_slot();
-                    return Err(e);
-                }
-            }
-        };
-
-        let chunks = drain_sse(resp).await;
-        self.release_slot();
-        chunks
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamChunk>();
+        let response = self.chat_stream(req, tx).await?;
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        let _ = response; // reassembled response; chunks carry the details
+        Ok(chunks)
     }
 
     /// A single HTTP chat request (non-streaming body parse).
     async fn do_chat(&self, req: &ChatRequest) -> Result<ModelResponse, RequiemError> {
         let body = req.to_json_bytes()?;
         let url = self.config.completions_url();
-        let http_req = self
-            .http
-            .post(&url)
-            .header(ACCEPT, HeaderValue::from_static("application/json"))
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .body(body)
-            .send();
+        let http_req = self.authorize(
+            self.http
+                .post(&url)
+                .header(ACCEPT, HeaderValue::from_static("application/json"))
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
+        )
+        .body(body)
+        .send();
 
         let resp = match http_req.await {
             Ok(r) => r,
@@ -193,34 +174,179 @@ impl ModelClient {
             RequiemError::InvalidResponse(format!("failed to parse model response: {text}"))
         })
     }
-}
 
-async fn send_stream(
-    client: &reqwest::Client,
-    config: &ModelConfig,
-    body: &[u8],
-    _attempt: u32,
-) -> Result<reqwest::Response, RequiemError> {
-    let url = config.completions_url();
-    let mut req = client
-        .post(&url)
-        .header(ACCEPT, "text/event-stream")
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let key = config.resolved_api_key();
-    if !key.is_empty() {
-        req = req.header(AUTHORIZATION, format!("Bearer {key}"));
+    /// Attach the bearer token when a key is configured. Every outbound
+    /// request — streaming or not — goes through this so credentials can
+    /// never be dropped on one code path only.
+    fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let key = self.config.resolved_api_key();
+        if !key.is_empty() {
+            req.header(AUTHORIZATION, format!("Bearer {key}"))
+        } else {
+            req
+        }
     }
-    let resp = req
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(|e| RequiemError::Connection(e.to_string()))?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(classify_http_error(status, &text));
+
+    /// A streaming chat completion with incremental delivery.
+    ///
+    /// Parses the SSE stream chunk-by-chunk as bytes arrive (no full-body
+    /// buffering) and pushes every parsed `StreamChunk` through `tx`. When
+    /// the stream ends the fully reassembled `ModelResponse` is returned:
+    /// content is concatenated, tool-call deltas are merged by index, and
+    /// usage is taken from the final chunk when the endpoint reports it.
+    pub async fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+    ) -> Result<ModelResponse, RequiemError> {
+        self.acquire_slot().await?;
+        let result = self.chat_stream_inner(req, &tx).await;
+        self.release_slot();
+        result
     }
-    Ok(resp)
+
+    async fn chat_stream_inner(
+        &self,
+        req: &ChatRequest,
+        tx: &tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+    ) -> Result<ModelResponse, RequiemError> {
+        let mut sreq = req.clone();
+        sreq.stream = true;
+        let body = sreq.to_json_bytes()?;
+
+        let mut attempt = 0u32;
+        let resp = loop {
+            match self.connect_stream(&body).await {
+                Ok(r) => break r,
+                Err(e) if e.is_retryable() && self.retry.should_retry(attempt) => {
+                    let delay = self.retry.delay_for_attempt(attempt);
+                    attempt += 1;
+                    tracing::warn!("stream connect failed (retry {attempt}): {e}");
+                    sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+
+        // Incremental SSE parse over the byte stream.
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+
+        // Reassembly state.
+        let mut content = String::new();
+        let mut tool_calls: std::collections::BTreeMap<u32, crate::request::ToolCall> =
+            std::collections::BTreeMap::new();
+        let mut finish_reason: Option<String> = None;
+        let mut usage: Option<TokenUsage> = None;
+
+        while let Some(chunk) = stream
+            .next()
+            .await
+        {
+            let bytes = chunk.map_err(|e| RequiemError::Connection(e.to_string()))?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            // SSE events are separated by newlines; a line may still be
+            // incomplete, so only consume whole lines.
+            while let Some(pos) = buffer.find('\n') {
+                let line: String = buffer.drain(..=pos).collect();
+                let line = line.trim();
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+                let data = line.strip_prefix("data:").unwrap_or(line).trim_start();
+                if data == "[DONE]" || data == "done" {
+                    break;
+                }
+                if let Some(chunk) = parse_sse_chunk(data) {
+                    if let Some(c) = &chunk.content {
+                        content.push_str(c);
+                    }
+                    if let Some(delta) = &chunk.tool_call_delta {
+                        let entry = tool_calls.entry(delta.index).or_insert_with(|| {
+                            crate::request::ToolCall {
+                                id: String::new(),
+                                name: String::new(),
+                                arguments: serde_json::Value::String(String::new()),
+                            }
+                        });
+                        if let Some(id) = &delta.id {
+                            entry.id = id.clone();
+                        }
+                        if let Some(name) = &delta.name {
+                            entry.name = name.clone();
+                        }
+                        if let Some(args) = &delta.arguments {
+                            if let serde_json::Value::String(acc) = &mut entry.arguments {
+                                acc.push_str(args);
+                            } else {
+                                entry.arguments = serde_json::Value::String(args.clone());
+                            }
+                        }
+                    }
+                    if let Some(fr) = &chunk.finish_reason {
+                        finish_reason = Some(fr.clone());
+                    }
+                    if let Some(u) = chunk.usage {
+                        usage = Some(u);
+                    }
+                    // Deliver without requiring the consumer to keep up:
+                    // unbounded means the UI can never block the agent
+                    // runtime (a closed channel just drops the chunk).
+                    let _ = tx.send(chunk);
+                }
+            }
+        }
+
+        let calls: Vec<crate::request::ToolCall> = tool_calls
+            .into_iter()
+            .filter(|(_, tc)| !tc.name.is_empty())
+            .map(|(idx, mut tc)| {
+                if tc.id.is_empty() {
+                    tc.id = format!("call_{idx}");
+                }
+                tc.arguments = normalize_arguments(tc.arguments);
+                tc
+            })
+            .collect();
+
+        Ok(ModelResponse {
+            message: crate::request::ChatMessage {
+                role: crate::request::Role::Assistant,
+                content: if content.is_empty() && !calls.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::String(content))
+                },
+                tool_call_id: None,
+                tool_calls: calls,
+            },
+            finish_reason,
+            usage,
+            model: Some(self.config.model.clone()),
+        })
+    }
+
+    async fn connect_stream(&self, body: &[u8]) -> Result<reqwest::Response, RequiemError> {
+        let url = self.config.completions_url();
+        let req = self
+            .authorize(
+                self.http
+                    .post(&url)
+                    .header(ACCEPT, "text/event-stream")
+                    .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            )
+            .body(body.to_vec());
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RequiemError::Connection(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(classify_http_error(status, &text));
+        }
+        Ok(resp)
+    }
 }
 
 fn classify_http_error(status: u16, body: &str) -> RequiemError {
@@ -254,6 +380,19 @@ fn classify_http_error(status: u16, body: &str) -> RequiemError {
             status: Some(status),
             message: snippet,
         },
+    }
+}
+
+/// Normalize tool-call arguments: the OpenAI wire format carries them as
+/// a JSON-encoded *string*, but tool implementations expect the parsed
+/// object. Strings that parse as JSON objects/arrays are converted; any
+/// other value is passed through unchanged.
+pub(crate) fn normalize_arguments(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) if !s.trim().is_empty() => {
+            serde_json::from_str::<serde_json::Value>(&s).unwrap_or(serde_json::Value::String(s))
+        }
+        other => other,
     }
 }
 
@@ -291,7 +430,7 @@ fn parse_chat_response(text: &str) -> Option<ModelResponse> {
             tool_calls.push(crate::request::ToolCall {
                 id,
                 name,
-                arguments: args,
+                arguments: normalize_arguments(args),
             });
         }
     }
@@ -328,31 +467,6 @@ fn parse_chat_response(text: &str) -> Option<ModelResponse> {
     })
 }
 
-async fn drain_sse(resp: reqwest::Response) -> Result<Vec<StreamChunk>, RequiemError> {
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| RequiemError::Connection(e.to_string()))?;
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_start();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with(":") {
-            continue;
-        }
-        let data = line.strip_prefix("data:").unwrap_or(line).trim_start();
-        if data == "done" {
-            break;
-        }
-        if let Some(chunk) = parse_sse_chunk(data) {
-            out.push(chunk);
-        }
-    }
-    Ok(out)
-}
-
 fn parse_sse_chunk(data: &str) -> Option<StreamChunk> {
     let v: serde_json::Value = serde_json::from_str(data).ok()?;
     let choice = v.get("choices")?.as_array()?.first()?;
@@ -380,6 +494,7 @@ fn parse_sse_chunk(data: &str) -> Option<StreamChunk> {
                 .map(|s| s.to_string());
             tool_call_delta = Some(ToolCallDelta {
                 index: idx,
+                id: tc.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()),
                 name,
                 arguments: args,
             });

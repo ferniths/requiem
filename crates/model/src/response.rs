@@ -102,6 +102,8 @@ pub struct StreamChunk {
 pub struct ToolCallDelta {
     /// The tool call index in the response.
     pub index: u32,
+    /// The call id (usually only on the first delta).
+    pub id: Option<String>,
     /// The tool name (usually only on the first delta).
     pub name: Option<String>,
     /// A partial argument string.

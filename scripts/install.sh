@@ -12,6 +12,12 @@ echo "REQUIEM — Linux/macOS installer"
 echo "  project root: $ROOT_DIR"
 echo ""
 
+# ── 0. Prerequisites ─────────────────────────────────────────────────
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo not found on PATH — install Rust from https://rustup.rs first" >&2
+    exit 1
+fi
+
 # ── 1. Build release ─────────────────────────────────────────────────
 echo "Building release binary…"
 (cd "$ROOT_DIR" && cargo build --release)
@@ -31,7 +37,14 @@ cp "$TARGET" "$INSTALL_DIR/requiem"
 chmod +x "$INSTALL_DIR/requiem"
 echo "  ✓ installed to $INSTALL_DIR/requiem"
 
-# ── 4. Add to PATH ───────────────────────────────────────────────────
+# ── 4. Verify the installed binary actually runs ─────────────────────
+VERSION_OUT="$("$INSTALL_DIR/requiem" --version)" || {
+    echo "Installed binary failed '--version' — installation is broken" >&2
+    exit 1
+}
+echo "  ✓ verified: $VERSION_OUT"
+
+# ── 5. Add to PATH ───────────────────────────────────────────────────
 SHELL_RC=""
 if [[ -n "${ZSH_VERSION:-}" ]]; then
     SHELL_RC="$HOME/.zshrc"
