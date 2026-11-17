@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 
 use crate::config::ModelConfig;
@@ -24,6 +25,12 @@ pub struct ModelClient {
     config: ModelConfig,
     http: reqwest::Client,
     retry: RetryPolicy,
+    /// Permits equal to `max_concurrency`. Acquired before each request,
+    /// released after. This is race-free: the semaphore's internal
+    /// accounting is atomic and the acquire blocks until a permit is
+    /// available (no TOCTOU window).
+    semaphore: Arc<Semaphore>,
+    /// Retained for `in_flight()` reporting.
     in_flight: Arc<AtomicU32>,
     max_concurrency: u32,
 }
@@ -36,12 +43,20 @@ impl ModelClient {
             .timeout(std::time::Duration::from_millis(config.timeout_ms))
             .build()
             .map_err(|e| RequiemError::Connection(e.to_string()))?;
+        let semaphore = Arc::new(Semaphore::new(
+            config
+                .max_concurrency
+                .max(1)
+                .try_into()
+                .unwrap_or(u32::MAX as usize),
+        ));
         Ok(Self {
             config: config.clone(),
             http,
             retry: from_max_retries(config.max_retries),
             in_flight: Arc::new(AtomicU32::new(0)),
             max_concurrency: config.max_concurrency,
+            semaphore,
         })
     }
 
@@ -66,19 +81,25 @@ impl ModelClient {
         self.in_flight.load(Ordering::Relaxed) < self.max_concurrency
     }
 
-    async fn acquire_slot(&self) -> Result<(), RequiemError> {
-        loop {
-            let cur = self.in_flight.load(Ordering::Relaxed);
-            if cur < self.max_concurrency {
-                self.in_flight.fetch_add(1, Ordering::SeqCst);
-                return Ok(());
+    /// Acquire a concurrency slot (blocks until one is available).
+    /// The returned permit must be held for the duration of the request
+    /// to keep the slot reserved; dropping it releases the slot.
+    async fn acquire_slot(&self) -> OwnedSemaphorePermit {
+        let permit = self.semaphore.clone().acquire_owned().await;
+        if let Ok(permit) = permit {
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            permit
+        } else {
+            // Semaphore was closed — should not happen in practice.
+            loop {
+                sleep(std::time::Duration::from_millis(25)).await;
             }
-            sleep(std::time::Duration::from_millis(25)).await;
         }
     }
 
-    fn release_slot(&self) {
-        let _ = self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    /// Release a concurrency slot.
+    fn release_slot(&self, _permit: OwnedSemaphorePermit) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// A quick connectivity probe. Used by `/model test` and first-run setup.
@@ -102,9 +123,9 @@ impl ModelClient {
 
     /// A non-streaming chat completion with retries on transient errors.
     pub async fn chat(&self, req: ChatRequest) -> Result<ModelResponse, RequiemError> {
-        self.acquire_slot().await?;
+        let _guard = self.acquire_slot().await;
         let res = self.chat_inner(&req).await;
-        self.release_slot();
+        self.release_slot(_guard);
         res
     }
 
@@ -200,9 +221,9 @@ impl ModelClient {
         req: &ChatRequest,
         tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
     ) -> Result<ModelResponse, RequiemError> {
-        self.acquire_slot().await?;
+        let _guard = self.acquire_slot().await;
         let result = self.chat_stream_inner(req, &tx).await;
-        self.release_slot();
+        self.release_slot(_guard);
         result
     }
 

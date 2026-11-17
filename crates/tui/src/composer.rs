@@ -124,18 +124,32 @@ impl Composer {
     }
 
     /// Delete the word before the cursor.
+    ///
+    /// Standard editor behavior: skip trailing whitespace, then skip the
+    /// preceding word. All content after the cursor is preserved intact.
+    /// If the cursor is at the start of a word (after whitespace), the
+    /// whitespace is included in the deletion.
     pub fn delete_word_left(&mut self) {
         self.push_undo();
         let chars: Vec<char> = self.text.chars().collect();
-        let mut i = self.cursor.min(chars.len());
+        let cursor_char = self.cursor.min(chars.len());
+        let mut i = cursor_char;
+        // Pass 1: skip trailing whitespace.
         while i > 0 && chars[i - 1].is_whitespace() {
             i -= 1;
         }
+        // Pass 2: skip the word.
         while i > 0 && !chars[i - 1].is_whitespace() {
             i -= 1;
         }
-        let byte = chars[..i].iter().map(|c| c.len_utf8()).sum();
-        self.text.truncate(byte);
+        let removed_count = cursor_char - i;
+        if removed_count == 0 {
+            self.redo_stack.clear();
+            return;
+        }
+        let before: String = chars[..i].iter().collect();
+        let after: String = chars[cursor_char..].iter().collect();
+        self.text = format!("{before}{after}");
         self.cursor = i;
         self.multiline = self.text.contains('\n');
     }
@@ -283,6 +297,173 @@ pub fn normalize_line_endings(text: &str) -> String {
 /// Byte offset of char index `idx` in `s`.
 fn char_to_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+// ── Soft wrapping ─────────────────────────────────────────────────────
+
+/// A visual line produced by soft-wrapping a logical line of text to a
+/// given width. Carries the starting char index so the cursor can be
+/// mapped back to a (row, col) position.
+#[derive(Debug, Clone)]
+pub struct WrappedLine {
+    /// The visible text for this row.
+    pub text: String,
+    /// Char index in the original logical line where this visual row starts.
+    pub start_char: usize,
+}
+
+/// Soft-wrap a single logical line (no embedded `\n`) to `width` columns.
+/// Long words are broken mid-word rather than overflowing.
+pub fn soft_wrap_line(line: &str, width: usize) -> Vec<WrappedLine> {
+    let width = width.max(1);
+    if line.is_empty() {
+        return vec![WrappedLine {
+            text: String::new(),
+            start_char: 0,
+        }];
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let total = chars.len();
+    if total <= width {
+        return vec![WrappedLine {
+            text: line.to_string(),
+            start_char: 0,
+        }];
+    }
+
+    let mut result = Vec::new();
+    let mut pos = 0;
+    while pos < total {
+        // Find the last space within the window; break there if found.
+        let window_end = (pos + width).min(total);
+        let mut break_at = window_end;
+        for i in (pos + 1..window_end).rev() {
+            if chars[i].is_whitespace() {
+                break_at = i;
+                break;
+            }
+        }
+        // If no space found, hard-break at window_end.
+        let end = if break_at > pos + 1 {
+            break_at
+        } else {
+            window_end
+        };
+        let text: String = chars[pos..end].iter().collect();
+        result.push(WrappedLine {
+            text,
+            start_char: pos,
+        });
+        pos = end;
+    }
+    result
+}
+
+/// Compute the visual row and column of the cursor for a given composer
+/// state and terminal width. Returns `(row, col)` where row is the index
+/// into the vector of all visual rows and col is the character position
+/// within that visual row's text.
+///
+/// The `all_visual_rows` is built by first splitting the text on `\n`
+/// (logical lines), then soft-wrapping each logical line.
+pub fn cursor_visual_position(text: &str, cursor_char: usize, width: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let cursor = cursor_char.min(total);
+
+    // Find which logical line the cursor is on.
+    let mut char_in_line = 0;
+    for (i, c) in chars.iter().enumerate() {
+        if i >= cursor {
+            break;
+        }
+        if *c == '\n' {
+            char_in_line = 0;
+        } else {
+            char_in_line += 1;
+        }
+    }
+
+    // Build visual rows for just this logical line.
+    let line_start = {
+        // Find the start of the current logical line.
+        let mut ls = 0;
+        for (i, c) in chars.iter().enumerate() {
+            if i >= cursor {
+                break;
+            }
+            if *c == '\n' {
+                ls = i + 1;
+            }
+        }
+        ls
+    };
+    let line_end = chars[line_start..]
+        .iter()
+        .position(|c| *c == '\n')
+        .map(|p| line_start + p)
+        .unwrap_or(total);
+    let logical_text: String = chars[line_start..line_end].iter().collect();
+    let wrapped = soft_wrap_line(&logical_text, width);
+
+    // Count total visual rows before this logical line.
+    let mut rows_before = 0;
+    for i in 0..line_start {
+        if chars[i] == '\n' {
+            let prev_start = {
+                let mut ps = 0;
+                for (j, c) in chars.iter().enumerate().take(i) {
+                    if *c == '\n' {
+                        ps = j + 1;
+                    }
+                }
+                ps
+            };
+            let prev_end = i;
+            let prev_text: String = chars[prev_start..prev_end].iter().collect();
+            rows_before += soft_wrap_line(&prev_text, width).len();
+        }
+    }
+
+    // Find which visual row within this logical line the cursor maps to.
+    let mut row_in_line = 0;
+    let mut col = char_in_line;
+    for wl in &wrapped {
+        if char_in_line < wl.start_char + wl.text.chars().count() {
+            row_in_line = wrapped
+                .iter()
+                .position(|w| std::ptr::eq(w, wl))
+                .unwrap_or(0);
+            col = char_in_line - wl.start_char;
+            break;
+        }
+        row_in_line += 1;
+        if row_in_line == wrapped.len() {
+            col = 0;
+            break;
+        }
+    }
+
+    (rows_before + row_in_line, col)
+}
+
+/// Number of visual rows the composer text will occupy at a given width.
+pub fn total_visual_rows(text: &str, width: usize) -> usize {
+    if text.is_empty() {
+        return 1;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut rows = 0;
+    let mut line_start = 0;
+    for i in 0..=chars.len() {
+        let is_end = i == chars.len() || chars[i] == '\n';
+        if is_end {
+            let line_text: String = chars[line_start..i].iter().collect();
+            rows += soft_wrap_line(&line_text, width).len();
+            line_start = i + 1;
+        }
+    }
+    rows.max(1)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -489,5 +670,179 @@ mod tests {
         assert_eq!(c.text, text, "content must remain intact");
         // Flatten preserves all lines.
         assert_eq!(c.flatten(), text.replace('\n', " "));
+    }
+
+    // ── Phase 1 regression tests ──────────────────────────────────
+
+    #[test]
+    fn ctrl_w_preserves_text_after_cursor() {
+        let mut c = Composer::new();
+        c.insert_paste("hello world foo bar");
+        c.move_end();
+        // Cursor at end. Ctrl+W deletes "bar" (word before cursor).
+        c.delete_word_left();
+        assert_eq!(
+            c.text, "hello world foo ",
+            "Ctrl+W must not truncate after cursor"
+        );
+        assert_eq!(c.cursor, 16);
+    }
+
+    #[test]
+    fn ctrl_w_preserves_multiline_content() {
+        let mut c = Composer::new();
+        c.insert_paste("line1\nline2\nline3");
+        c.move_end();
+        c.delete_word_left();
+        // Should be "line1\nline2\n" (removed "line3")
+        assert_eq!(c.text, "line1\nline2\n");
+    }
+
+    #[test]
+    fn ctrl_w_at_word_boundary_middle() {
+        let mut c = Composer::new();
+        c.insert_paste("abc def ghi");
+        // Position cursor on 'g' (index 8).
+        c.move_home();
+        for _ in 0..8 {
+            c.move_right();
+        }
+        c.delete_word_left();
+        // "abc def ghi": pass1 skips space→i=7, pass2 skips "def"→i=4.
+        // Delete chars 4..8 = "def ". before="abc ", after="ghi". Result: "abc ghi".
+        assert_eq!(c.text, "abc ghi");
+        assert_eq!(c.cursor, 4);
+    }
+
+    #[test]
+    fn soft_wrap_short_line_unchanged() {
+        let wrapped = soft_wrap_line("hello", 80);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0].text, "hello");
+    }
+
+    #[test]
+    fn soft_wrap_long_word_breaks_mid_word() {
+        let long_word = "a".repeat(100);
+        let wrapped = soft_wrap_line(&long_word, 40);
+        assert!(wrapped.len() >= 3);
+        // Total chars preserved.
+        let total: usize = wrapped.iter().map(|w| w.text.chars().count()).sum();
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn soft_wrap_breaks_at_spaces() {
+        let text = "word1 word2 word3 word4";
+        let wrapped = soft_wrap_line(text, 10);
+        // Each visual line should be at most 10 chars (including trailing space).
+        for wl in &wrapped {
+            assert!(
+                wl.text.chars().count() <= 10,
+                "line too long: {:?}",
+                wl.text
+            );
+        }
+        // Concatenating all wrapped lines should reproduce the original text.
+        let reconstructed: String = wrapped.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(
+            reconstructed, text,
+            "wrapped lines must reconstruct the original"
+        );
+    }
+
+    #[test]
+    fn cursor_visual_position_on_wrapped_line() {
+        let text = "aaaaaaaaaa bbbbbbbbbb"; // 10 a's, space, 10 b's
+        let width = 12;
+        // Cursor at char 15 (middle of b's).
+        let (row, col) = cursor_visual_position(text, 15, width);
+        assert_eq!(row, 1, "should be on second visual row");
+        assert!(col > 0, "should have a column offset");
+    }
+
+    #[test]
+    fn total_visual_rows_empty_text() {
+        assert_eq!(total_visual_rows("", 80), 1);
+    }
+
+    #[test]
+    fn total_visual_rows_single_line() {
+        assert_eq!(total_visual_rows("hello world", 80), 1);
+    }
+
+    #[test]
+    fn total_visual_rows_multiline() {
+        assert_eq!(total_visual_rows("line1\nline2\nline3", 80), 3);
+    }
+
+    #[test]
+    fn total_visual_rows_wrapped() {
+        let long = "x".repeat(100);
+        let rows = total_visual_rows(&long, 40);
+        assert!(
+            rows >= 3,
+            "100 chars at width 40 should produce ≥ 3 rows, got {rows}"
+        );
+    }
+
+    #[test]
+    fn unicode_cursor_movement() {
+        let mut c = Composer::new();
+        c.insert_paste("hello 🌍 world");
+        let len = c.len();
+        assert_eq!(len, "hello 🌍 world".chars().count());
+        c.move_end();
+        c.move_left();
+        c.move_left();
+        c.delete_before();
+        c.delete_before();
+        // Removed "or" → "hello 🌍 wld"
+        assert_eq!(c.text, "hello 🌍 wld");
+    }
+
+    #[test]
+    fn cjk_cursor_movement() {
+        let mut c = Composer::new();
+        c.insert_paste("你好世界");
+        assert_eq!(c.len(), 4);
+        c.move_home();
+        c.move_right();
+        c.move_right();
+        assert_eq!(c.cursor, 2);
+        c.delete_before();
+        // Removed "好" → "你世界"
+        assert_eq!(c.text, "你世界");
+    }
+
+    #[test]
+    fn multiline_paste_never_submits() {
+        let mut c = Composer::new();
+        c.insert_paste("line1\nline2\nline3");
+        // The text is intact — no flattening, no auto-submit.
+        assert_eq!(c.text, "line1\nline2\nline3");
+        assert!(c.multiline);
+    }
+
+    #[test]
+    fn large_code_block_paste_intact() {
+        let code = r#"
+fn main() {
+    let x = 42;
+    println!("value: {}", x);
+    for i in 0..10 {
+        if i % 2 == 0 {
+            println!("even: {i}");
+        }
+    }
+}
+"#;
+        let mut c = Composer::new();
+        c.insert_paste(code);
+        assert_eq!(c.text, code, "code block must survive paste intact");
+        assert!(c.multiline);
+        // Undo the entire paste as one operation.
+        assert!(c.undo());
+        assert!(c.text.is_empty());
     }
 }

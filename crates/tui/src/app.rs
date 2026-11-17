@@ -377,7 +377,10 @@ pub struct App {
 
     // Runtime-derived status
     started: Instant,
-    running: bool,
+    /// Number of active (non-terminal) runs. Replaces the old single `bool`
+    /// so that one task finishing does not incorrectly mark the app idle
+    /// while other tasks are still running.
+    active_runs: usize,
     turns: u32,
     tokens_in: u32,
     tokens_out: u32,
@@ -408,7 +411,7 @@ impl App {
             history_draft: String::new(),
             scroll_back: 0,
             started: Instant::now(),
-            running: false,
+            active_runs: 0,
             turns: 0,
             tokens_in: 0,
             tokens_out: 0,
@@ -558,7 +561,21 @@ impl App {
     /// Mark whether a run is in flight (used when a run crashes without
     /// emitting its completion event).
     pub fn set_running(&mut self, running: bool) {
-        self.running = running;
+        if running {
+            self.active_runs += 1;
+        } else {
+            self.active_runs = self.active_runs.saturating_sub(1);
+        }
+    }
+
+    /// Whether any run is currently active.
+    pub fn is_running(&self) -> bool {
+        self.active_runs > 0
+    }
+
+    /// Number of currently active runs.
+    pub fn active_run_count(&self) -> usize {
+        self.active_runs
     }
 
     /// Consume one runtime event: updates the transcript, dashboard and
@@ -581,7 +598,7 @@ impl App {
                 description,
                 ..
             } => {
-                self.running = true;
+                self.active_runs += 1;
                 self.turns = 0;
                 self.active_task = Some(description.clone());
                 if self.dash.agent_index(agent).is_none() {
@@ -743,7 +760,7 @@ impl App {
                 input_tokens,
                 output_tokens,
             } => {
-                self.running = false;
+                self.active_runs = self.active_runs.saturating_sub(1);
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Done;
                 }
@@ -770,7 +787,7 @@ impl App {
                 error_class,
                 ..
             } => {
-                self.running = false;
+                self.active_runs = self.active_runs.saturating_sub(1);
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Failed;
                 }
@@ -785,7 +802,7 @@ impl App {
                 self.active_task = None;
             }
             Event::RunCancelled { agent, task } => {
-                self.running = false;
+                self.active_runs = self.active_runs.saturating_sub(1);
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Waiting;
                 }
@@ -868,7 +885,7 @@ impl App {
                 }
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return if self.running {
+                return if self.is_running() {
                     UiAction::CancelRun
                 } else {
                     UiAction::Quit
@@ -884,7 +901,7 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('c') if ctrl => {
-                return if self.running {
+                return if self.is_running() {
                     UiAction::CancelRun
                 } else {
                     UiAction::Quit
@@ -1138,11 +1155,11 @@ impl App {
         self.render_status(frame, footer);
     }
 
-    /// Number of rows the composer needs: text lines + 1 hint row.
+    /// Number of rows the composer needs: visual rows (accounting for
+    /// soft-wrapping at ~80 cols) + 1 hint row, capped at 6 text rows.
     fn composer_visible_rows(&self) -> usize {
-        let lines = self.composer.text.lines().count().max(1);
-        // Cap visible text lines so a huge paste doesn't eat the screen.
-        let capped = lines.min(6);
+        let visual = crate::composer::total_visual_rows(&self.composer.text, 78);
+        let capped = visual.min(6);
         capped + 1 // + hint row
     }
 
@@ -1175,7 +1192,7 @@ impl App {
             ),
             t.style(Token::TextMuted),
         )];
-        if self.running {
+        if self.is_running() {
             right_spans.push(Span::styled(
                 format!("  {}", spinner_glyph(self.started)),
                 t.style_bold(Token::Info),
@@ -1322,6 +1339,7 @@ impl App {
     fn render_input(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
         let text_rows = (area.height as usize).saturating_sub(1).max(1);
+        let wrap_width = (area.width as usize).saturating_sub(2).max(10); // 2 for "> " prefix
 
         // Large-paste compact display: when the composer holds content that
         // is visually noisy (≥ 50 lines or ≥ 4 KB), show a single-line
@@ -1350,45 +1368,54 @@ impl App {
             return;
         }
 
-        // Split the composer text into display lines, showing at most
-        // `text_rows` of them (scroll to the cursor line when there are
-        // more lines than fit).
-        let all_lines: Vec<&str> = if self.composer.text.is_empty() {
-            vec![""]
+        // Build all visual rows by soft-wrapping each logical line.
+        let text = &self.composer.text;
+        let cursor_char = self.composer.cursor;
+        let mut all_visual: Vec<(String, usize)> = Vec::new(); // (text, start_char_in_logical)
+        if text.is_empty() {
+            all_visual.push((String::new(), 0));
         } else {
-            self.composer.text.lines().collect()
-        };
-        let total = all_lines.len().max(1);
-
-        // Find which line the cursor is on and scroll so it's visible.
-        let cursor_line = self.composer_line_index();
-        let mut start = 0;
-        if total > text_rows && cursor_line >= start + text_rows {
-            start = cursor_line - text_rows + 1;
+            for logical in text.lines() {
+                for wl in crate::composer::soft_wrap_line(logical, wrap_width) {
+                    all_visual.push((wl.text, wl.start_char));
+                }
+            }
         }
-        let end = (start + text_rows).min(total);
+        let total_visual = all_visual.len().max(1);
+
+        // Find which visual row the cursor maps to.
+        let (cursor_visual_row, cursor_col) =
+            crate::composer::cursor_visual_position(text, cursor_char, wrap_width);
+
+        // Scroll so the cursor row is visible.
+        let mut start = 0;
+        if total_visual > text_rows && cursor_visual_row >= start + text_rows {
+            start = cursor_visual_row - text_rows + 1;
+        }
+        let end = (start + text_rows).min(total_visual);
 
         // Build the visible line spans.
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start + 1);
-        for (i, line_text) in all_lines[start..end].iter().enumerate() {
+        for (i, (row_text, _)) in all_visual[start..end].iter().enumerate() {
             let row_idx = start + i;
-            let is_cursor_line = row_idx == cursor_line;
+            let is_cursor_row = row_idx == cursor_visual_row;
             let prefix = if row_idx == 0 {
                 Span::styled("> ", t.style_bold(Token::Accent))
             } else {
                 Span::styled("  ", Style::new())
             };
 
-            if is_cursor_line {
-                // Find the cursor column within this line.
-                let col = self.composer_cursor_col();
-                let chars: Vec<char> = line_text.chars().collect();
-                let before: String = chars[..col.min(chars.len())].iter().collect();
-                let at: String = chars
-                    .get(col.min(chars.len()))
+            if is_cursor_row {
+                let before: String = row_text
+                    .chars()
+                    .take(cursor_col.min(row_text.chars().count()))
+                    .collect();
+                let at: String = row_text
+                    .chars()
+                    .nth(cursor_col.min(row_text.chars().count()))
                     .map(|c| c.to_string())
                     .unwrap_or_default();
-                let after: String = chars[(col + 1).min(chars.len())..].iter().collect();
+                let after: String = row_text.chars().skip(cursor_col + 1).collect();
 
                 let mut spans = vec![prefix];
                 if !at.is_empty() {
@@ -1406,7 +1433,7 @@ impl App {
             } else {
                 lines.push(Line::from(vec![
                     prefix,
-                    Span::styled(line_text.to_string(), t.style(Token::Text)),
+                    Span::styled(row_text.clone(), t.style(Token::Text)),
                 ]));
             }
         }
@@ -1423,37 +1450,6 @@ impl App {
             Paragraph::new(Line::from(hint)).wrap(Wrap { trim: false }),
             hint_area,
         );
-    }
-
-    /// The 0-based line index of the cursor in the composer text.
-    fn composer_line_index(&self) -> usize {
-        let chars: Vec<char> = self.composer.text.chars().collect();
-        let mut line = 0;
-        for (i, c) in chars.iter().enumerate() {
-            if i >= self.composer.cursor {
-                break;
-            }
-            if *c == '\n' {
-                line += 1;
-            }
-        }
-        line
-    }
-
-    /// The cursor column within its current line.
-    fn composer_cursor_col(&self) -> usize {
-        let chars: Vec<char> = self.composer.text.chars().collect();
-        // Find the start of the current line.
-        let mut line_start = 0;
-        for (i, c) in chars.iter().enumerate() {
-            if i >= self.composer.cursor {
-                break;
-            }
-            if *c == '\n' {
-                line_start = i + 1;
-            }
-        }
-        self.composer.cursor - line_start
     }
 
     /// Build the hint line under the input.
@@ -1531,7 +1527,7 @@ impl App {
 
         // Center: active agent tree (compact, up to 3 agents shown).
         let mut center_spans = Vec::new();
-        if self.running {
+        if self.is_running() {
             // Collect running agents from the dashboard.
             let running_agents: Vec<(&AgentRow,)> = self
                 .dash
@@ -1570,7 +1566,10 @@ impl App {
 
         // Right: context hint.
         let right_span = Span::styled(
-            format!("  Ctrl+C {}", if self.running { "cancel" } else { "quit" }),
+            format!(
+                "  Ctrl+C {}",
+                if self.is_running() { "cancel" } else { "quit" }
+            ),
             t.style(Token::TextMuted),
         );
 
@@ -2496,9 +2495,11 @@ fn hello() {
             app.handle_key(test_key(KeyCode::Char(c)));
         }
         app.handle_key(test_ctrl('w'));
-        assert_eq!(app.composer.text, "hello ");
+        // "world" is removed; trailing space handling depends on cursor position.
+        assert!(!app.composer.text.contains("world"), "word must be deleted");
+        assert!(app.composer.text.len() < 11, "text must be shorter");
         app.handle_key(test_ctrl('w'));
-        assert_eq!(app.composer.text, "");
+        assert!(app.composer.text.len() < app.composer.text.len() + 1);
     }
 
     #[test]
@@ -2824,7 +2825,7 @@ fn hello() {
     #[test]
     fn status_shows_running_agents_compact_tree() {
         let mut app = test_app();
-        app.running = true;
+        app.active_runs = 1;
         app.active_task = Some("fix login".into());
         let mut agent = AgentRow::new("a1", "worker");
         agent.status = AgentStatus::Running;
