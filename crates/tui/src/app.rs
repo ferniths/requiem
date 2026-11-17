@@ -194,6 +194,8 @@ pub struct App {
 
     // Runtime-derived status
     started: Instant,
+    /// Timestamp of the last character insertion (for paste-flood detection).
+    last_char_at: Option<Instant>,
     running: bool,
     turns: u32,
     tokens_in: u32,
@@ -225,6 +227,7 @@ impl App {
             history_draft: String::new(),
             scroll_back: 0,
             started: Instant::now(),
+            last_char_at: None,
             running: false,
             turns: 0,
             tokens_in: 0,
@@ -273,6 +276,7 @@ impl App {
         let byte = char_to_byte(&self.input, self.cursor);
         self.input.insert_str(byte, &flat);
         self.cursor = byte + flat.chars().count();
+        self.last_char_at = Some(Instant::now());
         self.refresh_suggestions();
     }
 
@@ -631,23 +635,30 @@ impl App {
                 self.delete_word();
             }
             KeyCode::Enter => {
-                let line = self.input.trim().to_string();
-                // If the input still contains embedded newlines, it is a
-                // multi-line paste that was not delivered as a single
-                // bracketed-paste event (terminal without bracketed-paste
-                // support, or a keypress flood).  Collapse the newlines to
-                // spaces so the whole blob stays in the buffer as a single
-                // logical line; do NOT submit yet.
-                if self.input.contains('\n') {
+                // Paste-flood detection: if a large amount of text was just
+                // inserted (≥ 20 chars) and the last character arrived less
+                // than 100 ms ago, this Enter is almost certainly part of a
+                // paste blob from a terminal without bracketed-paste
+                // support.  Collapse newlines and do NOT submit.
+                let is_paste_flood = self.input.chars().count() >= 20
+                    && self
+                        .last_char_at
+                        .map(|t| t.elapsed() < std::time::Duration::from_millis(100))
+                        .unwrap_or(false);
+
+                if is_paste_flood || self.input.contains('\n') {
                     let collapsed: String = self.input.replace('\n', " ");
-                    self.cursor = 0;
                     self.input = collapsed;
-                    self.cursor = 0;
+                    self.cursor = self.input.chars().count();
+                    self.last_char_at = None;
                     self.refresh_suggestions();
                     return UiAction::None;
                 }
+
+                let line = self.input.trim().to_string();
                 self.input.clear();
                 self.cursor = 0;
+                self.last_char_at = None;
                 self.suggestions.clear();
                 self.suggestion_idx = 0;
                 if line.is_empty() {
@@ -728,6 +739,7 @@ impl App {
                 let byte = char_to_byte(&self.input, self.cursor);
                 self.input.insert(byte, c);
                 self.cursor += 1;
+                self.last_char_at = Some(Instant::now());
                 self.refresh_suggestions();
             }
             _ => {}
