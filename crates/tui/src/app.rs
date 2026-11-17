@@ -1420,16 +1420,41 @@ impl App {
             ),
         ];
 
-        // Center: active task spinner (when running).
+        // Center: active agent tree (compact, up to 3 agents shown).
         let mut center_spans = Vec::new();
         if self.running {
-            let task = self.active_task.as_deref().unwrap_or("working");
-            let short: String = task.chars().take(width.saturating_sub(50).max(10)).collect();
-            center_spans.push(Span::styled(
-                format!("  {} ", spinner_glyph(self.started)),
-                t.style_bold(Token::Info),
-            ));
-            center_spans.push(Span::styled(short, t.style(Token::TextSecondary)));
+            // Collect running agents from the dashboard.
+            let running_agents: Vec<(&AgentRow,)> = self
+                .dash
+                .agents
+                .iter()
+                .filter(|a| a.status == AgentStatus::Running)
+                .take(3)
+                .map(|a| (a,))
+                .collect();
+            if !running_agents.is_empty() {
+                for (agent,) in &running_agents {
+                    let glyph = "●";
+                    let label = if agent.current_task.is_empty() {
+                        agent.role.as_str()
+                    } else {
+                        agent.current_task.as_str()
+                    };
+                    let short: String = label.chars().take(32).collect();
+                    center_spans.push(Span::styled(
+                        format!("  {glyph} {short}"),
+                        t.style(Token::Info),
+                    ));
+                }
+            } else if let Some(task) = self.active_task.as_deref() {
+                let short: String =
+                    task.chars().take(width.saturating_sub(50).max(10)).collect();
+                center_spans.push(Span::styled(
+                    format!("  {} ", spinner_glyph(self.started)),
+                    t.style_bold(Token::Info),
+                ));
+                center_spans.push(Span::styled(short, t.style(Token::TextSecondary)));
+            }
         }
 
         // Right: context hint.
@@ -2476,6 +2501,22 @@ fn hello() {
             "footer row: {footer:?}"
         );
         assert!(!footer.contains('─'), "border glyph on footer row: {footer:?}");
+    }
+
+    #[test]
+    fn status_shows_running_agents_compact_tree() {
+        let mut app = test_app();
+        app.running = true;
+        app.active_task = Some("fix login".into());
+        let mut agent = AgentRow::new("a1", "worker");
+        agent.status = AgentStatus::Running;
+        agent.current_task = "reading files".into();
+        app.dash.agents.push(agent);
+        let text = visible_text(&app, 100, 30);
+        assert!(
+            text.contains("reading files"),
+            "running agent task in status: {text}"
+        );
     }
 
     #[test]
