@@ -306,12 +306,21 @@ async fn run_fullscreen(
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen)?;
+    // Enable bracketed paste so terminals deliver clipboard content as a
+    // single CEvent::Paste instead of a flood of keypresses. Safe to enable
+    // even if the terminal doesn't support it — old terminals just won't
+    // send paste events.
+    crossterm::execute!(
+        stdout,
+        crossterm::event::EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // Restore the terminal even if we panic mid-frame.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         let _ = disable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
         previous_hook(info);
@@ -460,6 +469,13 @@ async fn run_fullscreen(
         else {
             continue;
         };
+        // Bracketed paste: the terminal delivers clipboard content as one
+        // event instead of a keypress flood. Insert it into the input
+        // buffer without triggering submit or per-char validation.
+        if let Ok(CEvent::Paste(pasted)) = cev {
+            app.paste_input(&pasted);
+            continue;
+        }
         if let Ok(CEvent::Key(key)) = cev {
             let action = app.handle_key(key);
             let directive = handle_action(
@@ -483,7 +499,7 @@ async fn run_fullscreen(
             match directive {
                 Directive::Continue => {}
                 Directive::Exit => {
-                    break Ok(final_summary(store, session_id, tasks_total, tasks_ok))
+                    break Ok(final_summary(store, session_id, tasks_total, tasks_ok));
                 }
                 Directive::RunSetup => {
                     // Leave full-screen, run the wizard, rebuild.
@@ -517,6 +533,7 @@ async fn run_fullscreen(
     };
 
     // Tear down the full-screen terminal.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     let _ = disable_raw_mode();
     let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
     history.save();

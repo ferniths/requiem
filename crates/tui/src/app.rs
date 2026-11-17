@@ -260,6 +260,20 @@ impl App {
         self.mode = mode.to_string();
     }
 
+    /// Insert a full pasted text blob (bracketed-paste delivery) into the
+    /// input buffer at the cursor position. Newlines are preserved. The
+    /// input is NOT submitted — the user still presses Enter to send.
+    /// Suggestions are refreshed to reflect the new input content.
+    pub fn paste_input(&mut self, text: &str) {
+        if self.cursor > self.input.chars().count() {
+            self.cursor = self.input.chars().count();
+        }
+        let byte = char_to_byte(&self.input, self.cursor);
+        self.input.insert_str(byte, text);
+        self.cursor = byte + text.chars().count();
+        self.refresh_suggestions();
+    }
+
     /// Record a user-submitted line in the transcript and history.
     pub fn push_user_line(&mut self, text: &str) {
         self.entries.push(TranscriptEntry {
@@ -788,10 +802,10 @@ impl App {
 
     fn render_session(&self, frame: &mut Frame) {
         let area = frame.area();
-        let [header, transcript, input, status] = Layout::vertical([
-            Constraint::Length(3),
+        let [header, transcript, input, footer] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(4),
+            Constraint::Length(2),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -799,26 +813,40 @@ impl App {
         self.render_header(frame, header);
         self.render_transcript(frame, transcript);
         self.render_input(frame, input);
-        self.render_status(frame, status);
+        self.render_status(frame, footer);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
+        let width = area.width as usize;
+
+        // Left segment: wordmark + mode badge.
         let mut spans = vec![
-            Span::styled(" REQUIEM", t.style_bold(Token::Accent)),
-            Span::styled(" multi-agent harness", t.style(Token::TextMuted)),
+            Span::styled(" REQUIEM ", t.style_bold(Token::Accent)),
             Span::styled(
-                format!("  session {}", self.session_label),
-                t.style(Token::TextSecondary),
-            ),
-            Span::styled(
-                format!("  model {}", self.model),
-                t.style(Token::TextSecondary),
+                format!("/{:8}", self.mode),
+                t.style_bold(Token::Violet),
             ),
         ];
+
+        // Centre / right segments (responsive: drop when narrow).
+        if width >= 80 {
+            spans.push(Span::styled(
+                format!("  {}", self.model),
+                t.style(Token::TextSecondary),
+            ));
+            spans.push(Span::styled(
+                format!(" · {}", self.session_label),
+                t.style(Token::TextMuted),
+            ));
+        }
         spans.push(Span::styled(
-            format!("  /{}", self.mode),
-            t.style_bold(Token::Violet),
+            format!(
+                " · {} in / {} out",
+                fmt_tokens(self.tokens_in),
+                fmt_tokens(self.tokens_out)
+            ),
+            t.style(Token::TextMuted),
         ));
         if self.running {
             spans.push(Span::styled(
@@ -826,15 +854,11 @@ impl App {
                 t.style(Token::Info),
             ));
         }
-        let header_line = Line::from(spans);
-        let block = Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(t.style(Token::Border));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+
+        // Single-line header — no border block, just the top row of the screen.
         frame.render_widget(
-            Paragraph::new(header_line).wrap(Wrap { trim: false }),
-            inner,
+            Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+            area,
         );
     }
 
@@ -866,12 +890,7 @@ impl App {
     /// Convert transcript entries into styled, pre-wrapped lines.
     fn render_transcript_lines(&self, width: usize) -> RenderedTranscript {
         let t = &self.theme;
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.entries.len() + 2);
-        lines.push(Line::from(Span::styled(
-            " ".repeat(width.max(1)),
-            t.style(Token::Background),
-        )));
-        lines.push(Line::from(Span::styled("", t.style(Token::Background))));
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.entries.len() + 1);
 
         for e in &self.entries {
             let indent_str = " ".repeat(e.indent.min(width / 2));
@@ -906,8 +925,7 @@ impl App {
                 lines.push(Line::from(spans));
             }
         }
-        // Breathing room at the bottom.
-        lines.push(Line::from(Span::styled("", t.style(Token::Background))));
+        // One trailing blank row so the last entry never abuts the input.
         lines.push(Line::from(Span::styled(
             " ".repeat(width.max(1)),
             t.style(Token::Background),
@@ -917,26 +935,11 @@ impl App {
 
     fn render_input(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
-        let title = if self.input.starts_with('/') {
-            " input · command "
-        } else {
-            " input "
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(t.style(if self.input.starts_with('/') {
-                Token::BorderActive
-            } else {
-                Token::Border
-            }))
-            .title(Span::styled(title, t.style(Token::TextMuted)))
-            .title_alignment(ratatui::layout::Alignment::Left);
 
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
+        // No border block — the input row is bare; the hint row is muted text
+        // directly below.
         let [line_area, hint_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
         // Prompt + typed text.
         let prompt = Span::styled("› ", t.style_bold(Token::Accent));
@@ -1025,33 +1028,29 @@ impl App {
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
+        // Left: mode + token usage.
         let mut spans = vec![
             Span::styled(format!(" /{} ", self.mode), t.style_bold(Token::Violet)),
-            Span::styled("·", t.style(Token::TextMuted)),
+            Span::styled(
+                format!(
+                    "  ·  {} in / {} out",
+                    fmt_tokens(self.tokens_in),
+                    fmt_tokens(self.tokens_out)
+                ),
+                t.style(Token::TextMuted),
+            ),
         ];
+        // Centre: active task (when running).
         if self.running {
             let task = self.active_task.as_deref().unwrap_or("working");
             let short: String = task.chars().take(40).collect();
             spans.push(Span::styled(
-                format!(" {} working: ", spinner_glyph(self.started)),
+                format!("  {} ", spinner_glyph(self.started)),
                 t.style(Token::Info),
             ));
             spans.push(Span::styled(short, t.style(Token::TextSecondary)));
-            spans.push(Span::styled(
-                format!("  turn {}", self.turns),
-                t.style(Token::TextMuted),
-            ));
-        } else {
-            spans.push(Span::styled(" idle ", t.style(Token::TextMuted)));
         }
-        spans.push(Span::styled(
-            format!(
-                "  ·  tok {} in / {} out",
-                fmt_tokens(self.tokens_in),
-                fmt_tokens(self.tokens_out)
-            ),
-            t.style(Token::TextSecondary),
-        ));
+        // Right: contextual hint.
         spans.push(Span::styled(
             format!(
                 "  ·  Ctrl+C {} · /dashboard",
@@ -1945,5 +1944,87 @@ mod tests {
 
     fn test_ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn paste_input_inserts_multiline_text_at_cursor() {
+        let mut app = test_app();
+        app.input = "abc".into();
+        app.cursor = 1;
+        app.paste_input("line1\nline2");
+        // "abc" → insert "line1\nline2" at char index 1 → "aline1\nline2bc"
+        // (newlines are preserved in the input buffer; the UI handles them)
+        assert_eq!(app.input, "aline1\nline2bc");
+        // cursor is right after the pasted text (1 + 11 chars)
+        let pasted_len = "line1\nline2".chars().count();
+        assert_eq!(app.cursor, 1 + pasted_len);
+    }
+
+    #[test]
+    fn paste_input_does_not_submit() {
+        let mut app = test_app();
+        app.paste_input("hello\nworld");
+        // No transcript entry was pushed — paste does not submit.
+        assert!(app.entries.is_empty());
+        assert_eq!(app.input, "hello\nworld");
+    }
+
+    #[test]
+    fn paste_input_at_empty_input() {
+        let mut app = test_app();
+        app.paste_input("/ask");
+        assert_eq!(app.input, "/ask");
+        assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
+    fn paste_input_clamps_stale_cursor() {
+        let mut app = test_app();
+        app.input = "hi".into();
+        // Cursor beyond end (stale from a prior longer input) — should clamp.
+        app.cursor = 99;
+        app.paste_input("x");
+        assert_eq!(app.input, "hix");
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn compact_header_is_single_row_borderless() {
+        let app = test_app();
+        // Render at 100x30. The header occupies row 0 (chars 0..100).
+        // The footer occupies row 29 (chars 2900..3000).
+        let buf = render_to_string(&app, 100, 30);
+        // Row 0: must contain the wordmark and no border glyph.
+        let row0 = buf.get(0..100).unwrap_or(&buf[..100.min(buf.len())]).to_string();
+        assert!(row0.contains("REQUIEM"), "header row: {row0:?}");
+        assert!(!row0.contains('─'), "border glyph on header row: {row0:?}");
+        // Row 29: footer — must contain Ctrl+C hint, no border glyph.
+        let footer_start = 29 * 100;
+        let footer_end = (29 * 100 + 100).min(buf.len());
+        let footer = buf.get(footer_start..footer_end).unwrap_or("").to_string();
+        assert!(
+            footer.contains("Ctrl+C") || footer.contains("/dashboard"),
+            "footer row: {footer:?}"
+        );
+        assert!(!footer.contains('─'), "border glyph on footer row: {footer:?}");
+    }
+
+    #[test]
+    fn compact_layout_header_and_footer_are_one_row() {
+        let app = test_app();
+        let buf = render_to_string(&app, 80, 30);
+        // Row 0 (chars 0..80): header with wordmark.
+        let r0 = buf.get(0..80).unwrap_or(&buf[..80.min(buf.len())]).to_string();
+        assert!(r0.contains("REQUIEM"), "header: {r0:?}");
+        // Row 27 (chars 27*80..28*80): input prompt '›'.
+        let r27_start = 27 * 80;
+        let r27_end = (28 * 80).min(buf.len());
+        let r27 = buf.get(r27_start..r27_end).unwrap_or("").to_string();
+        assert!(r27.contains('›') || r27.contains("Enter"), "input row: {r27:?}");
+        // Row 29 (chars 29*80..30*80): footer with mode + Ctrl+C.
+        let r29_start = 29 * 80;
+        let r29_end = (30 * 80).min(buf.len());
+        let r29 = buf.get(r29_start..r29_end).unwrap_or("").to_string();
+        assert!(r29.contains("/code") || r29.contains("Ctrl+C"), "footer: {r29:?}");
     }
 }
