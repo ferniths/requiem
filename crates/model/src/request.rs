@@ -32,14 +32,20 @@ impl std::fmt::Display for Role {
 }
 
 /// A tool definition (function spec) advertised to the model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The OpenAI wire format nests the spec under a `function` key:
+/// ```json
+/// {"type":"function","function":{"name":"read_file","description":"...","parameters":{}}}
+/// ```
+/// The custom (de)serializers bridge REQUIEM's flat shape to the nested
+/// form so strict gateways can deserialize the `tools` array.
+#[derive(Debug, Clone)]
 pub struct ToolDef {
     /// The tool name the model will use in a `tool_call`.
     pub name: String,
     /// A human/LLM description of what the tool does.
     pub description: String,
     /// A JSON-Schema object describing the tool's parameters.
-    #[serde(rename = "parameters")]
     pub parameters: serde_json::Value,
 }
 
@@ -56,10 +62,101 @@ impl ToolDef {
             parameters,
         }
     }
+
+    fn serialize_as_function<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = ser.serialize_struct("ToolDef", 2)?;
+        s.serialize_field("type", "function")?;
+        let mut f = serde_json::Map::new();
+        f.insert("name".into(), serde_json::Value::String(self.name.clone()));
+        f.insert(
+            "description".into(),
+            serde_json::Value::String(self.description.clone()),
+        );
+        f.insert("parameters".into(), self.parameters.clone());
+        s.serialize_field("function", &f)?;
+        s.end()
+    }
+
+    fn deserialize_from_function<'de, D: serde::Deserializer<'de>>(
+        de: D,
+    ) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, Visitor};
+        struct ToolDefVisitor;
+        impl<'de> Visitor<'de> for ToolDefVisitor {
+            type Value = ToolDef;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tool-definition object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut name = String::new();
+                let mut description = String::new();
+                let mut parameters: serde_json::Value = serde_json::Value::Null;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        // Nested "function" object (OpenAI shape).
+                        "function" => {
+                            let func: serde_json::Value = map.next_value()?;
+                            name = func
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            description = func
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(p) = func.get("parameters") {
+                                parameters = p.clone();
+                            }
+                        }
+                        // Tolerate flat shape for non-OpenAI endpoints.
+                        "name" => name = map.next_value()?,
+                        "description" => description = map.next_value()?,
+                        "parameters" => parameters = map.next_value()?,
+                        "type" => {
+                            let _ = map.next_value::<serde_json::Value>();
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde_json::Value>();
+                        }
+                    }
+                }
+                Ok(ToolDef {
+                    name,
+                    description,
+                    parameters,
+                })
+            }
+        }
+        de.deserialize_map(ToolDefVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::deserialize_from_function(d)
+    }
+}
+
+impl Serialize for ToolDef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.serialize_as_function(s)
+    }
 }
 
 /// A tool invocation requested by the model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The OpenAI wire format nests name and arguments under a `function` key:
+/// ```json
+/// {"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}
+/// ```
+/// REQUIEM's flat struct carries the fields at the top level.  The custom
+/// (de)serializers below bridge the two shapes so that outgoing requests
+/// and incoming responses both match what a strict OpenAI-compatible
+/// gateway expects.
+#[derive(Debug, Clone)]
 pub struct ToolCall {
     /// A client-generated id for this call.
     pub id: String,
@@ -68,10 +165,102 @@ pub struct ToolCall {
     /// The JSON-encoded arguments.
     ///
     /// NOTE: the OpenAI protocol carries this as a JSON string, not a JSON
-    /// object. `serde` here deserializes it to `Value` for convenience but
-    /// `to_json` re-serializes it back to the string form the API expects.
-    #[serde(rename = "arguments")]
+    /// object.  `normalize_arguments` re-serializes it back to the string
+    /// form the API expects.
     pub arguments: serde_json::Value,
+}
+
+impl ToolCall {
+    fn serialize_as_function<S: serde::Serializer>(
+        &self,
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = ser.serialize_struct("ToolCall", 2)?;
+        s.serialize_field("id", &self.id)?;
+        // Nested "function" object — the shape the OpenAI gateway expects.
+        let mut f = serde_json::Map::new();
+        f.insert("name".into(), serde_json::Value::String(self.name.clone()));
+        // OpenAI requires `arguments` to be a JSON-encoded *string*, not a
+        // raw JSON object.  Always stringify it here so strict gateways
+        // (including the 9router proxy) can deserialize it.
+        let args_str = match &self.arguments {
+            serde_json::Value::String(s) => s.clone(),
+            other => serde_json::to_string(other)
+                .unwrap_or_else(|_| "{}".to_string()),
+        };
+        f.insert("arguments".into(), serde_json::Value::String(args_str));
+        s.serialize_field("function", &f)?;
+        s.end()
+    }
+
+    fn deserialize_from_function<'de, D: serde::Deserializer<'de>>(
+        de: D,
+    ) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, Visitor};
+        struct ToolCallVisitor;
+        impl<'de> Visitor<'de> for ToolCallVisitor {
+            type Value = ToolCall;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tool-call object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut id = String::new();
+                let mut name = String::new();
+                let mut arguments: serde_json::Value = serde_json::Value::Null;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => id = map.next_value()?,
+                        "function" => {
+                            // The nested object carries name + arguments.
+                            let func: serde_json::Value = map.next_value()?;
+                            name = func
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            match func.get("arguments") {
+                                Some(serde_json::Value::String(s)) => {
+                                    // OpenAI carries arguments as a JSON string.
+                                    arguments =
+                                        serde_json::from_str(s).unwrap_or(serde_json::Value::String(
+                                            s.clone(),
+                                        ));
+                                }
+                                Some(v) => arguments = v.clone(),
+                                None => arguments = serde_json::Value::String(String::new()),
+                            }
+                        }
+                        // Tolerate a flat shape for endpoints that don't
+                        // nest under "function".
+                        "name" => name = map.next_value()?,
+                        "arguments" => arguments = map.next_value()?,
+                        _ => {
+                            let _ = map.next_value::<serde_json::Value>();
+                        }
+                    }
+                }
+                Ok(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+            }
+        }
+        de.deserialize_map(ToolCallVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolCall {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::deserialize_from_function(d)
+    }
+}
+
+impl Serialize for ToolCall {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.serialize_as_function(s)
+    }
 }
 
 /// A single chat message.

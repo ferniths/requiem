@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use requiem_model::client::ModelClient;
 use requiem_model::config::ModelConfig;
-use requiem_model::request::{ChatMessage, ChatRequest};
+use requiem_model::request::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use requiem_model::response::ModelResponse;
 
 /// Everything the mock server saw for one request.
@@ -516,4 +516,114 @@ async fn http_errors_classify() {
     ));
     // 401 is not retryable — the client must fail fast.
     assert!(!err.is_retryable());
+}
+
+/// Regression: a request that carries a tool-result message must serialize
+/// the `tool_calls` field in the nested OpenAI wire shape
+/// (`{"id":…, "function": {"name":…, "arguments": "…"}}`) so a strict
+/// gateway deserializer does not reject the payload with
+/// `missing field 'function'`.
+#[tokio::test]
+async fn outgoing_tool_calls_use_nested_function_shape() {
+    let body = simple_chat_body("ok");
+    let server = MockServer::single(&body).await;
+    let client = make_client(server.addr);
+
+    // Simulate the two-turn exchange: assistant requests a tool call,
+    // REQUIEM executes it and sends the result back.
+    let assistant_msg = ChatMessage {
+        role: requiem_model::request::Role::Assistant,
+        content: None,
+        tool_call_id: None,
+        tool_calls: vec![ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "main.rs"}),
+        }],
+    };
+    let tool_msg = ChatMessage::tool_result("call_1", "fn main() {}");
+    let user_msg = ChatMessage::user("What did the tool say?");
+
+    let req = ChatRequest {
+        model: "mock-model".to_string(),
+        messages: vec![assistant_msg, tool_msg, user_msg],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        request_id: None,
+    };
+
+    client.chat(req).await.expect("chat");
+
+    let last = server.last_request().expect("recorded request");
+    let json: serde_json::Value =
+        serde_json::from_str(&last.body).expect("body is valid JSON");
+    let messages = json["messages"].as_array().expect("messages array");
+
+    // messages[0] is the assistant message with the tool call.
+    let tc = &messages[0]["tool_calls"][0];
+    // The "function" key MUST be present — this is the exact field the
+    // gateway was rejecting.
+    assert!(
+        tc.get("function").is_some(),
+        "tool_calls[0] must carry a nested 'function' object, got: {tc}"
+    );
+    assert_eq!(tc["id"], "call_1");
+    assert_eq!(tc["function"]["name"], "read_file");
+    // arguments is a JSON-encoded string per the OpenAI spec.
+    let args_str = tc["function"]["arguments"].as_str().expect("arguments is a string");
+    let parsed: serde_json::Value = serde_json::from_str(args_str).unwrap();
+    assert_eq!(parsed, serde_json::json!({"path": "main.rs"}));
+}
+
+/// Regression: the `tools` array must use the nested OpenAI wire shape
+/// `{"type":"function","function":{…}}` so strict gateways can
+/// deserialize it.
+#[tokio::test]
+async fn outgoing_tools_use_nested_function_shape() {
+    let body = simple_chat_body("ok");
+    let server = MockServer::single(&body).await;
+    let client = make_client(server.addr);
+
+    let tools = vec![ToolDef::new(
+        "read_file",
+        "Read a file from disk",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+    )];
+
+    let req = ChatRequest {
+        model: "mock-model".to_string(),
+        messages: vec![ChatMessage::user("hi")],
+        temperature: None,
+        max_tokens: None,
+        tools: Some(tools),
+        tool_choice: None,
+        stream: false,
+        request_id: None,
+    };
+
+    client.chat(req).await.expect("chat");
+
+    let last = server.last_request().expect("recorded request");
+    let json: serde_json::Value =
+        serde_json::from_str(&last.body).expect("body is valid JSON");
+    let tool = &json["tools"][0];
+    assert_eq!(
+        tool.get("type").and_then(|v| v.as_str()),
+        Some("function"),
+        "tools[0].type must be the literal string 'function'"
+    );
+    let f = tool.get("function").expect("tools[0].function must exist");
+    assert_eq!(f["name"], "read_file");
+    assert_eq!(f["description"], "Read a file from disk");
+    assert!(
+        f.get("parameters").is_some(),
+        "tools[0].function.parameters must be present"
+    );
 }
