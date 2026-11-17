@@ -210,6 +210,17 @@ impl Theme {
         self.paint_with(color_mode(), token, text)
     }
 
+    /// Paint each line of a multi-line string independently so SGR
+    /// open/close sequences are co-located with the text they color.
+    ///
+    /// Terminals treat `\x1b[...m` as a state change that persists
+    /// until reset; wrapping a whole multi-line block in one sequence
+    /// means intermediate lines may render in the wrong color depending
+    /// on terminal line-wrapping behavior. Painting per-line avoids that.
+    pub fn paint_lines(&self, token: Token, lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| self.paint(token, *l)).collect()
+    }
+
     /// Convenience: accent-colored text.
     pub fn accent(&self, text: impl AsRef<str>) -> String {
         self.paint(Token::Accent, text)
