@@ -836,42 +836,58 @@ impl App {
         let t = &self.theme;
         let width = area.width as usize;
 
-        // Left segment: wordmark + mode badge.
-        let mut spans = vec![
-            Span::styled(" REQUIEM ", t.style_bold(Token::Accent)),
+        // Left: wordmark + mode pill.
+        let left_spans = vec![
+            Span::styled("requiem", t.style_bold(Token::Text)),
+            Span::styled("  ", Style::new()),
             Span::styled(
-                format!("/{:8}", self.mode),
-                t.style_bold(Token::Violet),
+                format!("[{:>4}]", self.mode),
+                t.style_bold(Token::Accent),
             ),
         ];
 
-        // Centre / right segments (responsive: drop when narrow).
-        if width >= 80 {
-            spans.push(Span::styled(
-                format!("  {}", self.model),
+        // Center: model name (only when wide enough).
+        let mut center_spans = Vec::new();
+        if width >= 60 {
+            center_spans.push(Span::styled(
+                self.model.clone(),
                 t.style(Token::TextSecondary),
             ));
-            spans.push(Span::styled(
-                format!(" · {}", self.session_label),
-                t.style(Token::TextMuted),
-            ));
         }
-        spans.push(Span::styled(
+
+        // Right: token usage + running indicator.
+        let mut right_spans = vec![Span::styled(
             format!(
-                " · {} in / {} out",
+                " {} in / {} out",
                 fmt_tokens(self.tokens_in),
                 fmt_tokens(self.tokens_out)
             ),
             t.style(Token::TextMuted),
-        ));
+        )];
         if self.running {
-            spans.push(Span::styled(
-                format!("  {} running", spinner_glyph(self.started)),
-                t.style(Token::Info),
+            right_spans.push(Span::styled(
+                format!("  {}", spinner_glyph(self.started)),
+                t.style_bold(Token::Info),
             ));
         }
 
-        // Single-line header — no border block, just the top row of the screen.
+        // Compose: left … center … right, filling gaps with spaces.
+        let left_text: String = left_spans.iter().map(|s| s.content.as_ref()).collect();
+        let center_text: String = center_spans.iter().map(|s| s.content.as_ref()).collect();
+        let right_text: String = right_spans.iter().map(|s| s.content.as_ref()).collect();
+
+        let left_len = left_text.chars().count();
+        let center_len = center_text.chars().count();
+        let right_len = right_text.chars().count();
+        let gap = width.saturating_sub(left_len + center_len + right_len + 2);
+        let gap_str = " ".repeat(gap);
+
+        let mut spans = left_spans;
+        spans.push(Span::styled(gap_str.clone(), Style::new()));
+        spans.append(&mut center_spans);
+        spans.push(Span::styled(gap_str, Style::new()));
+        spans.append(&mut right_spans);
+
         frame.render_widget(
             Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
             area,
@@ -906,29 +922,27 @@ impl App {
     /// Convert transcript entries into styled, pre-wrapped lines.
     fn render_transcript_lines(&self, width: usize) -> RenderedTranscript {
         let t = &self.theme;
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.entries.len() + 1);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.entries.len() + 2);
 
         for e in &self.entries {
-            let indent_str = " ".repeat(e.indent.min(width / 2));
-            let text_width = width.saturating_sub(e.indent.min(width / 2) + 2);
+            let text_width = width.saturating_sub(e.indent.min(width / 2) + 3);
             let wrapped = wrap_to_width(&e.text, text_width.max(8));
             for (i, chunk) in wrapped.iter().enumerate() {
                 let mut spans = Vec::new();
                 if i == 0 {
+                    // Clean entry marker: glyph + 2 spaces.
                     spans.push(Span::styled(
-                        format!("  {glyph} ", glyph = e.glyph),
+                        format!("{glyph}  ", glyph = e.glyph),
                         if e.bold {
                             t.style_bold(e.fg)
                         } else {
                             t.style(e.fg)
                         },
                     ));
-                    spans.push(Span::styled(indent_str.clone(), t.style(Token::TextMuted)));
                 } else {
-                    spans.push(Span::styled(
-                        format!("    {indent_str}"),
-                        t.style(Token::TextMuted),
-                    ));
+                    // Continuation lines align under the text, not the glyph.
+                    let pad = " ".repeat(e.glyph.chars().count() + 2);
+                    spans.push(Span::styled(pad, Style::new()));
                 }
                 let mut style = t.style(e.fg);
                 if e.bold {
@@ -940,12 +954,12 @@ impl App {
                 spans.push(Span::styled(chunk.clone(), style));
                 lines.push(Line::from(spans));
             }
+            // One blank line between entries for readability.
+            lines.push(Line::from(Span::styled(
+                " ".repeat(width.max(1)),
+                t.style(Token::Background),
+            )));
         }
-        // One trailing blank row so the last entry never abuts the input.
-        lines.push(Line::from(Span::styled(
-            " ".repeat(width.max(1)),
-            t.style(Token::Background),
-        )));
         RenderedTranscript { lines }
     }
 
@@ -957,8 +971,8 @@ impl App {
         let [line_area, hint_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
-        // Prompt + typed text.
-        let prompt = Span::styled("› ", t.style_bold(Token::Accent));
+        // Prompt + typed text. Clean ">" like Qwen Code.
+        let prompt = Span::styled("> ", t.style_bold(Token::Text));
         let chars: Vec<char> = self.input.chars().collect();
         let before: String = chars[..self.cursor.min(chars.len())].iter().collect();
         let at: String = chars
@@ -1002,28 +1016,30 @@ impl App {
                 };
                 let desc = hint_text(s, &self.hints);
                 if i == self.suggestion_idx && !desc.is_empty() {
-                    spans.push(Span::styled(format!(" /{s} "), style));
+                    spans.push(Span::styled(format!("/{s} "), style));
                     spans.push(Span::styled(
-                        format!(" {desc}  "),
+                        desc,
                         t.style(Token::TextSecondary),
                     ));
+                    spans.push(Span::styled(" ", Style::new()));
                 } else {
-                    spans.push(Span::styled(format!(" /{s} "), style));
+                    spans.push(Span::styled(format!("/{s} "), style));
                 }
             }
-            spans.push(Span::styled(" Tab cycle", t.style(Token::TextMuted)));
+            spans.push(Span::styled("Tab to cycle", t.style(Token::TextMuted)));
             return spans;
         }
         if let Some((cmd, args)) = self.current_command_args() {
             let mut spans = vec![Span::styled(
-                format!("  /{cmd} args: "),
+                format!("{cmd} "),
                 t.style(Token::TextSecondary),
             )];
             spans.push(Span::styled(args.join(" | "), t.style(Token::Info)));
             return spans;
         }
+        // Minimal default hint — keep it short and unobtrusive.
         vec![Span::styled(
-            "  Enter submit · Tab dashboard · ↑ history · /help commands",
+            "  /help  ·  /dashboard  ·  Ctrl+C quit",
             t.style(Token::TextMuted),
         )]
     }
@@ -1044,36 +1060,62 @@ impl App {
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
-        // Left: mode + token usage.
-        let mut spans = vec![
-            Span::styled(format!(" /{} ", self.mode), t.style_bold(Token::Violet)),
+        let width = area.width as usize;
+
+        // Left: mode pill + token usage.
+        let left_spans = vec![
+            Span::styled(
+                format!("[{:>4}]", self.mode),
+                t.style_bold(Token::Accent),
+            ),
             Span::styled(
                 format!(
-                    "  ·  {} in / {} out",
+                    "  {} in / {} out",
                     fmt_tokens(self.tokens_in),
                     fmt_tokens(self.tokens_out)
                 ),
                 t.style(Token::TextMuted),
             ),
         ];
-        // Centre: active task (when running).
+
+        // Center: active task spinner (when running).
+        let mut center_spans = Vec::new();
         if self.running {
             let task = self.active_task.as_deref().unwrap_or("working");
-            let short: String = task.chars().take(40).collect();
-            spans.push(Span::styled(
+            let short: String = task.chars().take(width.saturating_sub(50).max(10)).collect();
+            center_spans.push(Span::styled(
                 format!("  {} ", spinner_glyph(self.started)),
-                t.style(Token::Info),
+                t.style_bold(Token::Info),
             ));
-            spans.push(Span::styled(short, t.style(Token::TextSecondary)));
+            center_spans.push(Span::styled(short, t.style(Token::TextSecondary)));
         }
-        // Right: contextual hint.
-        spans.push(Span::styled(
+
+        // Right: context hint.
+        let right_span = Span::styled(
             format!(
-                "  ·  Ctrl+C {} · /dashboard",
+                "  Ctrl+C {}",
                 if self.running { "cancel" } else { "quit" }
             ),
             t.style(Token::TextMuted),
-        ));
+        );
+
+        // Compose: left … center … right.
+        let left_text: String = left_spans.iter().map(|s| s.content.as_ref()).collect();
+        let center_text: String = center_spans.iter().map(|s| s.content.as_ref()).collect();
+        let right_text: String = right_span.content.as_ref().to_string();
+
+        let left_len = left_text.chars().count();
+        let center_len = center_text.chars().count();
+        let right_len = right_text.chars().count();
+        let gap = width.saturating_sub(left_len + center_len + right_len + 2);
+        let gap_str = " ".repeat(gap);
+
+        let mut spans = left_spans;
+        spans.push(Span::styled(gap_str.clone(), Style::new()));
+        spans.append(&mut center_spans);
+        spans.push(Span::styled(gap_str, Style::new()));
+        spans.push(right_span);
+
         frame.render_widget(
             Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
             area,
@@ -1086,40 +1128,31 @@ impl App {
         let t = &self.theme;
         let area = frame.area();
         let [header, body, footer] = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .areas(area);
 
-        // Header.
+        // Compact single-row header matching the session screen.
         let (done, total) = self.dash.task_progress();
         let header_line = Line::from(vec![
-            Span::styled(" REQUIEM", t.style_bold(Token::Accent)),
-            Span::styled(" dashboard", t.style(Token::TextMuted)),
+            Span::styled("requiem", t.style_bold(Token::Text)),
+            Span::styled("  ", Style::new()),
+            Span::styled("[dashboard]", t.style_bold(Token::Accent)),
             Span::styled(
-                format!("  session {}", self.session_label),
-                t.style(Token::TextSecondary),
-            ),
-            Span::styled(format!("  tasks {done}/{total}"), t.style(Token::Info)),
-            Span::styled(
-                format!("  agents {}", self.dash.agents.len()),
-                t.style(Token::TextSecondary),
-            ),
-            Span::styled(
-                format!("  tok {}", fmt_tokens(self.dash.total_tokens())),
+                format!(
+                    "  tasks {done}/{total}  ·  agents {}  ·  tok {}",
+                    self.dash.agents.len(),
+                    fmt_tokens(self.dash.total_tokens())
+                ),
                 t.style(Token::TextSecondary),
             ),
             Span::styled("  Esc close", t.style(Token::TextMuted)),
         ]);
-        let hblock = Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(t.style(Token::Border));
-        let hinner = hblock.inner(header);
-        frame.render_widget(hblock, header);
         frame.render_widget(
             Paragraph::new(header_line).wrap(Wrap { trim: false }),
-            hinner,
+            header,
         );
 
         // Progress gauge row on top of the body.
@@ -1168,25 +1201,9 @@ impl App {
 
         // Footer: selection detail + hints.
         let detail = self.selected_detail();
-        let fblock = Block::default()
-            .borders(Borders::TOP)
-            .border_style(t.style(Token::Border));
-        let finner = fblock.inner(footer);
-        frame.render_widget(fblock, footer);
-        let [detail_row, hints_row] =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(finner);
         frame.render_widget(
             Paragraph::new(Line::from(detail)).wrap(Wrap { trim: false }),
-            detail_row,
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("  Tab panel", t.style(Token::TextMuted)),
-                Span::styled(" · ↑↓ select", t.style(Token::TextMuted)),
-                Span::styled(" · PgUp/PgDn scroll", t.style(Token::TextMuted)),
-                Span::styled(" · Esc close", t.style(Token::TextMuted)),
-            ])),
-            hints_row,
+            footer,
         );
     }
 
@@ -1624,11 +1641,10 @@ mod tests {
     fn session_screen_shows_header_and_prompt() {
         let app = test_app();
         let text = visible_text(&app, 100, 30);
-        assert!(text.contains("REQUIEM"), "header: {text}");
-        assert!(text.contains("sess-1234"));
-        assert!(text.contains("test-model"));
-        assert!(text.contains("›"), "input prompt present");
-        assert!(text.contains("/code"), "mode badge present");
+        assert!(text.contains("requiem"), "wordmark: {text}");
+        assert!(text.contains("test-model"), "model in header");
+        assert!(text.contains("> "), "input prompt present");
+        assert!(text.contains("[code]"), "mode pill present");
     }
 
     #[test]
@@ -2012,14 +2028,14 @@ mod tests {
         let buf = render_to_string(&app, 100, 30);
         // Row 0: must contain the wordmark and no border glyph.
         let row0 = buf.get(0..100).unwrap_or(&buf[..100.min(buf.len())]).to_string();
-        assert!(row0.contains("REQUIEM"), "header row: {row0:?}");
+        assert!(row0.contains("requiem"), "header row: {row0:?}");
         assert!(!row0.contains('─'), "border glyph on header row: {row0:?}");
         // Row 29: footer — must contain Ctrl+C hint, no border glyph.
         let footer_start = 29 * 100;
         let footer_end = (29 * 100 + 100).min(buf.len());
         let footer = buf.get(footer_start..footer_end).unwrap_or("").to_string();
         assert!(
-            footer.contains("Ctrl+C") || footer.contains("/dashboard"),
+            footer.contains("Ctrl+C") || footer.contains("[code]"),
             "footer row: {footer:?}"
         );
         assert!(!footer.contains('─'), "border glyph on footer row: {footer:?}");
@@ -2031,16 +2047,16 @@ mod tests {
         let buf = render_to_string(&app, 80, 30);
         // Row 0 (chars 0..80): header with wordmark.
         let r0 = buf.get(0..80).unwrap_or(&buf[..80.min(buf.len())]).to_string();
-        assert!(r0.contains("REQUIEM"), "header: {r0:?}");
-        // Row 27 (chars 27*80..28*80): input prompt '›'.
+        assert!(r0.contains("requiem"), "header: {r0:?}");
+        // Row 27 (chars 27*80..28*80): input prompt '>'.
         let r27_start = 27 * 80;
         let r27_end = (28 * 80).min(buf.len());
         let r27 = buf.get(r27_start..r27_end).unwrap_or("").to_string();
-        assert!(r27.contains('›') || r27.contains("Enter"), "input row: {r27:?}");
+        assert!(r27.contains(">") || r27.contains("/help"), "input row: {r27:?}");
         // Row 29 (chars 29*80..30*80): footer with mode + Ctrl+C.
         let r29_start = 29 * 80;
         let r29_end = (30 * 80).min(buf.len());
         let r29 = buf.get(r29_start..r29_end).unwrap_or("").to_string();
-        assert!(r29.contains("/code") || r29.contains("Ctrl+C"), "footer: {r29:?}");
+        assert!(r29.contains("[code]") || r29.contains("Ctrl+C"), "footer: {r29:?}");
     }
 }
