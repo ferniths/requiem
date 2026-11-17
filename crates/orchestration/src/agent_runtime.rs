@@ -92,10 +92,17 @@ pub struct AgentRun {
 impl AgentRun {
     /// Start a new run for a task.
     pub fn new(agent: Agent, task: Task) -> Self {
+        Self::with_mode(agent, task, None)
+    }
+
+    /// Start a new run with a mode-specific system prompt.
+    ///
+    /// When `mode` is `Some`, the system prompt is augmented with
+    /// mode-specific instructions so the agent behaves differently in
+    /// Ask vs. Debug vs. Research, etc.
+    pub fn with_mode(agent: Agent, task: Task, mode: Option<&str>) -> Self {
         let mut history = Vec::new();
-        // System prompt: the agent's role, the task description, and the
-        // working conventions that keep multi-agent runs coherent.
-        let system = format!(
+        let mut system = format!(
             "You are the {} agent in REQUIEM, a multi-agent coding harness.\n\
              Your task: {}\n\
              Complete the task using the tools available to you. Make \
@@ -104,6 +111,11 @@ impl AgentRun {
              exactly what blocked you.",
             agent.role, task.description,
         );
+
+        if let Some(m) = mode {
+            system.push_str(mode_prompt(m));
+        }
+
         if let Some(body) = &task.body {
             history.push(ChatMessage::system(format!("{system}\n\nContext:\n{body}")));
         } else {
@@ -128,6 +140,52 @@ impl AgentRun {
             .as_ref()
             .and_then(|r| r.usage)
             .map(|u| (u.input, u.output))
+    }
+}
+
+/// Mode-specific instructions appended to the system prompt so agents
+/// behave differently in each operating mode.
+fn mode_prompt(mode: &str) -> &'static str {
+    match mode {
+        "ask" => {
+            "\n\nMode: ASK. You are in read-only Q&A mode. \
+            Do NOT modify files, run mutating commands, or spawn agents. \
+            Answer the question using inspection tools (read, search, list) \
+            and provide a clear, well-structured response."
+        }
+        "plan" => {
+            "\n\nMode: PLAN. Produce a detailed implementation plan. \
+            Investigate the codebase with read-only tools, then present a \
+            step-by-step plan with file paths, expected changes, and risks. \
+            Do NOT implement. Do NOT modify files."
+        }
+        "code" => {
+            "\n\nMode: CODE. Implement the requested changes. \
+            Use file tools to read, write, and edit code. Run builds and \
+            tests via the terminal tool to verify your changes. \
+            Commit with descriptive messages when appropriate."
+        }
+        "auto" => {
+            "\n\nMode: AUTO. You are fully autonomous. Plan, implement, \
+            test, and correct iteratively until the objective is met. \
+            Use all available tools without asking for confirmation. \
+            Verify your work by running tests or builds before declaring success."
+        }
+        "debug" => {
+            "\n\nMode: DEBUG. Reproduce the failure, find the root \
+            cause, fix it, and verify the fix. Use the terminal to run \
+            tests/reproduce, read the error output, inspect the relevant \
+            code, make a minimal fix, and confirm the failure is resolved. \
+            State the root cause explicitly in your final response."
+        }
+        "research" => {
+            "\n\nMode: RESEARCH. Investigate the topic using \
+            available tools. Search for relevant information, read \
+            documentation or source files, and produce structured findings. \
+            Save research results to the Obsidian vault when appropriate. \
+            Cite sources. Do not modify application code."
+        }
+        _ => "",
     }
 }
 
@@ -665,7 +723,7 @@ pub async fn run_agents_concurrent(
 mod tests {
     use super::*;
     use requiem_core::Id;
-    use requiem_model::request::ToolDef;
+    use requiem_model::request::{Role, ToolDef};
 
     #[tokio::test]
     async fn concurrent_runs_return_results_in_order() {
@@ -751,5 +809,42 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "cancellation took {elapsed:?}, expected < 5s"
         );
+    }
+
+    #[test]
+    fn mode_prompts_are_distinct_per_mode() {
+        // Each mode produces a different system prompt.
+        let agent = Agent::master("test", Id::new());
+        let task = Task::new("do something");
+
+        let run_ask = AgentRun::with_mode(agent.clone(), task.clone(), Some("ask"));
+        let run_debug = AgentRun::with_mode(agent.clone(), task.clone(), Some("debug"));
+        let run_research = AgentRun::with_mode(agent.clone(), task.clone(), Some("research"));
+        let run_plain = AgentRun::with_mode(agent.clone(), task.clone(), None);
+
+        // The system message is the first entry in history.
+        let sys = |run: &AgentRun| {
+            let msg = &run.history[0];
+            assert_eq!(msg.role, Role::System, "first message must be system");
+            msg.content
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+
+        let sys_ask = sys(&run_ask);
+        let sys_debug = sys(&run_debug);
+        let sys_research = sys(&run_research);
+        let sys_plain = sys(&run_plain);
+
+        assert!(sys_ask.contains("Mode: ASK"));
+        assert!(sys_debug.contains("Mode: DEBUG"));
+        assert!(sys_research.contains("Mode: RESEARCH"));
+        assert!(!sys_plain.contains("Mode:"));
+
+        // All are distinct.
+        assert_ne!(sys_ask, sys_debug);
+        assert_ne!(sys_debug, sys_research);
     }
 }

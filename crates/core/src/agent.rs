@@ -118,6 +118,27 @@ impl Agent {
         }
     }
 
+    /// Create a master with an explicit id.
+    ///
+    /// The session driver uses a stable master id so every run can be
+    /// re-registered in the scheduler's agent registry — without it,
+    /// `poll_available` would treat each run's task as unheld and
+    /// re-dispatch it.
+    pub fn master_with_id(id: AgentId, name: impl Into<String>, task_session: Id) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            role: Role::Master,
+            parent: None,
+            task_session,
+            depth: 0,
+            status: AgentStatus::Idle,
+            current_task: None,
+            created: Timestamp::now(),
+            last_activity: None,
+        }
+    }
+
     /// Create a child agent under a parent.
     pub fn child(name: impl Into<String>, role: Role, parent: &Agent, task_session: Id) -> Self {
         Self {

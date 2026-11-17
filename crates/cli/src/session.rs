@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::commands as slash;
 use crate::config::Config;
+use requiem_core::agent::AgentId;
 use requiem_core::events::{Event, NoticeLevel};
 use requiem_core::mode::Mode;
 use requiem_orchestration::agent_runtime::{
@@ -345,7 +346,10 @@ async fn run_fullscreen(
     let mut tasks_total: usize = prior.len();
     let mut tasks_ok: usize = prior.iter().filter(|r| r.success).count();
     let mut tasks_in_flight = false;
-    let cancel = CancelFlag::new();
+    // One shared flag for the spawn_subagent tool's children (registered
+    // once below); /stop and Ctrl-C cancel every in-flight run via the
+    // per-run flags stored in active_runs.
+    let subagent_cancel = CancelFlag::new();
     // The scheduler is the source of truth for task state. On resume,
     // restore the last checkpointed task graph so in-flight multi-agent
     // work continues rather than starting fresh.
@@ -360,13 +364,29 @@ async fn run_fullscreen(
             Scheduler::new(cfg)
         }
     }));
-    // Multiple concurrent task runs (bounded by max_concurrency).
-    let mut active_runs: Vec<(requiem_core::Id, tokio::task::JoinHandle<()>)> = Vec::new();
+    // Concurrent task runs (bounded by max_concurrency). Each run gets
+    // its own cancel flag so /stop and Ctrl-C target only what is
+    // actually in flight without cancelling the others' children.
+    let mut active_runs: Vec<(requiem_core::Id, tokio::task::JoinHandle<()>, CancelFlag)> =
+        Vec::new();
     // Finished runs are delivered here so the UI loop can persist their
     // records; the JoinHandle alone would lose the AgentRun state.
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<AgentRun>();
 
     let mut events: crossterm::event::EventStream = EventStream::new();
+
+    // Register the subagent tools once; every run binds to the same
+    // shared subagent_cancel flag.
+    if bridge.is_tool_allowed("spawn_subagent").await {
+        register_subagent_tools(
+            &bridge,
+            &client,
+            &event_tx,
+            &subagent_cancel,
+            config.max_agent_depth,
+        )
+        .await;
+    }
 
     let result: Result<String, String> = loop {
         // 1. Drain runtime events (never blocks the runtime).
@@ -376,14 +396,15 @@ async fn run_fullscreen(
 
         // 2. Reap completed runs. The JoinHandle catches panics; the done
         //    channel delivers the final AgentRun for persistence.
-        if active_runs.iter().any(|(_, h)| h.is_finished()) {
+        if active_runs.iter().any(|(_, h, _)| h.is_finished()) {
             let mut still_active = Vec::new();
-            for (task_id, handle) in active_runs.drain(..) {
+            for entry in active_runs.drain(..) {
+                let (task_id, handle, flag) = entry;
                 if handle.is_finished() {
                     // Reap — completion arrives via the done channel.
                     let _ = handle.await;
                 } else {
-                    still_active.push((task_id, handle));
+                    still_active.push((task_id, handle, flag));
                 }
             }
             active_runs = still_active;
@@ -392,7 +413,7 @@ async fn run_fullscreen(
             let ok = run.final_response.is_some();
             persist_run(store, session_id, &run);
             tasks_ok += usize::from(ok);
-            // Update the scheduler's task graph.
+            // Update the scheduler's task graph and agent registry.
             let task_id = run.task.id.clone();
             {
                 let mut sched = scheduler.lock().unwrap();
@@ -407,12 +428,22 @@ async fn run_fullscreen(
                 } else {
                     sched.fail_task(&task_id, "run did not complete");
                 }
+                // Mark the agent's terminal status so it frees its slot.
+                let agent_id = AgentId("master".into());
+                if let Some(a) = sched.registry.agents.get_mut(&agent_id) {
+                    if ok {
+                        a.finish();
+                    } else {
+                        a.fail();
+                    }
+                }
                 // Checkpoint the updated graph so a crash or restart can
                 // resume multi-agent state, not just finished records.
                 let _ = store.save_task_graph(&session_id, &sched.graph);
             }
             if active_runs.is_empty() {
                 tasks_in_flight = false;
+                app.set_running(false);
             }
         }
 
@@ -440,7 +471,7 @@ async fn run_fullscreen(
                 store,
                 session_id,
                 &event_tx,
-                &cancel,
+                &subagent_cancel,
                 &mut tasks_total,
                 &mut tasks_in_flight,
                 &mut active_runs,
@@ -510,7 +541,7 @@ async fn handle_action(
     cancel: &CancelFlag,
     tasks_total: &mut usize,
     tasks_in_flight: &mut bool,
-    active_runs: &mut Vec<(requiem_core::Id, tokio::task::JoinHandle<()>)>,
+    active_runs: &mut Vec<(requiem_core::Id, tokio::task::JoinHandle<()>, CancelFlag)>,
     done_tx: &tokio::sync::mpsc::UnboundedSender<AgentRun>,
     history: &mut InputHistory,
     scheduler: &SharedScheduler,
@@ -519,6 +550,12 @@ async fn handle_action(
         UiAction::None => Directive::Continue,
         UiAction::Quit => Directive::Exit,
         UiAction::CancelRun => {
+            // Cancel every in-flight run (and the subagent tool's
+            // children, which share the subagent flag bound to the
+            // session).
+            for (_, _, flag) in active_runs.iter() {
+                flag.cancel();
+            }
             cancel.cancel();
             app.push_system("stopping…", NoticeLevel::Warning);
             Directive::Continue
@@ -536,9 +573,11 @@ async fn handle_action(
                     event_tx,
                     cancel,
                     tasks_in_flight,
+                    active_runs,
                 )
                 .await
             } else {
+                let mode_str = app.mode.clone();
                 start_task(
                     app,
                     &line,
@@ -554,6 +593,7 @@ async fn handle_action(
                     done_tx,
                     history,
                     scheduler,
+                    &mode_str,
                 )
                 .await
             }
@@ -574,6 +614,7 @@ async fn dispatch_slash(
     event_tx: &EventTx,
     cancel: &CancelFlag,
     tasks_in_flight: &bool,
+    active_runs: &[(requiem_core::Id, tokio::task::JoinHandle<()>, CancelFlag)],
 ) -> Directive {
     let trimmed = line.trim();
     let mut parts = trimmed[1..].split_whitespace();
@@ -612,6 +653,9 @@ async fn dispatch_slash(
         }
         "stop" => {
             if *tasks_in_flight {
+                for (_, _, flag) in active_runs.iter() {
+                    flag.cancel();
+                }
                 cancel.cancel();
                 app.push_system("stopping…", NoticeLevel::Warning);
             } else {
@@ -938,6 +982,59 @@ async fn search_brain(app: &mut App, config: &Config, query: &str) {
     }
 }
 
+/// Register the subagent spawn tools on the shared bridge.
+///
+/// Every run reuses the same `spawn_subagent` / `spawn_subagents`
+/// instances; they bind to the shared `subagent_cancel` flag so `/stop`
+/// and Ctrl-C can cancel children across concurrent runs.
+async fn register_subagent_tools(
+    bridge: &ToolBridge,
+    client: &Arc<requiem_model::client::ModelClient>,
+    event_tx: &EventTx,
+    subagent_cancel: &CancelFlag,
+    max_depth: u32,
+) {
+    let parent = requiem_core::agent::Agent::master("master", requiem_core::Id::new());
+    let child_executor = bridge.share();
+    let child_tools: Vec<requiem_model::request::ToolDef> = {
+        let names: Vec<String> = bridge
+            .tools
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|n| n.as_str() != "spawn_subagent" && n.as_str() != "spawn_subagents")
+            .cloned()
+            .collect();
+        names
+            .iter()
+            .filter_map(|n| bridge.tools.lock().unwrap().get(n).map(|t| t.tool_def()))
+            .collect()
+    };
+    let sub_tool = requiem_tools::make_subagent_tool(
+        client.clone(),
+        child_executor.clone(),
+        parent.clone(),
+        parent.task_session.clone(),
+        child_tools.clone(),
+    )
+    .with_max_depth(max_depth)
+    .with_events(event_tx.clone())
+    .with_cancel(subagent_cancel.clone());
+    bridge.add_tool(std::sync::Arc::new(sub_tool));
+
+    let parallel_tool = requiem_tools::make_parallel_subagent_tool(
+        client.clone(),
+        child_executor,
+        parent.clone(),
+        parent.task_session.clone(),
+        child_tools,
+    )
+    .with_max_depth(max_depth)
+    .with_events(event_tx.clone())
+    .with_cancel(subagent_cancel.clone());
+    bridge.add_tool(std::sync::Arc::new(parallel_tool));
+}
+
 /// Spawn a task run on the runtime.
 #[allow(clippy::too_many_arguments)]
 async fn start_task(
@@ -948,26 +1045,22 @@ async fn start_task(
     bridge: &ToolBridge,
     session_id: Uuid,
     event_tx: &EventTx,
-    cancel: &CancelFlag,
+    _cancel: &CancelFlag,
     tasks_total: &mut usize,
     tasks_in_flight: &mut bool,
-    active_runs: &mut Vec<(requiem_core::Id, tokio::task::JoinHandle<()>)>,
+    active_runs: &mut Vec<(requiem_core::Id, tokio::task::JoinHandle<()>, CancelFlag)>,
     done_tx: &tokio::sync::mpsc::UnboundedSender<AgentRun>,
     _history: &mut InputHistory,
     scheduler: &SharedScheduler,
+    mode: &str,
 ) -> Directive {
-    // Use the scheduler as the concurrency gate: it tracks which tasks
-    // are running and how many agent slots are free.
+    // Use the scheduler's running task count as the concurrency gate.
     {
-        let mut sched = scheduler.lock().unwrap();
-        let free_slots = sched.poll_available().len();
-        if free_slots == 0 && !sched.has_pending_work() {
-            // No slots free and no queued work — reject.
+        let sched = scheduler.lock().unwrap();
+        let max = sched.max_agents();
+        if sched.running_task_count() >= max {
             app.push_system(
-                &format!(
-                    "max concurrency reached ({}) — wait for a task to finish",
-                    config.max_concurrency
-                ),
+                &format!("max concurrency reached ({max}) — wait for a task to finish",),
                 NoticeLevel::Warning,
             );
             return Directive::Continue;
@@ -984,60 +1077,8 @@ async fn start_task(
         return Directive::Continue;
     }
 
-    // Reset the cancel flag for the new run (previous run may have
-    // cancelled it).
-    cancel.reset();
-
     app.push_user_line(line);
     *tasks_total += 1;
-
-    // The subagent tool binds this run's event feed + cancel flag.
-    // Pass the *full* tool set (minus spawn_subagent itself to avoid
-    // infinite nesting at this level) so children can actually do work.
-    if bridge.is_tool_allowed("spawn_subagent").await {
-        let child_executor = bridge.share();
-        let parent = requiem_core::agent::Agent::master(
-            "master",
-            requiem_core::Id::from(session_id.to_string()),
-        );
-        let child_tools: Vec<requiem_model::request::ToolDef> = {
-            let names: Vec<String> = bridge
-                .tools
-                .lock()
-                .unwrap()
-                .keys()
-                .filter(|n| n.as_str() != "spawn_subagent" && n.as_str() != "spawn_subagents")
-                .cloned()
-                .collect();
-            names
-                .iter()
-                .filter_map(|n| bridge.tools.lock().unwrap().get(n).map(|t| t.tool_def()))
-                .collect()
-        };
-        let sub_tool = requiem_tools::make_subagent_tool(
-            client.clone(),
-            child_executor.clone(),
-            parent.clone(),
-            requiem_core::Id::from(session_id.to_string()),
-            child_tools.clone(),
-        )
-        .with_max_depth(config.max_agent_depth)
-        .with_events(event_tx.clone())
-        .with_cancel(cancel.clone());
-        bridge.add_tool(std::sync::Arc::new(sub_tool));
-
-        let parallel_tool = requiem_tools::make_parallel_subagent_tool(
-            client.clone(),
-            child_executor,
-            parent,
-            requiem_core::Id::from(session_id.to_string()),
-            child_tools,
-        )
-        .with_max_depth(config.max_agent_depth)
-        .with_events(event_tx.clone())
-        .with_cancel(cancel.clone());
-        bridge.add_tool(std::sync::Arc::new(parallel_tool));
-    }
 
     let tools = bridge.tool_defs().await;
     let agent = requiem_core::agent::Agent::master(
@@ -1047,29 +1088,49 @@ async fn start_task(
     let task = requiem_core::task::Task::new(line);
     let task_id = task.id.clone();
 
-    // Register the task in the scheduler's graph and claim it.
+    // Register the task in the scheduler's graph, claim it for the
+    // stable master agent, and mark it running. The agent descriptor is
+    // re-registered on every run so poll_available treats its task as
+    // held while it's in flight.
     {
         let mut sched = scheduler.lock().unwrap();
         sched.add_task(task.clone());
-        let agent_id = requiem_core::agent::AgentId("master".into());
+        let agent_id = AgentId("master".into());
+        let mut agent = requiem_core::agent::Agent::master_with_id(
+            agent_id.clone(),
+            "master",
+            requiem_core::Id::from(session_id.to_string()),
+        );
+        agent.assign_task(task_id.clone());
+        agent.start();
+        sched.registry.register(agent);
         let _ = sched.claim(&task_id, &agent_id);
         sched.start_task(&task_id);
     }
 
-    let mut run = AgentRun::new(agent, task);
+    let mut run = AgentRun::with_mode(agent, task, Some(mode));
     let client = client.clone();
     let executor = bridge.share();
     let tx = event_tx.clone();
-    let flag = cancel.clone();
+    let flag = CancelFlag::new();
+    let flag_for_run = flag.clone();
     let done_tx_owned = done_tx.clone();
 
     *tasks_in_flight = true;
+    app.set_running(true);
     let handle = tokio::spawn(async move {
-        let _ =
-            run_agent_halted(&client, &executor, &mut run, &tools, Some(&tx), Some(&flag)).await;
+        let _ = run_agent_halted(
+            &client,
+            &executor,
+            &mut run,
+            &tools,
+            Some(&tx),
+            Some(&flag_for_run),
+        )
+        .await;
         let _ = done_tx_owned.send(run);
     });
-    active_runs.push((task_id, handle));
+    active_runs.push((task_id, handle, flag));
     Directive::Continue
 }
 
@@ -1289,7 +1350,7 @@ async fn run_plain(
             let _ = sched.claim(&task_id, &agent_id);
             sched.start_task(&task_id);
         }
-        let mut run = AgentRun::new(agent, task);
+        let mut run = AgentRun::with_mode(agent, task, Some(config.default_mode.as_str()));
 
         let mut event_rx = event_tx.subscribe();
         let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<(

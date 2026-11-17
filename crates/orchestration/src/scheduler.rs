@@ -148,6 +148,23 @@ impl Scheduler {
         self.graph.tasks.values().any(|t| !t.status.is_terminal())
     }
 
+    /// How many tasks are currently in the `Running` state.
+    ///
+    /// Used by the session driver to gate concurrency: a new task can only
+    /// start when `running_task_count() < max_agents`.
+    pub fn running_task_count(&self) -> usize {
+        self.graph
+            .tasks
+            .values()
+            .filter(|t| t.status == requiem_core::task::TaskStatus::Running)
+            .count()
+    }
+
+    /// The configured maximum number of concurrent agents.
+    pub fn max_agents(&self) -> usize {
+        self.config.max_agents
+    }
+
     /// Fraction of tasks in a terminal state.
     pub fn progress(&self) -> f32 {
         self.graph.progress()
@@ -257,6 +274,17 @@ mod tests {
         s.registry.agents.get_mut(&aid).unwrap().finish();
         // The agent finished: its slot frees up again.
         assert_eq!(s.poll_available().len(), 4);
+    }
+
+    #[test]
+    fn running_task_count_tracks_status() {
+        let mut s = scheduler_with_tasks(3);
+        assert_eq!(s.running_task_count(), 0);
+        let id = polled_ids(&s)[0].clone();
+        s.start_task(&id);
+        assert_eq!(s.running_task_count(), 1);
+        s.complete_task(&id, serde_json::json!(null));
+        assert_eq!(s.running_task_count(), 0);
     }
 
     #[test]
