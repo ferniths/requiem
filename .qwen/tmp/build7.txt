@@ -1,9 +1,0 @@
-   Compiling requiem-cli v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\cli)
-error[E0432]: unresolved import `crossterm::terminal::MoveTo`
-   --> crates\cli\src\history.rs:159:53
-    |
-159 |         use crossterm::terminal::{Clear, ClearType, MoveTo};
-    |                                                     ^^^^^^ no `MoveTo` in `terminal`
-
-For more information about this error, try `rustc --explain E0432`.
-error: could not compile `requiem-cli` (lib) due to 1 previous error

@@ -1,3 +1,0 @@
-   Compiling requiem-tui v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\tui)
-   Compiling requiem-cli v0.1.0 (C:\Users\Fern\Desktop\superproductiveharnessthing-cli\crates\cli)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.28s
