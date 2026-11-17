@@ -333,14 +333,35 @@ impl Theme {
     }
 
     /// Convert a token to a ratatui color under an explicit mode.
+    ///
+    /// Uses the hand-tuned `ansi16_index` for 16-colour terminals so the
+    /// REQUIEM semantic palette survives the downgrade (crimson→red, text→
+    /// bright-white, muted→grey). RGB-math fallback is only used for the
+    /// 256-colour path where nearest-neighbour is acceptable.
+    ///
+    /// In `NoColor` mode, background-family tokens return `Color::Reset`
+    /// (let the terminal choose), while text-family tokens return
+    /// `Color::White` — this guarantees readable foreground on any dark
+    /// terminal even when SGR is suppressed, because ratatui will still
+    /// emit the fg parameter for non-Reset colors in its own rendering
+    /// (the TUI always uses the terminal's native color support; NoColor
+    /// only affects the pre-painted ANSI string path).
     pub fn ratatui_color_with(&self, mode: ColorMode, token: Token) -> Color {
-        let rgb = self.rgb(token);
         match mode {
-            ColorMode::NoColor => Color::Reset,
-            ColorMode::TrueColor => Color::Rgb(rgb.0, rgb.1, rgb.2),
-            ColorMode::Ansi256 => Color::Indexed(crate::color::to_ansi256(rgb)),
+            ColorMode::NoColor => match token {
+                Token::Background | Token::Surface | Token::SurfaceRaised => Color::Reset,
+                _ => Color::White,
+            },
+            ColorMode::TrueColor => {
+                let rgb = self.rgb(token);
+                Color::Rgb(rgb.0, rgb.1, rgb.2)
+            }
+            ColorMode::Ansi256 => {
+                let rgb = self.rgb(token);
+                Color::Indexed(crate::color::to_ansi256(rgb))
+            }
             ColorMode::Ansi16 => {
-                let idx = crate::color::to_ansi16(rgb);
+                let idx = self.ansi16_index(token);
                 Color::Indexed(idx)
             }
         }
@@ -365,10 +386,11 @@ impl Theme {
             .add_modifier(Modifier::DIM)
     }
 
-    /// The background style for panels (kept subtle: no hard fills unless
-    /// the terminal supports truecolour).
+    /// The background style for panels: sets the terminal cell background
+    /// to the theme's deep charcoal so the TUI fills the screen with a
+    /// consistent dark surface regardless of the user's terminal default.
     pub fn panel_style(&self) -> Style {
-        Style::new().fg(self.ratatui_color(Token::Border))
+        Style::new().bg(self.ratatui_color(Token::Background))
     }
 }
 
@@ -491,9 +513,20 @@ mod tests {
             t.ratatui_color_with(ColorMode::TrueColor, Token::Accent),
             Color::Rgb(0xD8, 0x3A, 0x5E)
         );
+        // NoColor: background tokens stay Reset (terminal default),
+        // text/accent tokens become White so dark terminals never show
+        // invisible black-on-black.
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::NoColor, Token::Background),
+            Color::Reset
+        );
         assert_eq!(
             t.ratatui_color_with(ColorMode::NoColor, Token::Accent),
-            Color::Reset
+            Color::White
+        );
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::NoColor, Token::Text),
+            Color::White
         );
         let idx = t.ratatui_color_with(ColorMode::Ansi256, Token::Accent);
         assert!(matches!(idx, Color::Indexed(_)));
@@ -514,5 +547,156 @@ mod tests {
         let m = Theme::muted_variant();
         assert_ne!(d.rgb(Token::Text), h.rgb(Token::Text));
         assert_ne!(d.rgb(Token::Accent), m.rgb(Token::Accent));
+    }
+
+    // ── Colour-identity tests (spec requirements) ─────────────────
+
+    #[test]
+    fn logo_resolves_to_crimson() {
+        let t = Theme::default();
+        // The accent token is the official REQUIEM crimson.
+        assert_eq!(t.rgb(Token::Accent), Rgb(0xD8, 0x3A, 0x5E));
+        // TrueColor ratatui bridge must produce the exact RGB.
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::TrueColor, Token::Accent),
+            Color::Rgb(0xD8, 0x3A, 0x5E)
+        );
+        // The banner pre-paint path must emit 38;2;216;58;94.
+        let painted = t.paint_with(ColorMode::TrueColor, Token::Accent, "X");
+        assert!(
+            painted.contains("38;2;216;58;94"),
+            "crimson SGR missing: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn primary_text_resolves_to_readable_light() {
+        let t = Theme::default();
+        // #F2E9EC is a near-white with a slight warm tint.
+        assert_eq!(t.rgb(Token::Text), Rgb(0xF2, 0xE9, 0xEC));
+        // Luminance must be high enough to read on the dark bg.
+        assert!(t.rgb(Token::Text).luma() > 0.8);
+        // TrueColor bridge.
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::TrueColor, Token::Text),
+            Color::Rgb(0xF2, 0xE9, 0xEC)
+        );
+        // Ansi16: maps to bright white (15).
+        assert_eq!(t.ansi16_index(Token::Text), 15);
+    }
+
+    #[test]
+    fn ansi16_uses_intentional_theme_mapping() {
+        let t = Theme::default();
+        // Semantic map: accent→red(1), not nearest-RGB.
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::Ansi16, Token::Accent),
+            Color::Indexed(1)
+        );
+        // Text→bright white(15), not nearest-RGB to 0xF2E9EC.
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::Ansi16, Token::Text),
+            Color::Indexed(15)
+        );
+        // Muted→grey(8).
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::Ansi16, Token::TextMuted),
+            Color::Indexed(8)
+        );
+        // Success→green(2).
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::Ansi16, Token::Success),
+            Color::Indexed(2)
+        );
+        // Background→black(0).
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::Ansi16, Token::Background),
+            Color::Indexed(0)
+        );
+    }
+
+    #[test]
+    fn truecolor_renders_correct_rgb() {
+        let t = Theme::default();
+        for (token, expected) in [
+            (Token::Accent, Rgb(0xD8, 0x3A, 0x5E)),
+            (Token::AccentBright, Rgb(0xFF, 0x52, 0x78)),
+            (Token::AccentDeep, Rgb(0x8C, 0x1D, 0x3A)),
+            (Token::Violet, Rgb(0x9D, 0x7B, 0xD8)),
+            (Token::Text, Rgb(0xF2, 0xE9, 0xEC)),
+            (Token::TextSecondary, Rgb(0xB9, 0xA6, 0xAE)),
+            (Token::TextMuted, Rgb(0x76, 0x63, 0x6C)),
+            (Token::Info, Rgb(0x65, 0xC9, 0xD6)),
+            (Token::Success, Rgb(0x75, 0xD6, 0x9A)),
+            (Token::Warning, Rgb(0xE7, 0xB8, 0x6D)),
+            (Token::Error, Rgb(0xFF, 0x64, 0x7C)),
+        ] {
+            assert_eq!(
+                t.ratatui_color_with(ColorMode::TrueColor, token),
+                Color::Rgb(expected.0, expected.1, expected.2),
+                "token {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nocolor_mode_produces_readable_text() {
+        let t = Theme::default();
+        // Background tokens: Reset (terminal default bg).
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::NoColor, Token::Background),
+            Color::Reset
+        );
+        // Text/accent tokens: White (readable on any dark terminal).
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::NoColor, Token::Text),
+            Color::White
+        );
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::NoColor, Token::Accent),
+            Color::White
+        );
+        assert_eq!(
+            t.ratatui_color_with(ColorMode::NoColor, Token::TextMuted),
+            Color::White
+        );
+        // The pre-painted ANSI path in NoColor mode emits no SGR at all,
+        // so text uses the terminal default — always readable.
+        let plain = t.paint_with(ColorMode::NoColor, Token::Text, "hello");
+        assert_eq!(plain, "hello");
+        assert!(!plain.contains("\x1b["));
+    }
+
+    #[test]
+    fn all_screens_use_same_theme() {
+        let t = Theme::default();
+        // panel_style sets bg to the charcoal background.
+        let ps = t.panel_style();
+        assert_eq!(ps.bg, Some(t.ratatui_color(Token::Background)));
+        // The style() for Text must be readable (not black).
+        let text_style = t.style(Token::Text);
+        assert_eq!(
+            text_style.fg,
+            Some(t.ratatui_color(Token::Text)),
+            "text fg must match the theme's Text token"
+        );
+        // No token should resolve to Color::Black (invisible on dark bg).
+        for token in [
+            Token::Accent,
+            Token::AccentBright,
+            Token::Text,
+            Token::TextSecondary,
+            Token::TextMuted,
+            Token::Info,
+            Token::Success,
+            Token::Warning,
+            Token::Error,
+        ] {
+            let c = t.ratatui_color_with(ColorMode::TrueColor, token);
+            assert!(
+                !matches!(c, Color::Black),
+                "token {token:?} must never resolve to Black"
+            );
+        }
     }
 }

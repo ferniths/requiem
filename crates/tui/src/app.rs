@@ -1100,6 +1100,12 @@ impl App {
 
     fn render_session(&self, frame: &mut Frame) {
         let area = frame.area();
+        let t = &self.theme;
+        // Fill the entire screen with the theme's deep charcoal so the
+        // TUI has a consistent dark surface regardless of terminal default.
+        let bg_block = Block::default().style(t.panel_style());
+        frame.render_widget(bg_block, area);
+
         // Input area grows with multiline content (capped at 8 rows),
         // so the transcript gets whatever is left.
         let input_rows = self.composer_visible_rows();
@@ -1199,7 +1205,7 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::NONE)
-            .style(t.style(Token::Background));
+            .style(t.panel_style());
         frame.render_widget(block, area);
         frame.render_widget(
             Paragraph::new(rendered.lines)
@@ -1581,6 +1587,10 @@ impl App {
     fn render_dashboard(&self, frame: &mut Frame) {
         let t = &self.theme;
         let area = frame.area();
+        // Full-screen charcoal background.
+        let bg_block = Block::default().style(t.panel_style());
+        frame.render_widget(bg_block, area);
+
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
