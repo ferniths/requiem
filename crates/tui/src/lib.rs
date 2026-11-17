@@ -7,6 +7,7 @@
 pub mod app;
 pub mod banner;
 pub mod color;
+pub mod composer;
 pub mod dashboard;
 pub mod markdown;
 pub mod theme;

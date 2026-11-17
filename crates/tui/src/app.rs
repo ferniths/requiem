@@ -26,6 +26,7 @@ use ratatui::Frame;
 
 use requiem_core::events::{Event, NoticeLevel};
 
+use crate::composer::Composer;
 use crate::dashboard::{AgentRow, AgentStatus, TaskRow, TaskStatus};
 use crate::theme::{Theme, Token};
 
@@ -183,8 +184,7 @@ pub struct App {
 
     // Session screen state
     entries: Vec<TranscriptEntry>,
-    input: String,
-    cursor: usize,
+    composer: Composer,
     suggestions: Vec<String>,
     suggestion_idx: usize,
     history: Vec<String>,
@@ -194,8 +194,6 @@ pub struct App {
 
     // Runtime-derived status
     started: Instant,
-    /// Timestamp of the last character insertion (for paste-flood detection).
-    last_char_at: Option<Instant>,
     running: bool,
     turns: u32,
     tokens_in: u32,
@@ -218,8 +216,7 @@ impl App {
             model,
             mode: "code".to_string(),
             entries: Vec::new(),
-            input: String::new(),
-            cursor: 0,
+            composer: Composer::new(),
             suggestions: Vec::new(),
             suggestion_idx: 0,
             history: Vec::new(),
@@ -227,7 +224,6 @@ impl App {
             history_draft: String::new(),
             scroll_back: 0,
             started: Instant::now(),
-            last_char_at: None,
             running: false,
             turns: 0,
             tokens_in: 0,
@@ -264,19 +260,11 @@ impl App {
     }
 
     /// Insert a full pasted text blob (bracketed-paste delivery) into the
-    /// input buffer at the cursor position. Newlines are collapsed to
-    /// spaces so the single-line input stays clean.  The input is NOT
-    /// submitted — the user still presses Enter to send.  Suggestions are
-    /// refreshed to reflect the new input content.
+    /// composer at the cursor position. Newlines are preserved for
+    /// multiline content. The input is NOT submitted — the user still
+    /// presses Enter to send. Suggestions are refreshed.
     pub fn paste_input(&mut self, text: &str) {
-        if self.cursor > self.input.chars().count() {
-            self.cursor = self.input.chars().count();
-        }
-        let flat: String = text.replace('\n', " ");
-        let byte = char_to_byte(&self.input, self.cursor);
-        self.input.insert_str(byte, &flat);
-        self.cursor = byte + flat.chars().count();
-        self.last_char_at = Some(Instant::now());
+        self.composer.insert_paste(text);
         self.refresh_suggestions();
     }
 
@@ -294,6 +282,7 @@ impl App {
         self.history.truncate(200);
         self.history_idx = None;
         self.scroll_back = 0;
+        self.composer.clear();
     }
 
     /// Record a system notice in the transcript.
@@ -556,6 +545,16 @@ impl App {
         &self.dash
     }
 
+    /// Whether the composer text ends with `suffix` (for clipboard dedup).
+    pub fn composer_text_ends_with(&self, suffix: &str) -> bool {
+        self.composer.text.ends_with(suffix)
+    }
+
+    /// The current composer text (read-only access for the CLI driver).
+    pub fn composer_text(&self) -> &str {
+        &self.composer.text
+    }
+
     // ── Key handling ─────────────────────────────────────────────
 
     /// Handle a key event. Drivers must filter `KeyEventKind::Release`
@@ -618,63 +617,81 @@ impl App {
     }
 
     fn handle_session_key(&mut self, key: KeyEvent) -> UiAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('c') if ctrl => {
                 return if self.running {
                     UiAction::CancelRun
                 } else {
                     UiAction::Quit
                 };
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.clear();
-                self.cursor = 0;
+            KeyCode::Char('u') if ctrl => {
+                self.composer.delete_to_start();
                 self.refresh_suggestions();
             }
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.delete_word();
+            KeyCode::Char('w') if ctrl => {
+                self.composer.delete_word_left();
+                self.refresh_suggestions();
+            }
+            KeyCode::Char('k') if ctrl => {
+                self.composer.delete_to_end();
+                self.refresh_suggestions();
+            }
+            KeyCode::Char('z') if ctrl => {
+                if self.composer.undo() {
+                    self.refresh_suggestions();
+                }
+            }
+            KeyCode::Char('z') if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.composer.redo() {
+                    self.refresh_suggestions();
+                }
+            }
+            KeyCode::Char('a') if ctrl => {
+                self.composer.move_end();
             }
             KeyCode::Enter => {
-                // Paste-flood detection: if a large amount of text was just
-                // inserted (≥ 20 chars) and the last character arrived less
-                // than 100 ms ago, this Enter is almost certainly part of a
-                // paste blob from a terminal without bracketed-paste
-                // support.  Collapse newlines and do NOT submit.
-                let is_paste_flood = self.input.chars().count() >= 20
-                    && self
-                        .last_char_at
-                        .map(|t| t.elapsed() < std::time::Duration::from_millis(100))
-                        .unwrap_or(false);
-
-                if is_paste_flood || self.input.contains('\n') {
-                    let collapsed: String = self.input.replace('\n', " ");
-                    self.input = collapsed;
-                    self.cursor = self.input.chars().count();
-                    self.last_char_at = None;
+                // Newline shortcuts: Shift+Enter, Ctrl+Enter, Ctrl+J, Alt+Enter
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || (ctrl && key.code == KeyCode::Enter)
+                    || (alt && key.code == KeyCode::Enter)
+                {
+                    self.composer.insert_newline();
                     self.refresh_suggestions();
                     return UiAction::None;
                 }
-
-                let line = self.input.trim().to_string();
-                self.input.clear();
-                self.cursor = 0;
-                self.last_char_at = None;
-                self.suggestions.clear();
-                self.suggestion_idx = 0;
+                // Ctrl+J
+                if key.code == KeyCode::Char('j') && ctrl {
+                    self.composer.insert_newline();
+                    self.refresh_suggestions();
+                    return UiAction::None;
+                }
+                // Plain Enter: submit
+                let text = self.composer.flatten();
+                let line = text.trim().to_string();
                 if line.is_empty() {
                     return UiAction::None;
                 }
+                self.composer.clear();
+                self.suggestions.clear();
+                self.suggestion_idx = 0;
                 return UiAction::Submit(line);
+            }
+            KeyCode::Char('j') if ctrl => {
+                self.composer.insert_newline();
+                self.refresh_suggestions();
             }
             KeyCode::Tab => {
                 if !self.suggestions.is_empty() {
-                    // Cycle the selection and complete to it.
-                    self.suggestion_idx = (self.suggestion_idx + 1) % self.suggestions.len();
+                    self.suggestion_idx =
+                        (self.suggestion_idx + 1) % self.suggestions.len();
                     let chosen = self.suggestions[self.suggestion_idx].clone();
-                    self.input = format!("/{chosen}");
-                    self.cursor = self.input.chars().count();
+                    self.composer.text = format!("/{chosen}");
+                    self.composer.cursor = self.composer.len();
+                    self.composer.multiline = false;
                 } else {
-                    // No suggestions: Tab opens the dashboard.
                     self.dash.open = true;
                 }
             }
@@ -702,65 +719,46 @@ impl App {
                 self.scroll_back = self.scroll_back.saturating_sub(10);
             }
             KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
+                if ctrl {
+                    self.composer.move_word_left();
+                } else {
+                    self.composer.move_left();
+                }
             }
             KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(self.input.chars().count());
+                if ctrl {
+                    self.composer.move_word_right();
+                } else {
+                    self.composer.move_right();
+                }
             }
             KeyCode::Home => {
-                self.cursor = 0;
+                self.composer.move_home();
             }
             KeyCode::End => {
-                self.cursor = self.input.chars().count();
+                self.composer.move_end();
             }
             KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    let idx = char_to_byte(&self.input, self.cursor - 1);
-                    self.input.remove(idx);
-                    self.cursor -= 1;
-                }
+                self.composer.delete_before();
                 self.refresh_suggestions();
             }
             KeyCode::Delete => {
-                if self.cursor < self.input.chars().count() {
-                    let idx = char_to_byte(&self.input, self.cursor + 1);
-                    self.input.remove(idx);
-                }
+                self.composer.delete_after();
                 self.refresh_suggestions();
             }
             KeyCode::Esc => {
-                if !self.input.is_empty() {
-                    self.input.clear();
-                    self.cursor = 0;
+                if !self.composer.text.is_empty() {
+                    self.composer.clear();
                     self.refresh_suggestions();
                 }
             }
             KeyCode::Char(c) => {
-                let byte = char_to_byte(&self.input, self.cursor);
-                self.input.insert(byte, c);
-                self.cursor += 1;
-                self.last_char_at = Some(Instant::now());
+                self.composer.insert_char(c);
                 self.refresh_suggestions();
             }
             _ => {}
         }
         UiAction::None
-    }
-
-    fn delete_word(&mut self) {
-        // Delete the word left of the cursor.
-        let chars: Vec<char> = self.input.chars().collect();
-        let mut i = self.cursor.min(chars.len());
-        while i > 0 && chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        while i > 0 && !chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        let byte = chars[..i].iter().map(|c| c.len_utf8()).sum();
-        self.input.truncate(byte);
-        self.cursor = i;
-        self.refresh_suggestions();
     }
 
     fn recall_history(&mut self, dir: i32) {
@@ -770,9 +768,11 @@ impl App {
         match self.history_idx {
             None => {
                 if dir > 0 {
-                    self.history_draft = self.input.clone();
+                    self.history_draft = self.composer.text.clone();
                     self.history_idx = Some(0);
-                    self.input = self.history[0].clone();
+                    self.composer.text = self.history[0].clone();
+                    self.composer.cursor = self.composer.len();
+                    self.composer.multiline = self.composer.text.contains('\n');
                 }
             }
             Some(i) => {
@@ -781,23 +781,25 @@ impl App {
                 } else if i == 0 {
                     // Restoring the draft.
                     self.history_idx = None;
-                    self.input = self.history_draft.clone();
-                    self.cursor = self.input.chars().count();
+                    self.composer.text = self.history_draft.clone();
+                    self.composer.cursor = self.composer.len();
+                    self.composer.multiline = self.composer.text.contains('\n');
                     return;
                 } else {
                     i - 1
                 };
                 self.history_idx = Some(next);
-                self.input = self.history[next].clone();
+                self.composer.text = self.history[next].clone();
+                self.composer.cursor = self.composer.len();
+                self.composer.multiline = self.composer.text.contains('\n');
             }
         }
-        self.cursor = self.input.chars().count();
     }
 
     fn refresh_suggestions(&mut self) {
         self.suggestions.clear();
         self.suggestion_idx = 0;
-        let trimmed = self.input.trim_start();
+        let trimmed = self.composer.text.trim_start();
         if !trimmed.starts_with('/') {
             return;
         }
@@ -830,10 +832,13 @@ impl App {
 
     fn render_session(&self, frame: &mut Frame) {
         let area = frame.area();
+        // Input area grows with multiline content (capped at 8 rows),
+        // so the transcript gets whatever is left.
+        let input_rows = self.composer_visible_rows();
         let [header, transcript, input, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(2),
+            Constraint::Length(input_rows as u16),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -842,6 +847,14 @@ impl App {
         self.render_transcript(frame, transcript);
         self.render_input(frame, input);
         self.render_status(frame, footer);
+    }
+
+    /// Number of rows the composer needs: text lines + 1 hint row.
+    fn composer_visible_rows(&self) -> usize {
+        let lines = self.composer.text.lines().count().max(1);
+        // Cap visible text lines so a huge paste doesn't eat the screen.
+        let capped = lines.min(6);
+        capped + 1 // + hint row
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -977,42 +990,145 @@ impl App {
 
     fn render_input(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
+        let text_rows = (area.height as usize).saturating_sub(1).max(1);
 
-        // No border block — the input row is bare; the hint row is muted text
-        // directly below.
-        let [line_area, hint_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        // Large-paste compact display: when the composer holds content that
+        // is visually noisy (≥ 50 lines or ≥ 4 KB), show a single-line
+        // placeholder instead of the full text. The content remains intact
+        // in `composer.text` and is submitted exactly once.
+        if let Some(placeholder) = self.composer.paste_placeholder() {
+            let areas = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+            let text_area = areas[0];
+            let hint_area = areas[1];
 
-        // Prompt + typed text. Clean ">" like Qwen Code.
-        let prompt = Span::styled("> ", t.style_bold(Token::Text));
-        let chars: Vec<char> = self.input.chars().collect();
-        let before: String = chars[..self.cursor.min(chars.len())].iter().collect();
-        let at: String = chars
-            .get(self.cursor.min(chars.len()))
-            .map(|c| c.to_string())
-            .unwrap_or_default();
-        let after: String = chars[(self.cursor + 1).min(chars.len())..].iter().collect();
-        let mut spans = vec![prompt];
-        if !at.is_empty() {
-            spans.push(Span::styled(before, t.style(Token::Text)));
-            // Block cursor over the character at the caret.
-            spans.push(Span::styled(
-                at,
-                t.style(Token::Background)
-                    .bg(t.ratatui_color(Token::Accent)),
-            ));
-            spans.push(Span::styled(after, t.style(Token::Text)));
-        } else {
-            spans.push(Span::styled(format!("{before} "), t.style(Token::Text)));
+            let spans: Vec<Span<'static>> = vec![
+                Span::styled("> ", t.style_bold(Token::Accent)),
+                Span::styled(placeholder, t.style(Token::TextMuted)),
+            ];
+            frame.render_widget(
+                Paragraph::new(Line::from(spans.clone())).wrap(Wrap { trim: false }),
+                text_area,
+            );
+
+            let hint = self.hint_line();
+            frame.render_widget(
+                Paragraph::new(Line::from(hint)).wrap(Wrap { trim: false }),
+                hint_area,
+            );
+            return;
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), line_area);
 
-        // Hint line: suggestions, argument hints, or default hints.
+        // Split the composer text into display lines, showing at most
+        // `text_rows` of them (scroll to the cursor line when there are
+        // more lines than fit).
+        let all_lines: Vec<&str> = if self.composer.text.is_empty() {
+            vec![""]
+        } else {
+            self.composer.text.lines().collect()
+        };
+        let total = all_lines.len().max(1);
+
+        // Find which line the cursor is on and scroll so it's visible.
+        let cursor_line = self.composer_line_index();
+        let mut start = 0;
+        if total > text_rows {
+            if cursor_line >= start + text_rows {
+                start = cursor_line - text_rows + 1;
+            }
+        }
+        let end = (start + text_rows).min(total);
+
+        // Build the visible line spans.
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start + 1);
+        for (i, line_text) in all_lines[start..end].iter().enumerate() {
+            let row_idx = start + i;
+            let is_cursor_line = row_idx == cursor_line;
+            let prefix = if row_idx == 0 {
+                Span::styled("> ", t.style_bold(Token::Accent))
+            } else {
+                Span::styled("  ", Style::new())
+            };
+
+            if is_cursor_line {
+                // Find the cursor column within this line.
+                let col = self.composer_cursor_col();
+                let chars: Vec<char> = line_text.chars().collect();
+                let before: String = chars[..col.min(chars.len())].iter().collect();
+                let at: String = chars.get(col.min(chars.len())).map(|c| c.to_string()).unwrap_or_default();
+                let after: String = chars[(col + 1).min(chars.len())..].iter().collect();
+
+                let mut spans = vec![prefix];
+                if !at.is_empty() {
+                    spans.push(Span::styled(before, t.style(Token::Text)));
+                    spans.push(Span::styled(
+                        at,
+                        t.style(Token::Background).bg(t.ratatui_color(Token::Accent)),
+                    ));
+                    spans.push(Span::styled(after, t.style(Token::Text)));
+                } else {
+                    spans.push(Span::styled(
+                        format!("{before} "),
+                        t.style(Token::Text),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            } else {
+                lines.push(Line::from(vec![
+                    prefix,
+                    Span::styled(line_text.to_string(), t.style(Token::Text)),
+                ]));
+            }
+        }
+
+        // Render text lines + hint row.
+        let [text_area, hint_area] = Layout::vertical([
+            Constraint::Length(text_rows as u16),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+
+        frame.render_widget(Paragraph::new(lines), text_area);
+
         let hint = self.hint_line();
         frame.render_widget(
             Paragraph::new(Line::from(hint)).wrap(Wrap { trim: false }),
             hint_area,
         );
+    }
+
+    /// The 0-based line index of the cursor in the composer text.
+    fn composer_line_index(&self) -> usize {
+        let chars: Vec<char> = self.composer.text.chars().collect();
+        let mut line = 0;
+        for (i, c) in chars.iter().enumerate() {
+            if i >= self.composer.cursor {
+                break;
+            }
+            if *c == '\n' {
+                line += 1;
+            }
+        }
+        line
+    }
+
+    /// The cursor column within its current line.
+    fn composer_cursor_col(&self) -> usize {
+        let chars: Vec<char> = self.composer.text.chars().collect();
+        // Find the start of the current line.
+        let mut line_start = 0;
+        for (i, c) in chars.iter().enumerate() {
+            if i >= self.composer.cursor {
+                break;
+            }
+            if *c == '\n' {
+                line_start = i + 1;
+            }
+        }
+        self.composer.cursor - line_start
     }
 
     /// Build the hint line under the input.
@@ -1049,16 +1165,23 @@ impl App {
             spans.push(Span::styled(args.join(" | "), t.style(Token::Info)));
             return spans;
         }
-        // Minimal default hint — keep it short and unobtrusive.
+        // Minimal default hint — contextual, short.
+        let default_hint = if self.composer.should_show_placeholder() {
+            "  Enter send (full content) · Esc clear · Ctrl+C quit"
+        } else if self.composer.multiline {
+            "  Enter send · Shift+Enter newline · Esc clear · Ctrl+C quit"
+        } else {
+            "  /help · /dashboard · @files · Enter send · Ctrl+C quit"
+        };
         vec![Span::styled(
-            "  /help  ·  /dashboard  ·  Ctrl+C quit",
+            default_hint,
             t.style(Token::TextMuted),
         )]
     }
 
     /// (command, arg hints) when the input names a known command.
     fn current_command_args(&self) -> Option<(String, Vec<String>)> {
-        let trimmed = self.input.trim();
+        let trimmed = self.composer.text.trim();
         if !trimmed.starts_with('/') {
             return None;
         }
@@ -1588,6 +1711,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// Byte offset of char index `idx` in `s` (panics never).
+#[cfg(test)]
 fn char_to_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
 }
@@ -1851,10 +1975,10 @@ mod tests {
         for c in "/help".chars() {
             app.handle_key(test_key(KeyCode::Char(c)));
         }
-        assert_eq!(app.input, "/help");
+        assert_eq!(app.composer.text, "/help");
         let action = app.handle_key(test_key(KeyCode::Enter));
         assert_eq!(action, UiAction::Submit("/help".into()));
-        assert!(app.input.is_empty());
+        assert!(app.composer.text.is_empty());
     }
 
     #[test]
@@ -1867,7 +1991,7 @@ mod tests {
         assert!(text.contains("/auto"), "{text}");
         // Tab cycles to /auto and completes it.
         app.handle_key(test_key(KeyCode::Tab));
-        assert_eq!(app.input, "/auto");
+        assert_eq!(app.composer.text, "/auto");
     }
 
     #[test]
@@ -1886,13 +2010,13 @@ mod tests {
         let mut app = test_app();
         app.set_history(vec!["first".into(), "second".into()]);
         app.handle_key(test_key(KeyCode::Up));
-        assert_eq!(app.input, "first");
+        assert_eq!(app.composer.text, "first");
         app.handle_key(test_key(KeyCode::Up));
-        assert_eq!(app.input, "second");
+        assert_eq!(app.composer.text, "second");
         app.handle_key(test_key(KeyCode::Down));
-        assert_eq!(app.input, "first");
+        assert_eq!(app.composer.text, "first");
         app.handle_key(test_key(KeyCode::Down));
-        assert_eq!(app.input, "", "returns to draft");
+        assert_eq!(app.composer.text, "", "returns to draft");
     }
 
     #[test]
@@ -1901,14 +2025,14 @@ mod tests {
         for c in "héllo".chars() {
             app.handle_key(test_key(KeyCode::Char(c)));
         }
-        assert_eq!(app.input, "héllo");
-        assert_eq!(app.cursor, 5);
+        assert_eq!(app.composer.text, "héllo");
+        assert_eq!(app.composer.cursor, 5);
         app.handle_key(test_key(KeyCode::Backspace));
-        assert_eq!(app.input, "héll");
-        assert_eq!(app.cursor, 4);
+        assert_eq!(app.composer.text, "héll");
+        assert_eq!(app.composer.cursor, 4);
         app.handle_key(test_key(KeyCode::Left));
         app.handle_key(test_key(KeyCode::Char('X')));
-        assert_eq!(app.input, "hélXl");
+        assert_eq!(app.composer.text, "hélXl");
         // UTF-8 safety: cursor math never splits a char.
         let _ = render_to_string(&app, 60, 20);
     }
@@ -1993,14 +2117,14 @@ mod tests {
     #[test]
     fn paste_input_inserts_multiline_text_at_cursor() {
         let mut app = test_app();
-        app.input = "abc".into();
-        app.cursor = 1;
+        app.composer.text = "abc".into();
+        app.composer.cursor = 1;
         app.paste_input("line1\nline2");
-        // "abc" → insert "line1 line2" (newlines→spaces) at char index 1
-        assert_eq!(app.input, "aline1 line2bc");
-        // cursor is right after the pasted text (1 + 11 chars)
-        let pasted_len = "line1 line2".chars().count();
-        assert_eq!(app.cursor, 1 + pasted_len);
+        // "abc" → insert "line1\nline2" (newlines preserved) at char index 1
+        assert_eq!(app.composer.text, "aline1\nline2bc");
+        // cursor is right after the pasted text (1 + 12 chars)
+        let pasted_len = "line1\nline2".chars().count();
+        assert_eq!(app.composer.cursor, 1 + pasted_len);
     }
 
     #[test]
@@ -2009,27 +2133,27 @@ mod tests {
         app.paste_input("hello\nworld");
         // No transcript entry was pushed — paste does not submit.
         assert!(app.entries.is_empty());
-        // Newlines collapsed to spaces.
-        assert_eq!(app.input, "hello world");
+        // Newlines preserved.
+        assert_eq!(app.composer.text, "hello\nworld");
     }
 
     #[test]
     fn paste_input_at_empty_input() {
         let mut app = test_app();
         app.paste_input("/ask");
-        assert_eq!(app.input, "/ask");
-        assert_eq!(app.cursor, 4);
+        assert_eq!(app.composer.text, "/ask");
+        assert_eq!(app.composer.cursor, 4);
     }
 
     #[test]
     fn paste_input_clamps_stale_cursor() {
         let mut app = test_app();
-        app.input = "hi".into();
+        app.composer.text = "hi".into();
         // Cursor beyond end (stale from a prior longer input) — should clamp.
-        app.cursor = 99;
+        app.composer.cursor = 99;
         app.paste_input("x");
-        assert_eq!(app.input, "hix");
-        assert_eq!(app.cursor, 3);
+        assert_eq!(app.composer.text, "hix");
+        assert_eq!(app.composer.cursor, 3);
     }
 
     #[test]
@@ -2060,15 +2184,310 @@ mod tests {
         // Row 0 (chars 0..80): header with wordmark.
         let r0 = buf.get(0..80).unwrap_or(&buf[..80.min(buf.len())]).to_string();
         assert!(r0.contains("requiem"), "header: {r0:?}");
-        // Row 27 (chars 27*80..28*80): input prompt '>'.
-        let r27_start = 27 * 80;
-        let r27_end = (28 * 80).min(buf.len());
-        let r27 = buf.get(r27_start..r27_end).unwrap_or("").to_string();
-        assert!(r27.contains(">") || r27.contains("/help"), "input row: {r27:?}");
+        // Row 28 (chars 28*80..29*80): input prompt '>' (second-to-last row).
+        let r28_start = 28 * 80;
+        let r28_end = (29 * 80).min(buf.len());
+        let r28 = buf.get(r28_start..r28_end).unwrap_or("").to_string();
+        assert!(r28.contains(">") || r28.contains("/help"), "input row: {r28:?}");
         // Row 29 (chars 29*80..30*80): footer with mode + Ctrl+C.
         let r29_start = 29 * 80;
         let r29_end = (30 * 80).min(buf.len());
         let r29 = buf.get(r29_start..r29_end).unwrap_or("").to_string();
         assert!(r29.contains("[code]") || r29.contains("Ctrl+C"), "footer: {r29:?}");
+    }
+
+    // ── Stage 8: paste tests (22 mandated) ───────────────────────
+
+    /// The exact Rust code block from the spec §5.3 — a multiline paste
+    /// that must retain its original line structure.
+    const RUST_CODE_BLOCK: &str = "fn main() {
+    let x: u32 = 42;
+    if x % 2 == 0 {
+        println!(\"even: {x}\");
+    } else {
+        println!(\"odd: {x}\");
+    }
+}";
+
+    #[test]
+    fn paste_rust_code_block_preserves_structure() {
+        let mut app = test_app();
+        app.paste_input(RUST_CODE_BLOCK);
+        // The text must retain all newlines exactly.
+        let expected = RUST_CODE_BLOCK.to_string();
+        assert_eq!(
+            app.composer.text, expected,
+            "line structure must be preserved"
+        );
+        assert_eq!(
+            app.composer.text.lines().count(),
+            expected.lines().count(),
+            "line count must match"
+        );
+        // Each original line must appear in order.
+        for line in expected.lines() {
+            assert!(
+                app.composer.text.contains(line),
+                "missing line: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_rust_code_block_submits_once_intact() {
+        let mut app = test_app();
+        app.paste_input(RUST_CODE_BLOCK);
+        // Simulate pressing Enter (plain, no modifiers) → submit.
+        let action = app.handle_key(test_key(KeyCode::Enter));
+        match action {
+            UiAction::Submit(ref line) => {
+                // The submitted text is the flattened (newlines→spaces)
+                // version of the original block, trimmed.
+                let expected = RUST_CODE_BLOCK.replace('\n', " ");
+                let expected = expected.trim();
+                assert_eq!(
+                    line, expected,
+                    "must submit the complete original content exactly once"
+                );
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        // After submit the composer is cleared.
+        assert!(app.composer.text.is_empty());
+    }
+
+    #[test]
+    fn paste_rust_block_crlf_normalized() {
+        let mut app = test_app();
+        let crlf_block = RUST_CODE_BLOCK.replace('\n', "\r\n");
+        app.paste_input(&crlf_block);
+        // CRLF must be normalised to LF.
+        assert!(!app.composer.text.contains('\r'), "CR must be stripped");
+        assert_eq!(
+            app.composer.text, RUST_CODE_BLOCK,
+            "CRLF paste must equal LF paste"
+        );
+    }
+
+    #[test]
+    fn paste_rust_block_cr_only_normalized() {
+        let mut app = test_app();
+        let cr_block = RUST_CODE_BLOCK.replace('\n', "\r");
+        app.paste_input(&cr_block);
+        assert!(!app.composer.text.contains('\r'), "CR must be stripped");
+        assert_eq!(app.composer.text, RUST_CODE_BLOCK);
+    }
+
+    #[test]
+    fn paste_rust_block_does_not_auto_submit() {
+        let mut app = test_app();
+        app.paste_input(RUST_CODE_BLOCK);
+        // No transcript entry for the pasted content — it stays in the
+        // composer until the user presses Enter.
+        assert!(
+            app.entries.is_empty(),
+            "paste must not create transcript entries"
+        );
+    }
+
+    #[test]
+    fn paste_rust_block_at_cursor_position() {
+        let mut app = test_app();
+        // Type "review this: " then paste the code block.
+        for c in "review this: ".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        app.paste_input(RUST_CODE_BLOCK);
+        assert!(
+            app.composer.text.starts_with("review this: "),
+            "prefix must be preserved before paste"
+        );
+        assert!(
+            app.composer.text.ends_with(RUST_CODE_BLOCK),
+            "pasted block must be at the end"
+        );
+    }
+
+    #[test]
+    fn paste_rust_block_is_single_undo() {
+        let mut app = test_app();
+        app.paste_input(RUST_CODE_BLOCK);
+        let before = app.composer.text.clone();
+        assert!(app.composer.undo());
+        assert!(
+            app.composer.text.is_empty(),
+            "undo must remove the entire pasted block"
+        );
+        assert!(app.composer.redo());
+        assert_eq!(app.composer.text, before);
+    }
+
+    #[test]
+    fn paste_rust_block_placeholder_shown() {
+        let mut app = test_app();
+        // RUST_CODE_BLOCK is only 8 lines — below the 50-line threshold.
+        // Force a large paste to trigger the placeholder.
+        let large: String = RUST_CODE_BLOCK.repeat(10);
+        app.paste_input(&large);
+        let ph = app.composer.paste_placeholder().expect("placeholder expected");
+        assert!(ph.contains("lines"), "placeholder: {ph}");
+        assert!(ph.contains("KB"), "placeholder: {ph}");
+    }
+
+    #[test]
+    fn paste_large_block_content_intact() {
+        let mut app = test_app();
+        let large: String = RUST_CODE_BLOCK.repeat(10);
+        app.paste_input(&large);
+        // Content must be intact despite placeholder rendering.
+        assert_eq!(app.composer.text, large);
+        // Submit must send the full content.
+        let action = app.handle_key(test_key(KeyCode::Enter));
+        if let UiAction::Submit(line) = action {
+            let expected = large.replace('\n', " ").trim().to_string();
+            assert_eq!(line, expected, "full content must be submitted");
+        } else {
+            panic!("expected Submit");
+        }
+    }
+
+    #[test]
+    fn paste_240_lines_18kb_placeholder() {
+        let mut app = test_app();
+        // Simulate a 240-line, ~18 KB paste.
+        let line = "fn test_240() { assert!(true); }\n";
+        let text = line.repeat(240);
+        assert!(text.lines().count() == 240);
+        app.paste_input(&text);
+        let ph = app.composer.paste_placeholder().expect("placeholder");
+        assert!(ph.contains("240 lines"), "got: {ph}");
+    }
+
+    #[test]
+    fn paste_short_text_no_placeholder() {
+        let mut app = test_app();
+        app.paste_input("fn main() {}\n");
+        assert!(
+            app.composer.paste_placeholder().is_none(),
+            "short paste must not show placeholder"
+        );
+    }
+
+    #[test]
+    fn paste_empty_string() {
+        let mut app = test_app();
+        app.paste_input("");
+        assert!(app.composer.text.is_empty());
+    }
+
+    #[test]
+    fn paste_whitespace_only() {
+        let mut app = test_app();
+        app.paste_input("   \n  ");
+        assert!(!app.composer.text.is_empty());
+        // Submit trims to empty → no Submit action.
+        let action = app.handle_key(test_key(KeyCode::Enter));
+        assert_eq!(action, UiAction::None);
+    }
+
+    #[test]
+    fn paste_mixed_line_endings_normalized() {
+        let mut app = test_app();
+        // Mix of LF, CRLF, and lone CR.
+        app.paste_input("a\nb\r\nc\rd");
+        assert_eq!(app.composer.text, "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn paste_utf8_preserved() {
+        let mut app = test_app();
+        app.paste_input("日本語\nテスト\nemoji ✓");
+        assert_eq!(app.composer.text, "日本語\nテスト\nemoji ✓");
+    }
+
+    #[test]
+    fn paste_special_characters() {
+        let mut app = test_app();
+        app.paste_input("a\"b'c\\d\te\nf");
+        assert_eq!(app.composer.text, "a\"b'c\\d\te\nf");
+    }
+
+    #[test]
+    fn paste_then_edit() {
+        let mut app = test_app();
+        app.paste_input("hello\nworld");
+        // Move to start, delete "hello" (5 chars).
+        app.handle_key(test_key(KeyCode::Home));
+        for _ in 0..5 {
+            app.handle_key(test_key(KeyCode::Delete));
+        }
+        assert_eq!(app.composer.text, "\nworld");
+        // Move right past the newline, then backspace to remove it.
+        app.handle_key(test_key(KeyCode::Right));
+        app.handle_key(test_key(KeyCode::Backspace));
+        assert_eq!(app.composer.text, "world");
+    }
+
+    #[test]
+    fn paste_multiple_blocks() {
+        let mut app = test_app();
+        app.paste_input("first block\n");
+        app.paste_input("second block\n");
+        assert_eq!(app.composer.text, "first block\nsecond block\n");
+    }
+
+    #[test]
+    fn paste_undo_redo_cycle() {
+        let mut app = test_app();
+        app.paste_input("aaa\n");
+        app.paste_input("bbb\n");
+        assert_eq!(app.composer.text, "aaa\nbbb\n");
+        assert!(app.composer.undo());
+        assert_eq!(app.composer.text, "aaa\n");
+        assert!(app.composer.redo());
+        assert_eq!(app.composer.text, "aaa\nbbb\n");
+        assert!(app.composer.undo());
+        assert!(app.composer.undo());
+        assert!(app.composer.text.is_empty());
+        assert!(!app.composer.undo());
+    }
+
+    #[test]
+    fn paste_history_recall_still_works() {
+        let mut app = test_app();
+        app.set_history(vec!["old input".into()]);
+        app.handle_key(test_key(KeyCode::Up));
+        assert_eq!(app.composer.text, "old input");
+    }
+
+    #[test]
+    fn paste_placeholder_renders_in_input_area() {
+        let mut app = test_app();
+        let large: String = RUST_CODE_BLOCK.repeat(20);
+        app.paste_input(&large);
+        // Render at 100x30 — the placeholder line must be visible.
+        let text = visible_text(&app, 100, 30);
+        assert!(
+            text.contains("Pasted text"),
+            "placeholder visible: {text}"
+        );
+        assert!(
+            text.contains("lines"),
+            "placeholder shows line count: {text}"
+        );
+    }
+
+    #[test]
+    fn paste_then_shift_enter_inserts_newline() {
+        let mut app = test_app();
+        app.paste_input("line1");
+        // Shift+Enter should insert a newline.
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        app.handle_key(key);
+        assert_eq!(app.composer.text, "line1\n");
+        assert!(app.composer.multiline);
     }
 }

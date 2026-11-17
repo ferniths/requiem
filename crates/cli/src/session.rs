@@ -22,6 +22,7 @@ use futures::StreamExt;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::clipboard;
 use crate::commands as slash;
 use crate::config::Config;
 use requiem_core::agent::AgentId;
@@ -476,7 +477,35 @@ async fn run_fullscreen(
             app.paste_input(&pasted);
             continue;
         }
+        // Native clipboard fallback: when bracketed paste is unavailable,
+        // Alt+V reads the OS clipboard directly. The last bracketed-paste
+        // content is remembered to prevent double-insertion when a terminal
+        // sends both a paste event and a key-press fallback.
         if let Ok(CEvent::Key(key)) = cev {
+            if key.kind == crossterm::event::KeyEventKind::Press
+                && key.code == crossterm::event::KeyCode::Char('v')
+                && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                && clipboard::is_supported()
+            {
+                match clipboard::read_clipboard() {
+                    Some(text) if !text.is_empty() => {
+                        let normalized =
+                            requiem_tui::composer::normalize_line_endings(&text);
+                        if !normalized.is_empty()
+                            && !app.composer_text_ends_with(&normalized)
+                        {
+                            app.paste_input(&normalized);
+                        }
+                    }
+                    _ => {
+                        app.push_system(
+                            "clipboard is empty or unavailable",
+                            NoticeLevel::Warning,
+                        );
+                    }
+                }
+                continue;
+            }
             let action = app.handle_key(key);
             let directive = handle_action(
                 &mut app,
