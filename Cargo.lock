@@ -1522,6 +1522,7 @@ dependencies = [
 name = "requiem-model"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures",
  "requiem-core",
  "reqwest",

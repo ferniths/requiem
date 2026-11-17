@@ -15,6 +15,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("research", "Modes", "parallel research and vault writes"),
     // ── Run control ─────────────────────────────────────────────────
     CommandSpec::new("stop", "Run control", "cancel the running task"),
+    CommandSpec::new("retry", "Run control", "retry the last failed request"),
+    CommandSpec::new(
+        "diagnostics",
+        "Run control",
+        "show model client diagnostics",
+    ),
     // ── View ────────────────────────────────────────────────────────
     CommandSpec::new("dashboard", "View", "open the live dashboard overlay"),
     CommandSpec::new("agents", "View", "list agents and their state"),

@@ -184,8 +184,17 @@ impl ModelClient {
 
         let status = resp.status();
         if !status.is_success() {
+            let retry_after: Option<String> = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
-            return Err(classify_http_error(status.as_u16(), &text));
+            return Err(classify_http_error(
+                status.as_u16(),
+                &text,
+                retry_after.as_deref(),
+            ));
         }
 
         let text = resp
@@ -361,35 +370,72 @@ impl ModelClient {
             .map_err(|e| RequiemError::Connection(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
+            let retry_after: Option<String> = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
-            return Err(classify_http_error(status, &text));
+            return Err(classify_http_error(status, &text, retry_after.as_deref()));
         }
         Ok(resp)
     }
 }
 
-fn classify_http_error(status: u16, body: &str) -> RequiemError {
+fn classify_http_error(status: u16, body: &str, retry_after_header: Option<&str>) -> RequiemError {
     let snippet: String = body.chars().take(300).collect();
     match status {
-        400 => RequiemError::Model {
-            status: Some(400),
-            message: snippet,
-        },
-        401 | 403 => RequiemError::Model {
-            status: Some(status),
-            message: format!("unauthorized/forbidden: {snippet}"),
-        },
-        404 => RequiemError::Model {
-            status: Some(404),
-            message: format!("endpoint or model not found: {snippet}"),
-        },
+        400 => {
+            // Distinguish sub-types within 400.
+            if body.contains("model")
+                && (body.contains("not found")
+                    || body.contains("does not exist")
+                    || body.contains("unsupported"))
+            {
+                RequiemError::ModelUnavailable(snippet)
+            } else if body.contains("tool")
+                && (body.contains("schema")
+                    || body.contains("format")
+                    || body.contains("incompatible"))
+            {
+                RequiemError::ToolCallingIncompatible(snippet)
+            } else if body.contains("quota")
+                || body.contains("billing")
+                || body.contains("exceeded")
+            {
+                RequiemError::QuotaExhausted(snippet)
+            } else {
+                RequiemError::Model {
+                    status: Some(400),
+                    message: snippet,
+                }
+            }
+        }
+        401 => RequiemError::Auth(format!("invalid credentials: {snippet}")),
+        403 => RequiemError::Auth(format!("access forbidden: {snippet}")),
+        404 => {
+            if body.contains("model") || body.contains("not found") {
+                RequiemError::ModelUnavailable(snippet)
+            } else {
+                RequiemError::Model {
+                    status: Some(404),
+                    message: snippet,
+                }
+            }
+        }
         408 => RequiemError::Timeout(0),
         413 => RequiemError::ContextLength {
             requested: 0,
             limit: None,
         },
-        429 => RequiemError::RateLimited {
-            retry_after_ms: 1000,
+        429 => {
+            let retry_after_ms = parse_retry_after(retry_after_header).unwrap_or(1000);
+            RequiemError::RateLimited { retry_after_ms }
+        }
+        409 => RequiemError::StreamingFailure(snippet),
+        502..=504 => RequiemError::GatewayFailure {
+            status,
+            message: snippet,
         },
         500..=599 => RequiemError::Model {
             status: Some(status),
@@ -400,6 +446,57 @@ fn classify_http_error(status: u16, body: &str) -> RequiemError {
             message: snippet,
         },
     }
+}
+
+/// Parse the `Retry-After` header value into milliseconds.
+///
+/// Supports both the `delta-seconds` integer form (RFC 9110 §12.2.3) and
+/// the `HTTP-date` form. Returns `None` when the header is absent or
+/// unparseable.
+fn parse_retry_after(header: Option<&str>) -> Option<u64> {
+    let value = header?;
+    // Try delta-seconds first (most common).
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs.saturating_mul(1000));
+    }
+    // Try HTTP-date: parse as RFC 2822 / RFC 1123 format.
+    if let Some(date) = parse_http_date(value) {
+        let now = std::time::SystemTime::now();
+        let now_unix = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if date > now_unix {
+            return Some((date - now_unix) * 1000);
+        }
+    }
+    None
+}
+
+/// Parse an HTTP-date (RFC 7231) into Unix seconds.
+fn parse_http_date(s: &str) -> Option<u64> {
+    use chrono::DateTime;
+
+    // RFC 7231 IMF-fixdate: "Wed, 21 Oct 2015 07:28:00 GMT"
+    let fmt = "%a, %d %b %Y %H:%M:%S %Z";
+    if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
+        return Some(dt.timestamp().max(0) as u64);
+    }
+    // RFC 7231 rfc1123 variant without day-of-week.
+    let fmt2 = "%d %b %Y %H:%M:%S %Z";
+    if let Ok(dt) = DateTime::parse_from_str(s, fmt2) {
+        return Some(dt.timestamp().max(0) as u64);
+    }
+    // RFC 850 (obsolete): "Wednesday, 21-Oct-15 07:28:00 GMT"
+    let fmt3 = "%A, %d-%b-%y %H:%M:%S %Z";
+    if let Ok(dt) = DateTime::parse_from_str(s, fmt3) {
+        return Some(dt.timestamp().max(0) as u64);
+    }
+    // ISO 8601 (used by some providers): "2024-01-15T12:00:00Z"
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ") {
+        return Some(dt.timestamp().max(0) as u64);
+    }
+    None
 }
 
 /// Normalize tool-call arguments: the OpenAI wire format carries them as
@@ -541,4 +638,90 @@ fn parse_sse_chunk(data: &str) -> Option<StreamChunk> {
         finish_reason,
         usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_retry_after_delta_seconds() {
+        assert_eq!(parse_retry_after(Some("30")), Some(30_000));
+        assert_eq!(parse_retry_after(Some("1")), Some(1000));
+        assert_eq!(parse_retry_after(Some("0")), Some(0));
+    }
+
+    #[test]
+    fn parse_retry_after_absent() {
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn parse_retry_after_invalid() {
+        assert_eq!(parse_retry_after(Some("abc")), None);
+    }
+
+    #[test]
+    fn classify_429_with_retry_after() {
+        let err = classify_http_error(429, "rate limited", Some("60"));
+        match err {
+            RequiemError::RateLimited { retry_after_ms } => {
+                assert_eq!(retry_after_ms, 60_000);
+            }
+            _ => panic!("expected RateLimited, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_429_without_retry_after() {
+        let err = classify_http_error(429, "rate limited", None);
+        match err {
+            RequiemError::RateLimited { retry_after_ms } => {
+                assert_eq!(retry_after_ms, 1000, "falls back to 1s");
+            }
+            _ => panic!("expected RateLimited, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_401_is_auth() {
+        let err = classify_http_error(401, "bad key", None);
+        assert!(matches!(err, RequiemError::Auth(_)));
+    }
+
+    #[test]
+    fn classify_403_is_auth() {
+        let err = classify_http_error(403, "forbidden", None);
+        assert!(matches!(err, RequiemError::Auth(_)));
+    }
+
+    #[test]
+    fn classify_502_is_gateway() {
+        let err = classify_http_error(502, "bad gateway", None);
+        assert!(matches!(err, RequiemError::GatewayFailure { .. }));
+    }
+
+    #[test]
+    fn classify_503_is_gateway() {
+        let err = classify_http_error(503, "unavailable", None);
+        assert!(matches!(err, RequiemError::GatewayFailure { .. }));
+    }
+
+    #[test]
+    fn classify_504_is_gateway() {
+        let err = classify_http_error(504, "gateway timeout", None);
+        assert!(matches!(err, RequiemError::GatewayFailure { .. }));
+    }
+
+    #[test]
+    fn classify_400_model_not_found() {
+        let err = classify_http_error(400, "model gpt-9 does not exist", None);
+        assert!(matches!(err, RequiemError::ModelUnavailable(_)));
+    }
+
+    #[test]
+    fn classify_400_quota() {
+        let err = classify_http_error(400, "quota exceeded", None);
+        assert!(matches!(err, RequiemError::QuotaExhausted(_)));
+    }
 }

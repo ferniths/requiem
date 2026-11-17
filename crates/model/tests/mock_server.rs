@@ -507,13 +507,7 @@ async fn http_errors_classify() {
         request_id: None,
     };
     let err = client.chat(req).await.unwrap_err();
-    assert!(matches!(
-        err,
-        requiem_core::error::RequiemError::Model {
-            status: Some(401),
-            ..
-        }
-    ));
+    assert!(matches!(err, requiem_core::error::RequiemError::Auth(_)));
     // 401 is not retryable — the client must fail fast.
     assert!(!err.is_retryable());
 }

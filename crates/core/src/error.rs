@@ -55,6 +55,43 @@ pub enum RequiemError {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
+    /// Credentials are missing, expired, or invalid.
+    #[error("authentication failed: {0}")]
+    Auth(String),
+
+    /// The API key is not configured.
+    #[error("no API key configured")]
+    MissingCredentials,
+
+    /// DNS resolution failed.
+    #[error("dns failure: {0}")]
+    Dns(String),
+
+    /// A TLS handshake or certificate verification failed.
+    #[error("tls failure: {0}")]
+    Tls(String),
+
+    /// The model name is not available at the configured endpoint.
+    #[error("model unavailable: {0}")]
+    ModelUnavailable(String),
+
+    /// The provider reports a quota or billing limit has been hit.
+    #[error("quota exhausted: {0}")]
+    QuotaExhausted(String),
+
+    /// The provider's tool-calling schema is incompatible with the request.
+    #[error("tool-calling error: {0}")]
+    ToolCallingIncompatible(String),
+
+    /// A failure occurred mid-stream after the HTTP connection was
+    /// established (SSE dropped, malformed chunk, etc.).
+    #[error("streaming failure: {0}")]
+    StreamingFailure(String),
+
+    /// An upstream gateway (load balancer, proxy) returned an error.
+    #[error("gateway failure [{status}]: {message}")]
+    GatewayFailure { status: u16, message: String },
+
     /// A filesystem or I/O failure.
     #[error("io: {0}")]
     Io(String),
@@ -89,7 +126,13 @@ impl RequiemError {
     /// Whether this error class is worth retrying (transient).
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Connection(_) | Self::RateLimited { .. } | Self::Timeout(_) => true,
+            Self::Connection(_)
+            | Self::Dns(_)
+            | Self::Tls(_)
+            | Self::RateLimited { .. }
+            | Self::Timeout(_)
+            | Self::GatewayFailure { .. }
+            | Self::StreamingFailure(_) => true,
             Self::Model { status, .. } => status.is_some_and(|s| s >= 500 || s == 429),
             _ => false,
         }
@@ -107,6 +150,15 @@ impl RequiemError {
             Self::Timeout(_) => "timeout",
             Self::InvalidState(_) => "invalid_state",
             Self::PermissionDenied(_) => "permission",
+            Self::Auth(_) => "auth",
+            Self::MissingCredentials => "missing_credentials",
+            Self::Dns(_) => "dns",
+            Self::Tls(_) => "tls",
+            Self::ModelUnavailable(_) => "model_unavailable",
+            Self::QuotaExhausted(_) => "quota_exhausted",
+            Self::ToolCallingIncompatible(_) => "tool_calling",
+            Self::StreamingFailure(_) => "streaming",
+            Self::GatewayFailure { .. } => "gateway",
             Self::Io(_) => "io",
             Self::Tool { .. } => "tool",
             Self::Session(_) => "session",

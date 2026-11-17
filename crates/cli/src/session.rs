@@ -711,6 +711,54 @@ async fn dispatch_slash(
             }
             Directive::Continue
         }
+        "retry" => {
+            let client = client.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                match client.test_connection().await {
+                    Ok(model) => {
+                        let _ = tx.send(
+                            Event::Notice {
+                                text: format!("retry OK — model reachable: {model}"),
+                                level: NoticeLevel::Success,
+                            }
+                            .stamped()
+                            .event,
+                        );
+                    }
+                    Err(e) => {
+                        let _ = tx.send(
+                            Event::Notice {
+                                text: format!(
+                                    "retry failed: [{}] {e} — check /diagnostics",
+                                    e.class()
+                                ),
+                                level: NoticeLevel::Error,
+                            }
+                            .stamped()
+                            .event,
+                        );
+                    }
+                }
+            });
+            Directive::Continue
+        }
+        "diagnostics" => {
+            let in_flight = client.in_flight();
+            let can_admit = client.can_admit();
+            let max_ctx = client
+                .max_context_tokens()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "?".into());
+            let client_info = format!(
+                "model {} @ {} — in-flight {in_flight} · admitting: {} · max-context {max_ctx}",
+                client.model(),
+                client.endpoint(),
+                can_admit,
+            );
+            app.push_system(&client_info, NoticeLevel::Info);
+            Directive::Continue
+        }
         "dashboard" => {
             app.dash.open = true;
             Directive::Continue
@@ -1336,6 +1384,19 @@ async fn run_plain(
                     Ok(m) => println!("  model reachable: {m}"),
                     Err(e) => println!("  model unreachable: {e}"),
                 },
+                "retry" => match client.test_connection().await {
+                    Ok(m) => println!("  retry OK — model reachable: {m}"),
+                    Err(e) => println!("  retry failed: [{}] {e}", e.class()),
+                },
+                "diagnostics" => {
+                    println!(
+                        "  model {} @ {} — in-flight {} · max-context {}",
+                        client.model(),
+                        client.endpoint(),
+                        client.in_flight(),
+                        client.max_context_tokens().unwrap_or(0)
+                    );
+                }
                 other => {
                     println!("  /{other} needs a terminal UI — run `requiem session` in a TTY");
                 }

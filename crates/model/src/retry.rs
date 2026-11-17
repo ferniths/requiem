@@ -75,9 +75,10 @@ pub fn from_max_retries(max_retries: u32) -> RetryPolicy {
 /// Compute the backoff delay for a specific retryable error, honoring the
 /// server-reported `retry_after_ms` for rate-limit responses.
 ///
-/// For `RateLimited` errors the server's `retry_after_ms` is used directly
-/// (clamped to `[base_delay_ms, max_delay_ms]`). For all other transient
-/// errors the standard exponential backoff schedule applies.
+/// For `RateLimited` errors the server's `retry_after_ms` is used as the
+/// base delay, clamped to `[base_delay_ms, max_delay_ms]`, with jitter
+/// applied to prevent thundering herds. For all other transient errors
+/// the standard exponential backoff schedule applies.
 pub fn delay_for_error(policy: &RetryPolicy, attempt: u32, err: &RequiemError) -> Duration {
     match err {
         RequiemError::RateLimited { retry_after_ms } => {
@@ -85,7 +86,13 @@ pub fn delay_for_error(policy: &RetryPolicy, attempt: u32, err: &RequiemError) -
             let base = policy.base_delay_ms;
             let cap = policy.max_delay_ms;
             let clamped = requested.clamp(base, cap);
-            Duration::from_millis(clamped)
+            if policy.jitter {
+                let seed = (attempt as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                let frac = ((seed & 0xFFFF) as f64 / 0xFFFF as f64) * 1.0 + 0.5;
+                Duration::from_millis((clamped as f64 * frac.min(1.5)) as u64)
+            } else {
+                Duration::from_millis(clamped)
+            }
         }
         _ => policy.delay_for_attempt(attempt),
     }
@@ -95,20 +102,27 @@ pub fn delay_for_error(policy: &RetryPolicy, attempt: u32, err: &RequiemError) -
 mod tests {
     use super::*;
 
+    fn no_jitter_policy() -> RetryPolicy {
+        RetryPolicy {
+            jitter: false,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn rate_limited_honors_server_backoff() {
-        let policy = RetryPolicy::default();
+        let policy = no_jitter_policy();
         let err = RequiemError::RateLimited {
             retry_after_ms: 5_000,
         };
         let delay = delay_for_error(&policy, 0, &err);
-        // 5000ms is within [500, 30000], so it should pass through unchanged.
+        // 5000ms is within [500, 30000], so it passes through unchanged.
         assert_eq!(delay.as_millis(), 5_000);
     }
 
     #[test]
     fn rate_limited_clamped_to_max() {
-        let policy = RetryPolicy::default();
+        let policy = no_jitter_policy();
         let err = RequiemError::RateLimited {
             retry_after_ms: 99_999,
         };
@@ -118,22 +132,35 @@ mod tests {
 
     #[test]
     fn rate_limited_clamped_to_min() {
-        let policy = RetryPolicy::default();
+        let policy = no_jitter_policy();
         let err = RequiemError::RateLimited { retry_after_ms: 10 };
         let delay = delay_for_error(&policy, 0, &err);
         assert_eq!(delay.as_millis(), 500);
     }
 
     #[test]
+    fn rate_limited_with_jitter_is_in_range() {
+        let policy = RetryPolicy::default(); // jitter: true
+        let err = RequiemError::RateLimited {
+            retry_after_ms: 5_000,
+        };
+        let delay = delay_for_error(&policy, 0, &err);
+        // With jitter in [0.5, 1.5], 5000ms becomes [2500, 7500].
+        assert!(
+            delay.as_millis() >= 2_500 && delay.as_millis() <= 7_500,
+            "jittered delay was {}ms",
+            delay.as_millis()
+        );
+    }
+
+    #[test]
     fn connection_error_uses_backoff_schedule() {
-        let policy = RetryPolicy::default();
+        let policy = no_jitter_policy();
         let err = RequiemError::Connection("refused".into());
         let delay0 = delay_for_error(&policy, 0, &err);
         let delay1 = delay_for_error(&policy, 1, &err);
-        // Backoff grows: 500ms * 2^0 (with jitter ~[500,750]) < 500*2^1 (with jitter)
-        assert!(delay0 <= delay1 || delay0.as_millis() >= 500);
-        // First attempt base is 500ms; with jitter in [0.5,1.5] it's [250,750]
-        assert!(delay0.as_millis() >= 250);
-        assert!(delay0.as_millis() <= 750);
+        // Without jitter: base 500ms, 500ms, 1000ms...
+        assert_eq!(delay0.as_millis(), 500);
+        assert_eq!(delay1.as_millis(), 1000);
     }
 }
