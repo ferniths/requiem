@@ -333,6 +333,7 @@ async fn run_fullscreen(
         session_label.to_string(),
         client.model().to_string(),
     );
+    app.workdir = std::env::current_dir().ok();
     app.set_mode(config.default_mode.as_str());
     app.push_system(
         "type a task, or /help for commands · /dashboard for the live view",
@@ -543,6 +544,7 @@ async fn run_fullscreen(
                                 session_label.to_string(),
                                 client.model().to_string(),
                             );
+                            app.workdir = std::env::current_dir().ok();
                             app.set_mode(cfg.default_mode.as_str());
                             app.set_history(history.entries().to_vec());
                             app.push_system(

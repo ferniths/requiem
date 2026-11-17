@@ -15,6 +15,7 @@
 //! come from the theme — nothing here hardcodes a color.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -218,6 +219,42 @@ fn ansi16_to_color(idx: u8) -> Color {
     }
 }
 
+/// Walk up to `limit` files/dirs under `root` (skipping common noise
+/// directories) and return their relative paths as `String`s.
+fn walk_files_for_suggestions(root: &std::path::Path, limit: usize) -> Vec<String> {
+    const SKIP: &[&str] = &[
+        ".git", "target", "node_modules", ".idea", ".vscode", "__pycache__", ".qwen",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') {
+                continue;
+            }
+            if SKIP.iter().any(|s| name_str == *s) {
+                continue;
+            }
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            out.push(rel.display().to_string());
+            if out.len() >= limit {
+                return out;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    out
+}
+
 // ── Dashboard overlay state ──────────────────────────────────────────
 
 /// Which dashboard panel has focus.
@@ -295,6 +332,8 @@ pub struct App {
     pub model: String,
     /// Current mode name (without slash).
     pub mode: String,
+    /// Working directory for `@` file autocomplete.
+    pub workdir: Option<PathBuf>,
 
     // Session screen state
     entries: Vec<TranscriptEntry>,
@@ -329,6 +368,7 @@ impl App {
             session_label,
             model,
             mode: "code".to_string(),
+            workdir: None,
             entries: Vec::new(),
             composer: Composer::new(),
             suggestions: Vec::new(),
@@ -807,9 +847,17 @@ impl App {
                     self.suggestion_idx =
                         (self.suggestion_idx + 1) % self.suggestions.len();
                     let chosen = self.suggestions[self.suggestion_idx].clone();
-                    self.composer.text = format!("/{chosen}");
+                    // Detect whether this is an @-file completion or a /cmd.
+                    let trimmed = self.composer.text.trim_start();
+                    if trimmed.starts_with('@') {
+                        // Insert the path with a trailing space, keep @ prefix.
+                        self.composer.text = format!("@{chosen} ");
+                    } else {
+                        self.composer.text = format!("/{chosen}");
+                    }
                     self.composer.cursor = self.composer.len();
                     self.composer.multiline = false;
+                    self.refresh_suggestions();
                 } else {
                     self.dash.open = true;
                 }
@@ -919,6 +967,26 @@ impl App {
         self.suggestions.clear();
         self.suggestion_idx = 0;
         let trimmed = self.composer.text.trim_start();
+        if trimmed.starts_with('@') {
+            // File autocomplete: fuzzy-search files under workdir.
+            let query = &trimmed[1..].to_lowercase();
+            let root = match &self.workdir {
+                Some(p) => p.clone(),
+                None => return,
+            };
+            let files = walk_files_for_suggestions(&root, 200);
+            let mut matches: Vec<String> = files
+                .into_iter()
+                .filter(|p| {
+                    let lower = p.to_lowercase();
+                    query.is_empty() || lower.contains(query)
+                })
+                .take(6)
+                .collect();
+            matches.sort();
+            self.suggestions = matches;
+            return;
+        }
         if !trimmed.starts_with('/') {
             return;
         }
@@ -2171,6 +2239,71 @@ fn hello() {
         }
         let text = visible_text(&app, 100, 30);
         assert!(text.contains("--test"), "args hint shown: {text}");
+    }
+
+    #[test]
+    fn at_file_suggestions_shown_for_typing() {
+        use std::path::PathBuf;
+        let mut app = test_app();
+        // Create a temp directory with a couple of files.
+        let tmp = std::env::temp_dir().join("requiem_at_test");
+        std::fs::create_dir_all(&tmp).ok();
+        std::fs::write(tmp.join("main.rs"), "fn main() {}").ok();
+        std::fs::write(tmp.join("util.rs"), "").ok();
+        app.workdir = Some(tmp.clone());
+
+        // Type @ma → should filter to main.rs
+        for c in "@ma".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        assert!(!app.suggestions.is_empty(), "suggestions should be non-empty");
+        assert!(
+            app.suggestions.iter().any(|s| s.contains("main.rs")),
+            "main.rs in suggestions: {:?}",
+            app.suggestions
+        );
+
+        // Tab completes to @main.rs
+        app.handle_key(test_key(KeyCode::Tab));
+        assert!(
+            app.composer.text.starts_with("@main.rs"),
+            "Tab completes @ path: {}",
+            app.composer.text
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = PathBuf::new();
+    }
+
+    #[test]
+    fn at_file_no_suggestions_when_no_workdir() {
+        let mut app = test_app();
+        // No workdir set — typing @ should produce no suggestions.
+        for c in "@foo".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        assert!(app.suggestions.is_empty(), "no workdir → no suggestions");
+    }
+
+    #[test]
+    fn at_file_fuzzy_substring_match() {
+        let tmp = std::env::temp_dir().join("requiem_at_fuzzy");
+        std::fs::create_dir_all(&tmp).ok();
+        std::fs::write(tmp.join("Cargo.toml"), "").ok();
+        std::fs::write(tmp.join("README.md"), "").ok();
+        let mut app = test_app();
+        app.workdir = Some(tmp.clone());
+
+        for c in "@cargo".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        assert!(
+            app.suggestions.iter().any(|s| s.to_lowercase().contains("cargo")),
+            "fuzzy match finds Cargo.toml: {:?}",
+            app.suggestions
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
