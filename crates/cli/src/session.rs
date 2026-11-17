@@ -966,6 +966,28 @@ async fn dispatch_slash(
             app.push_system(&out, NoticeLevel::Info);
             Directive::Continue
         }
+        "version" => {
+            let mode = requiem_tui::color::color_mode();
+            let mode_str = match mode {
+                requiem_tui::color::ColorMode::NoColor => "no-color",
+                requiem_tui::color::ColorMode::Ansi16 => "ansi16",
+                requiem_tui::color::ColorMode::Ansi256 => "ansi256",
+                requiem_tui::color::ColorMode::TrueColor => "truecolor",
+            };
+            let out = format!(
+                "REQUIEM v0.1.0 (commit {})\n\
+                 binary: {}\n\
+                 theme: {}  ·  colour-mode: {}\n\
+                 model: {}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::args().next().unwrap_or_default(),
+                config.theme,
+                mode_str,
+                client.model(),
+            );
+            app.push_system(&out, NoticeLevel::Info);
+            Directive::Continue
+        }
         "exit" | "quit" => Directive::Exit,
         other => {
             unknown_command(app, other);

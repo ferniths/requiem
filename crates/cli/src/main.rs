@@ -96,7 +96,9 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Commands::Session { resume }) => {
-            print_banner(&theme);
+            // The TUI renders its own welcome screen for fresh sessions and
+            // restores the conversation for resumed ones. Skip the
+            // pre-printed banner to avoid a flash-and-disappear artifact.
             finish(requiem_cli::session::run_session(resume).await, &theme)
         }
         Some(Commands::Setup) => finish(run_setup(&theme), &theme),
@@ -131,7 +133,9 @@ async fn run_default(theme: &Theme) -> ExitCode {
     match Config::load() {
         Ok(config) if config.is_initialized() => {
             if is_tty {
-                print_banner(theme);
+                // The TUI renders its own branded welcome screen; skip the
+                // pre-printed banner so the user doesn't see it flash and
+                // disappear when the alternate screen takes over.
                 finish(requiem_cli::session::run_session(None).await, theme)
             } else {
                 // Piped/redirected usage without a subcommand: help text,

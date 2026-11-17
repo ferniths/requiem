@@ -49,6 +49,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     .with_args(&["<query>"]),
     // ── Help ────────────────────────────────────────────────────────
     CommandSpec::new("help", "Help", "show this help"),
+    CommandSpec::new("version", "Help", "show build, theme and colour-mode info"),
     CommandSpec::new("exit", "Help", "leave the session (alias: /quit)"),
 ];
 

@@ -489,12 +489,21 @@ impl App {
     pub fn push_welcome(&mut self, project_dir: &str) {
         use crate::banner;
         let t = &self.theme;
-        // Banner lines, each painted in the accent token.
+        // Top spacer for visual balance.
+        self.entries.push(TranscriptEntry {
+            glyph: " ",
+            text: String::new(),
+            fg: Token::Text,
+            bold: false,
+            indent: 0,
+            streaming: false,
+            markdown: false,
+        });
+        // Banner lines, each painted in the accent token (crimson).
         let banner_lines: Vec<String> = banner::BANNER
             .lines()
             .map(|l| t.paint(Token::Accent, l))
             .collect();
-        // Join with newlines — the transcript renderer will wrap if needed.
         let banner_text = banner_lines.join("\n");
         self.entries.push(TranscriptEntry {
             glyph: " ",
@@ -505,16 +514,27 @@ impl App {
             streaming: false,
             markdown: false,
         });
-        // Description block.
+        // Blank line separator.
+        self.entries.push(TranscriptEntry {
+            glyph: " ",
+            text: String::new(),
+            fg: Token::Text,
+            bold: false,
+            indent: 0,
+            streaming: false,
+            markdown: false,
+        });
+        // Description block with proper spacing.
         let desc = format!(
-            "REQUIEM — MULTI-AGENT AI ENVIRONMENT\n\n\
-             Autonomous coding and knowledge orchestration\n\
-             Model: {}  ·  Project: {}  ·  Mode: /{}\n\n\
-             Start by describing a task, or use a command:\n\
-             /help       Available commands\n\
-             /dashboard  Live agent & task view\n\
-             /model      Model configuration\n\
-             /setup      Reconfigure API key & endpoint",
+            "REQUIEM — MULTI-AGENT AI ENVIRONMENT\n\
+             Autonomous coding and knowledge orchestration\n\n\
+             Model: {}  ·  Project: {}  ·  Mode: /{}  ·  Status: connected\n\n\
+             Describe a task to begin, or use a command:\n\
+             /help        Available commands\n\
+             /dashboard   Live agent & task view\n\
+             /model       Model configuration\n\
+             /setup       Reconfigure API key & endpoint\n\
+             /theme       Switch theme (default / high_contrast / muted)",
             self.model, project_dir, self.mode
         );
         let desc_lines: Vec<String> = desc
@@ -911,9 +931,9 @@ impl App {
                     self.refresh_suggestions();
                     return UiAction::None;
                 }
-                // Plain Enter: submit
-                let text = self.composer.flatten();
-                let line = text.trim().to_string();
+                // Plain Enter: submit (preserves newlines in pasted
+                // multiline content).
+                let line = self.composer.text.trim().to_string();
                 if line.is_empty() {
                     return UiAction::None;
                 }
@@ -1100,13 +1120,8 @@ impl App {
 
     fn render_session(&self, frame: &mut Frame) {
         let area = frame.area();
-        let t = &self.theme;
-        // Fill the entire screen with the theme's deep charcoal so the
-        // TUI has a consistent dark surface regardless of terminal default.
-        let bg_block = Block::default().style(t.panel_style());
-        frame.render_widget(bg_block, area);
 
-        // Input area grows with multiline content (capped at 8 rows),
+        // Input area grows with multiline content (capped at 6 rows),
         // so the transcript gets whatever is left.
         let input_rows = self.composer_visible_rows();
         let [header, transcript, input, footer] = Layout::vertical([
@@ -1587,10 +1602,6 @@ impl App {
     fn render_dashboard(&self, frame: &mut Frame) {
         let t = &self.theme;
         let area = frame.area();
-        // Full-screen charcoal background.
-        let bg_block = Block::default().style(t.panel_style());
-        frame.render_widget(bg_block, area);
-
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
@@ -2896,12 +2907,11 @@ fn hello() {
         let action = app.handle_key(test_key(KeyCode::Enter));
         match action {
             UiAction::Submit(ref line) => {
-                // The submitted text is the flattened (newlines→spaces)
-                // version of the original block, trimmed.
-                let expected = RUST_CODE_BLOCK.replace('\n', " ");
-                let expected = expected.trim();
+                // The submitted text preserves newlines (no flattening).
+                let expected = RUST_CODE_BLOCK.trim().to_string();
                 assert_eq!(
-                    line, expected,
+                    line.as_str(),
+                    expected,
                     "must submit the complete original content exactly once"
                 );
             }
@@ -2999,10 +3009,10 @@ fn hello() {
         app.paste_input(&large);
         // Content must be intact despite placeholder rendering.
         assert_eq!(app.composer.text, large);
-        // Submit must send the full content.
+        // Submit must send the full content (newlines preserved).
         let action = app.handle_key(test_key(KeyCode::Enter));
         if let UiAction::Submit(line) = action {
-            let expected = large.replace('\n', " ").trim().to_string();
+            let expected = large.trim().to_string();
             assert_eq!(line, expected, "full content must be submitted");
         } else {
             panic!("expected Submit");
