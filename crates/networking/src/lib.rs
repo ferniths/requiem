@@ -6,13 +6,13 @@
 //! rate-limit backpressure are coordinated here, not per-agent.
 
 pub mod config;
+pub mod health;
 pub mod pool;
 pub mod provider;
 pub mod rate_limit;
-pub mod health;
 
 pub use config::{NetworkConfig, ProviderKind, ProxyEndpoint, ProxyProtocol, SelectionStrategy};
+pub use health::{HealthChecker, HealthStatus};
 pub use pool::{EndpointSelection, ProxyPool};
 pub use provider::ProxyProvider;
 pub use rate_limit::RateLimitManager;
-pub use health::{HealthStatus, HealthChecker};

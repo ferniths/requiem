@@ -676,13 +676,11 @@ fn step_networking(config: &mut Config, theme: &Theme) -> Result<Step, String> {
         )
     );
 
-    let use_proxy: bool = match ask(
-        &format!(
-            "{} {} [Y/n] (default: n)",
-            theme.accent_bold("?"),
-            theme.info("Enable proxy routing?")
-        ),
-    )? {
+    let use_proxy: bool = match ask(&format!(
+        "{} {} [Y/n] (default: n)",
+        theme.accent_bold("?"),
+        theme.info("Enable proxy routing?")
+    ))? {
         Answer::Back => return Ok(Step::Back),
         Answer::Value(v) => !v.eq_ignore_ascii_case("n"),
         Answer::Keep => false,
@@ -692,17 +690,16 @@ fn step_networking(config: &mut Config, theme: &Theme) -> Result<Step, String> {
         config.network.proxy_enabled = false;
         println!(
             "  {}",
-            theme.muted("Proxy routing disabled — requests will connect directly to the model endpoint.")
+            theme.muted(
+                "Proxy routing disabled — requests will connect directly to the model endpoint."
+            )
         );
         return Ok(Step::Next);
     }
 
     config.network.proxy_enabled = true;
 
-    println!(
-        "\n  {}",
-        theme.secondary("Add your first proxy endpoint.")
-    );
+    println!("\n  {}", theme.secondary("Add your first proxy endpoint."));
     println!(
         "  {} {}",
         theme.accent("?"),
@@ -726,7 +723,12 @@ fn step_networking(config: &mut Config, theme: &Theme) -> Result<Step, String> {
     } else {
         requiem_networking::ProxyProtocol::Http
     };
-    let ep = requiem_networking::ProxyEndpoint::new("custom", requiem_networking::ProviderKind::None, &url, protocol);
+    let ep = requiem_networking::ProxyEndpoint::new(
+        "custom",
+        requiem_networking::ProviderKind::None,
+        &url,
+        protocol,
+    );
     let display_url = ep.redacted_url();
     config.network.endpoints.push(ep);
     println!(
@@ -786,7 +788,10 @@ fn step_summary(config: &Config, theme: &Theme) -> Result<Step, String> {
             if ep_count == 1 { "" } else { "s" }
         );
     } else {
-        println!("  proxy         {}", theme.muted("disabled (direct connection)"));
+        println!(
+            "  proxy         {}",
+            theme.muted("disabled (direct connection)")
+        );
     }
 
     let path = Config::config_path()

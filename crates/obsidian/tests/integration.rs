@@ -95,15 +95,18 @@ fn vault_round_trip_write_read_search_audit() {
 
     // Audit: duplicates (Dup1 and Dup2 share content).
     assert!(!result.duplicates.is_empty());
-    let dup_notes: Vec<&str> = result.duplicates[0].notes.iter().map(|s| s.as_str()).collect();
+    let dup_notes: Vec<&str> = result.duplicates[0]
+        .notes
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     assert!(dup_notes.iter().any(|p| p.contains("Dup1.md")));
     assert!(dup_notes.iter().any(|p| p.contains("Dup2.md")));
 
     // Change log was appended.
     let log_path = _dir.path().join(".requiem-changelog.json");
     let raw = std::fs::read_to_string(log_path).unwrap();
-    let log: Vec<requiem_obsidian::vault::ChangeLogEntry> =
-        serde_json::from_str(&raw).unwrap();
+    let log: Vec<requiem_obsidian::vault::ChangeLogEntry> = serde_json::from_str(&raw).unwrap();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].path, "04 New/NewNote.md");
 }

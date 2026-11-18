@@ -29,10 +29,7 @@ struct MockOpenAi {
 impl MockOpenAi {
     async fn start(retry_after_ms: u64) -> (Self, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = format!(
-            "http://{}",
-            listener.local_addr().unwrap()
-        );
+        let addr = format!("http://{}", listener.local_addr().unwrap());
         let hit_count = Arc::new(AtomicUsize::new(0));
         let rate_limit = Arc::new(Mutex::new(None::<u32>));
 
@@ -109,10 +106,7 @@ struct MockProxy {
 
 async fn start_mock_proxy() -> (MockProxy, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = format!(
-        "http://{}",
-        listener.local_addr().unwrap()
-    );
+    let addr = format!("http://{}", listener.local_addr().unwrap());
     let handle = tokio::spawn(async move {
         loop {
             if let Ok((mut stream, _)) = listener.accept().await {
@@ -125,10 +119,7 @@ async fn start_mock_proxy() -> (MockProxy, tokio::task::JoinHandle<()>) {
             }
         }
     });
-    (
-        MockProxy { addr },
-        handle,
-    )
+    (MockProxy { addr }, handle)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -139,12 +130,7 @@ async fn proxy_pool_selects_healthy_endpoint() {
     let mut config = NetworkConfig::default();
     config.proxy_enabled = true;
 
-    let ep = ProxyEndpoint::new(
-        "mock",
-        ProviderKind::None,
-        &mock.addr,
-        ProxyProtocol::Http,
-    );
+    let ep = ProxyEndpoint::new("mock", ProviderKind::None, &mock.addr, ProxyProtocol::Http);
     config.endpoints.push(ep);
 
     let client = Client::new();
@@ -183,7 +169,11 @@ async fn rate_limit_manager_blocks_during_cooldown() {
         elapsed.as_millis() >= 80,
         "acquire should wait for the cooldown (elapsed {elapsed:?})"
     );
-    assert_eq!(waited, std::time::Duration::ZERO, "acquire returns 0 (wait tracked externally)");
+    assert_eq!(
+        waited,
+        std::time::Duration::ZERO,
+        "acquire returns 0 (wait tracked externally)"
+    );
 }
 
 #[tokio::test]
@@ -297,8 +287,14 @@ async fn redacted_url_never_leaks_credentials() {
         ProxyProtocol::Http,
     );
     let redacted = ep.redacted_url();
-    assert!(!redacted.contains("supersecret"), "credential leaked: {redacted}");
-    assert!(redacted.contains("proxy.corp"), "host should remain: {redacted}");
+    assert!(
+        !redacted.contains("supersecret"),
+        "credential leaked: {redacted}"
+    );
+    assert!(
+        redacted.contains("proxy.corp"),
+        "host should remain: {redacted}"
+    );
 }
 
 #[tokio::test]
@@ -335,11 +331,7 @@ async fn config_persistence_roundtrip() {
 async fn mock_openai_server_returns_200() {
     let (mock, _handle) = MockOpenAi::start(1_000).await;
     let client = Client::new();
-    let resp = client
-        .get(&mock.addr)
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(&mock.addr).send().await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(mock.hit_count.load(Ordering::SeqCst), 1);
 }
@@ -349,14 +341,13 @@ async fn mock_openai_server_returns_429_when_configured() {
     let (mock, _handle) = MockOpenAi::start(500).await;
     *mock.rate_limit.lock().await = Some(1);
     let client = Client::new();
-    let resp = client
-        .get(&mock.addr)
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(&mock.addr).send().await.unwrap();
     assert_eq!(resp.status().as_u16(), 429);
     let headers = resp.headers();
-    assert!(headers.get("retry-after").is_some(), "429 must carry Retry-After");
+    assert!(
+        headers.get("retry-after").is_some(),
+        "429 must carry Retry-After"
+    );
 }
 
 #[tokio::test]

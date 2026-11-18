@@ -29,12 +29,7 @@ pub struct ProxyProvider {
 
 impl ProxyProvider {
     /// Create a provider descriptor.
-    pub fn new(
-        name: &str,
-        kind: ProviderKind,
-        auto_discover: bool,
-        requires_auth: bool,
-    ) -> Self {
+    pub fn new(name: &str, kind: ProviderKind, auto_discover: bool, requires_auth: bool) -> Self {
         Self {
             name: name.to_string(),
             kind,

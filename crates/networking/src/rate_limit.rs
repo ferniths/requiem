@@ -49,9 +49,13 @@ impl RateLimitManager {
     /// retry window. All blocked `acquire()` calls will wait until
     /// `retry_after_ms` elapses.
     pub async fn record_rate_limit(&self, retry_after_ms: u64) {
-        let count = self.consecutive_429s.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let count = self
+            .consecutive_429s
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         *self.last_retry_after_ms.lock().await = Some(retry_after_ms);
-        self.limited.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.limited
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // Scale the cooldown with consecutive 429s: 1st = server's window,
         // 2nd = 2× server's window, 3rd = 3×, etc. (capped at 120 s).
@@ -67,8 +71,10 @@ impl RateLimitManager {
     /// Record a successful request: clears the consecutive-429 counter
     /// and the limited flag.
     pub fn record_success(&self) {
-        self.consecutive_429s.store(0, std::sync::atomic::Ordering::SeqCst);
-        self.limited.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.consecutive_429s
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.limited
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Block until the current cooldown (if any) expires.
@@ -105,7 +111,8 @@ impl RateLimitManager {
 
     /// The number of consecutive 429s received (before the last success).
     pub fn consecutive_429s(&self) -> u32 {
-        self.consecutive_429s.load(std::sync::atomic::Ordering::SeqCst)
+        self.consecutive_429s
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The last server-reported retry window, if any.
@@ -136,15 +143,13 @@ impl EndpointRateState {
 
     /// Whether this endpoint is currently in cooldown.
     pub fn is_in_cooldown(&self) -> bool {
-        self.cooldown_until
-            .is_some_and(|t| t > Instant::now())
+        self.cooldown_until.is_some_and(|t| t > Instant::now())
     }
 
     /// Record a 429 for this endpoint.
     pub fn record_429(&mut self, retry_after_ms: u64) {
         self.consecutive_429s += 1;
-        let scaled =
-            (retry_after_ms * self.consecutive_429s as u64).min(120_000);
+        let scaled = (retry_after_ms * self.consecutive_429s as u64).min(120_000);
         self.cooldown_until = Some(Instant::now() + Duration::from_millis(scaled));
     }
 
@@ -183,17 +188,12 @@ impl EndpointRateMap {
 
     /// Whether the given endpoint is currently in cooldown.
     pub fn is_cooling_down(&self, id: &uuid::Uuid) -> bool {
-        self.states
-            .get(id)
-            .is_some_and(|s| s.is_in_cooldown())
+        self.states.get(id).is_some_and(|s| s.is_in_cooldown())
     }
 
     /// The number of endpoints currently in cooldown.
     pub fn cooling_down_count(&self) -> usize {
-        self.states
-            .values()
-            .filter(|s| s.is_in_cooldown())
-            .count()
+        self.states.values().filter(|s| s.is_in_cooldown()).count()
     }
 }
 

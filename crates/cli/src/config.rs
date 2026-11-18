@@ -14,9 +14,9 @@
 
 use std::path::PathBuf;
 
+use requiem_networking::NetworkConfig;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use requiem_networking::NetworkConfig;
 
 /// The root config file for REQUIEM.
 #[derive(Debug, Clone, Serialize, Deserialize)]

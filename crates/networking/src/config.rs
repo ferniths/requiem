@@ -245,9 +245,19 @@ mod tests {
     fn healthy_endpoint_list_filters_unhealthy() {
         let mut config = NetworkConfig::default();
         config.proxy_enabled = true;
-        let mut good = ProxyEndpoint::new("test", ProviderKind::None, "http://good:8080", ProxyProtocol::Http);
+        let mut good = ProxyEndpoint::new(
+            "test",
+            ProviderKind::None,
+            "http://good:8080",
+            ProxyProtocol::Http,
+        );
         good.failure_count = 0;
-        let mut bad = ProxyEndpoint::new("test", ProviderKind::None, "http://bad:8080", ProxyProtocol::Http);
+        let mut bad = ProxyEndpoint::new(
+            "test",
+            ProviderKind::None,
+            "http://bad:8080",
+            ProxyProtocol::Http,
+        );
         bad.failure_count = 5;
         config.endpoints.push(good);
         config.endpoints.push(bad);
@@ -257,7 +267,12 @@ mod tests {
     #[test]
     fn pinned_returns_only_when_manual_strategy() {
         let mut config = NetworkConfig::default();
-        let mut ep = ProxyEndpoint::new("pinned", ProviderKind::None, "http://pin:8080", ProxyProtocol::Http);
+        let mut ep = ProxyEndpoint::new(
+            "pinned",
+            ProviderKind::None,
+            "http://pin:8080",
+            ProxyProtocol::Http,
+        );
         ep.pinned = true;
         let id = ep.id;
         config.endpoints.push(ep);

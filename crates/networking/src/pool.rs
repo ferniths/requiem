@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::config::{
-    NetworkConfig, ProxyEndpoint, SelectionStrategy,
-};
+use crate::config::{NetworkConfig, ProxyEndpoint, SelectionStrategy};
 use crate::health::HealthChecker;
 use crate::rate_limit::{EndpointRateMap, RateLimitManager};
 
@@ -48,10 +46,7 @@ pub struct ProxyPool {
 
 impl ProxyPool {
     /// Create a pool from the current network config.
-    pub fn new(
-        config: NetworkConfig,
-        health_checker: Arc<HealthChecker>,
-    ) -> Self {
+    pub fn new(config: NetworkConfig, health_checker: Arc<HealthChecker>) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
             health_checker,
@@ -114,7 +109,9 @@ impl ProxyPool {
 
         let ep = match config.strategy {
             SelectionStrategy::RoundRobin => {
-                let idx = self.rr_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let idx = self
+                    .rr_index
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 available[idx % available.len()].clone()
             }
             SelectionStrategy::LowestLatency => available
@@ -138,10 +135,7 @@ impl ProxyPool {
 
     /// Record a successful request through the given endpoint.
     pub async fn record_success(&self, endpoint_id: &uuid::Uuid, latency_ms: u64) {
-        self.rate_map
-            .write()
-            .await
-            .record_success(endpoint_id);
+        self.rate_map.write().await.record_success(endpoint_id);
         let mut config = self.config.write().await;
         if let Some(ep) = config.endpoints.iter_mut().find(|e| e.id == *endpoint_id) {
             ep.failure_count = 0;
@@ -170,7 +164,9 @@ impl ProxyPool {
 
     /// Run a health check against all enabled endpoints and update the
     /// config with the results.
-    pub async fn health_check_all(&self) -> Vec<(ProxyEndpoint, crate::health::HealthStatus, Option<u64>)> {
+    pub async fn health_check_all(
+        &self,
+    ) -> Vec<(ProxyEndpoint, crate::health::HealthStatus, Option<u64>)> {
         let config = self.config.read().await;
         let mut results = Vec::new();
         for ep in config.endpoints.iter().filter(|e| e.enabled) {

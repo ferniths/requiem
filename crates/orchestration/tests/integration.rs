@@ -87,10 +87,7 @@ impl MockServer {
             }
         });
 
-        Self {
-            addr,
-            auth,
-        }
+        Self { addr, auth }
     }
 
     /// The base URL for a `ModelConfig` pointing at this server.
@@ -171,10 +168,7 @@ async fn read_request(mut stream: tokio::net::TcpStream) -> ParsedRequest {
         }
         raw.extend_from_slice(&buf[..n]);
     }
-    ParsedRequest {
-        auth,
-        stream,
-    }
+    ParsedRequest { auth, stream }
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -292,12 +286,10 @@ impl ToolExecutor for RouteExecutor {
         let tool = self.tools.get(name).ok_or_else(|| {
             RequiemError::InvalidState(format!("no tool registered for '{name}'"))
         })?;
-        tool
-            .run(arguments)
-            .map_err(|e| RequiemError::Tool {
-                tool: name.to_string(),
-                message: e,
-            })
+        tool.run(arguments).map_err(|e| RequiemError::Tool {
+            tool: name.to_string(),
+            message: e,
+        })
     }
 }
 
@@ -345,7 +337,9 @@ async fn agent_loop_executes_model_tool_calls_and_records_usage() {
     let task = Task::new("compute 40 + 2");
     let mut run = AgentRun::new(agent, task);
 
-    run_agent(&client, &executor, &mut run, &[calc_tool_def()]).await.unwrap();
+    run_agent(&client, &executor, &mut run, &[calc_tool_def()])
+        .await
+        .unwrap();
 
     // The model stopped with a final text answer.
     let text = run
@@ -354,7 +348,10 @@ async fn agent_loop_executes_model_tool_calls_and_records_usage() {
         .and_then(|r| r.text())
         .expect("final response has text")
         .to_string();
-    assert!(text.contains("42"), "final answer must cite the tool result, got: {text}");
+    assert!(
+        text.contains("42"),
+        "final answer must cite the tool result, got: {text}"
+    );
 
     // The executor really ran the concrete tool, not a stub.
     assert_eq!(probe.calls.lock().unwrap().as_ref(), vec!["calc"]);
@@ -402,9 +399,14 @@ async fn unknown_tool_call_yields_error_result_not_crash() {
     let executor: Arc<dyn ToolExecutor> = Arc::new(FailingExecutor);
     let agent = Agent::master("master", requiem_core::Id::new());
     let mut run = AgentRun::new(agent, Task::new("try an unknown tool"));
-    run_agent(&client_for(&server), &executor, &mut run, &[calc_tool_def()])
-        .await
-        .unwrap();
+    run_agent(
+        &client_for(&server),
+        &executor,
+        &mut run,
+        &[calc_tool_def()],
+    )
+    .await
+    .unwrap();
 
     // The loop survives the tool error and reaches the model's final answer.
     assert!(run.final_response.is_some());
@@ -433,21 +435,24 @@ fn client_for(server: &MockServer) -> ModelClient {
 
 #[tokio::test]
 async fn model_client_sends_configured_api_key() {
-    let server = MockServer::start(
-        vec![StatusCode::OK],
-        vec![chat_body("hi")],
-    )
-    .await;
+    let server = MockServer::start(vec![StatusCode::OK], vec![chat_body("hi")]).await;
     let client = server.client();
     let agent = Agent::master("master", requiem_core::Id::new());
     let mut run = AgentRun::new(agent, Task::new("ping"));
-    run_agent(&client, &no_op_executor(), &mut run, &[]).await.unwrap();
+    run_agent(&client, &no_op_executor(), &mut run, &[])
+        .await
+        .unwrap();
 
     let auth = server.seen_auth();
     assert_eq!(auth.len(), 1, "exactly one request seen");
-    let header = auth[0].as_ref().expect("request carried an Authorization header");
+    let header = auth[0]
+        .as_ref()
+        .expect("request carried an Authorization header");
     let h = header.to_str().unwrap().to_ascii_lowercase();
-    assert!(h.starts_with("bearer "), "header must be a Bearer token, got: {h}");
+    assert!(
+        h.starts_with("bearer "),
+        "header must be a Bearer token, got: {h}"
+    );
 }
 
 fn no_op_executor() -> Arc<dyn ToolExecutor> {
@@ -510,11 +515,7 @@ async fn subagent_spawn_runs_child_and_reports_result() {
 
 #[tokio::test]
 async fn subagent_spawn_refused_at_max_depth() {
-    let server = MockServer::start(
-        vec![StatusCode::OK],
-        vec![chat_body("x")],
-    )
-    .await;
+    let server = MockServer::start(vec![StatusCode::OK], vec![chat_body("x")]).await;
     let client = Arc::new(server.client());
 
     let mut deep = Agent::master("deep", requiem_core::Id::new());
@@ -549,11 +550,7 @@ async fn subagent_spawn_refused_at_max_depth() {
 
 #[tokio::test]
 async fn spawn_tool_map_routes_child_calls_to_executor() {
-    let server = MockServer::start(
-        vec![StatusCode::OK],
-        vec![chat_body("done")],
-    )
-    .await;
+    let server = MockServer::start(vec![StatusCode::OK], vec![chat_body("done")]).await;
     let client = Arc::new(server.client());
 
     let concrete = RouteExecutor::with_calc_and_echo();
@@ -593,11 +590,7 @@ async fn spawn_tool_map_routes_child_calls_to_executor() {
 
 #[tokio::test]
 async fn cancelled_run_returns_cancelled_error() {
-    let server = MockServer::start(
-        vec![StatusCode::OK],
-        vec![chat_body("never reached")],
-    )
-    .await;
+    let server = MockServer::start(vec![StatusCode::OK], vec![chat_body("never reached")]).await;
     let client = server.client();
 
     let executor: Arc<dyn ToolExecutor> = Arc::new(RouteExecutor::with_calc_and_echo());
@@ -608,10 +601,16 @@ async fn cancelled_run_returns_cancelled_error() {
     flag.cancel();
     let events = tokio::sync::broadcast::channel::<requiem_core::events::Event>(64).0;
 
-    let err =
-        run_agent_halted(&client, &executor, &mut run, &[], Some(&events), Some(&flag))
-            .await
-            .unwrap_err();
+    let err = run_agent_halted(
+        &client,
+        &executor,
+        &mut run,
+        &[],
+        Some(&events),
+        Some(&flag),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, RequiemError::Cancelled));
 }
 

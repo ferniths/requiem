@@ -36,7 +36,11 @@ fn python_fixture() -> tempfile::TempDir {
 
 fn cmake_fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("CMakeLists.txt"), "cmake_minimum_required(VERSION 3.10)\n").unwrap();
+    std::fs::write(
+        dir.path().join("CMakeLists.txt"),
+        "cmake_minimum_required(VERSION 3.10)\n",
+    )
+    .unwrap();
     dir
 }
 

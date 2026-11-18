@@ -159,7 +159,9 @@ impl ModelClient {
 
     /// Build the HTTP client for a request, honouring the current proxy
     /// selection. Returns `None` when no proxy is active (use `self.http`).
-    async fn http_for_request(&self) -> Option<(reqwest::Client, requiem_networking::EndpointSelection)> {
+    async fn http_for_request(
+        &self,
+    ) -> Option<(reqwest::Client, requiem_networking::EndpointSelection)> {
         let pool = self.proxy_pool.as_ref()?;
         let selection = pool.select().await;
         if let requiem_networking::EndpointSelection::ViaProxy { proxy_url, .. } = &selection {
@@ -195,7 +197,10 @@ impl ModelClient {
                 Ok(r) => {
                     // Record success: reset endpoint failure count, clear global cooldown.
                     if let Some(pool) = &self.proxy_pool {
-                        if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                        if let requiem_networking::EndpointSelection::ViaProxy {
+                            endpoint, ..
+                        } = &selection
+                        {
                             pool.record_success(&endpoint.id, 0).await;
                         }
                         pool.rate_limiter().record_success();
@@ -207,13 +212,21 @@ impl ModelClient {
                     if let Some(pool) = &self.proxy_pool {
                         if let RequiemError::RateLimited { retry_after_ms } = &e {
                             pool.rate_limiter().record_rate_limit(*retry_after_ms).await;
-                            if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                            if let requiem_networking::EndpointSelection::ViaProxy {
+                                endpoint,
+                                ..
+                            } = &selection
+                            {
                                 pool.record_rate_limit(&endpoint.id, *retry_after_ms).await;
                             }
                         } else {
                             // Non-429 transport failure through a proxy:
                             // increment the endpoint's failure count.
-                            if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                            if let requiem_networking::EndpointSelection::ViaProxy {
+                                endpoint,
+                                ..
+                            } = &selection
+                            {
                                 pool.record_failure(&endpoint.id, &e.to_string()).await;
                             }
                         }
@@ -367,7 +380,10 @@ impl ModelClient {
                 Ok(r) => {
                     // Record success.
                     if let Some(pool) = &self.proxy_pool {
-                        if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                        if let requiem_networking::EndpointSelection::ViaProxy {
+                            endpoint, ..
+                        } = &selection
+                        {
                             pool.record_success(&endpoint.id, 0).await;
                         }
                         pool.rate_limiter().record_success();
@@ -378,10 +394,18 @@ impl ModelClient {
                     if let Some(pool) = &self.proxy_pool {
                         if let RequiemError::RateLimited { retry_after_ms } = &e {
                             pool.rate_limiter().record_rate_limit(*retry_after_ms).await;
-                            if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                            if let requiem_networking::EndpointSelection::ViaProxy {
+                                endpoint,
+                                ..
+                            } = &selection
+                            {
                                 pool.record_rate_limit(&endpoint.id, *retry_after_ms).await;
                             }
-                        } else if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                        } else if let requiem_networking::EndpointSelection::ViaProxy {
+                            endpoint,
+                            ..
+                        } = &selection
+                        {
                             pool.record_failure(&endpoint.id, &e.to_string()).await;
                         }
                     }
