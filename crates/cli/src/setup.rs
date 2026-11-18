@@ -24,7 +24,7 @@ enum Step {
 }
 
 /// The number of wizard steps (after the welcome screen).
-pub const STEP_COUNT: usize = 8;
+pub const STEP_COUNT: usize = 9;
 
 /// Run the full wizard, returning the updated config on success.
 ///
@@ -57,13 +57,14 @@ pub fn run_wizard() -> Result<Config, String> {
             5 => step_permissions(&mut config, &theme),
             6 => step_vaults(&mut config, &theme),
             7 => step_appearance(&mut config, &theme),
-            8 => step_summary(&config, &theme),
+            8 => step_networking(&mut config, &theme),
+            9 => step_summary(&config, &theme),
             _ => unreachable!("wizard step out of range"),
         }?;
 
         match outcome {
             Step::Next => {
-                if step == 8 {
+                if step == 9 {
                     // Confirmed on the summary: persist and finish.
                     config.initialized = true;
                     save_config(&config)?;
@@ -662,10 +663,85 @@ fn step_appearance(config: &mut Config, theme: &Theme) -> Result<Step, String> {
     Ok(Step::Next)
 }
 
-// ── Step 8: Summary + save ───────────────────────────────────────────
+// ── Step 8: Networking ───────────────────────────────────────────────
+
+fn step_networking(config: &mut Config, theme: &Theme) -> Result<Step, String> {
+    header(theme, 8, "Networking");
+    println!(
+        "{}",
+        theme.secondary(
+            "  Proxy configuration routes model API calls through one or more proxy endpoints.
+  Skipping this step uses a direct connection (the default). You can add proxies later
+  with /proxy add and /proxy test inside a session."
+        )
+    );
+
+    let use_proxy: bool = match ask(
+        &format!(
+            "{} {} [Y/n] (default: n)",
+            theme.accent_bold("?"),
+            theme.info("Enable proxy routing?")
+        ),
+    )? {
+        Answer::Back => return Ok(Step::Back),
+        Answer::Value(v) => !v.eq_ignore_ascii_case("n"),
+        Answer::Keep => false,
+    };
+
+    if !use_proxy {
+        config.network.proxy_enabled = false;
+        println!(
+            "  {}",
+            theme.muted("Proxy routing disabled — requests will connect directly to the model endpoint.")
+        );
+        return Ok(Step::Next);
+    }
+
+    config.network.proxy_enabled = true;
+
+    println!(
+        "\n  {}",
+        theme.secondary("Add your first proxy endpoint.")
+    );
+    println!(
+        "  {} {}",
+        theme.accent("?"),
+        theme.info("Proxy URL (e.g. http://user:pass@host:8080 or socks5://host:1080):")
+    );
+    let url = match ask("  >")? {
+        Answer::Back => return Ok(Step::Back),
+        Answer::Value(v) => v,
+        Answer::Keep => String::new(),
+    };
+    if url.is_empty() {
+        println!(
+            "  {}",
+            theme.muted("No URL entered — proxy routing enabled but no endpoints configured. Add one later with /proxy add.")
+        );
+        return Ok(Step::Next);
+    }
+
+    let protocol = if url.starts_with("socks5://") {
+        requiem_networking::ProxyProtocol::Socks5
+    } else {
+        requiem_networking::ProxyProtocol::Http
+    };
+    let ep = requiem_networking::ProxyEndpoint::new("custom", requiem_networking::ProviderKind::None, &url, protocol);
+    let display_url = ep.redacted_url();
+    config.network.endpoints.push(ep);
+    println!(
+        "  {} {}",
+        theme.success_bold("✓"),
+        theme.success(format!("proxy added: {display_url}"))
+    );
+
+    Ok(Step::Next)
+}
+
+// ── Step 9: Summary + save ───────────────────────────────────────────
 
 fn step_summary(config: &Config, theme: &Theme) -> Result<Step, String> {
-    header(theme, 8, "Summary");
+    header(theme, 9, "Summary");
 
     println!("  endpoint      {}", theme.info(&config.endpoint));
     // The key is never displayed — only whether one is configured.
@@ -700,6 +776,18 @@ fn step_summary(config: &Config, theme: &Theme) -> Result<Step, String> {
         }
     }
     println!("  theme         {}", theme.info(&config.theme));
+
+    if config.network.proxy_enabled {
+        let ep_count = config.network.endpoints.len();
+        println!(
+            "  proxy         {} {} endpoint{}",
+            theme.info("enabled"),
+            theme.secondary(ep_count.to_string()),
+            if ep_count == 1 { "" } else { "s" }
+        );
+    } else {
+        println!("  proxy         {}", theme.muted("disabled (direct connection)"));
+    }
 
     let path = Config::config_path()
         .map(|p| p.display().to_string())
@@ -892,7 +980,7 @@ mod tests {
 
     #[test]
     fn step_count_matches_header_labels() {
-        assert_eq!(STEP_COUNT, 8);
+        assert_eq!(STEP_COUNT, 9);
     }
 
     #[test]

@@ -44,6 +44,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new("budget", "Config", "show token and task budget usage"),
     CommandSpec::new("project", "Config", "detect and show the project's build ecosystem"),
+    CommandSpec::new(
+        "proxy",
+        "Config",
+        "proxy pool status and management",
+    )
+    .with_args(&["[list|test|add|remove|enable|disable|rotate|stats|refresh|provider]"]),
     // ── Memory ──────────────────────────────────────────────────────
     CommandSpec::new("sessions", "Memory", "list past sessions"),
     CommandSpec::new("resume", "Memory", "resume a past session: /resume <id>")

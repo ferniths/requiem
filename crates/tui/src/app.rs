@@ -438,6 +438,8 @@ pub struct App {
     pub project: String,
     /// Current mode name (without slash).
     pub mode: String,
+    /// Networking status label for the header (e.g. "direct" or "proxy:2 ok").
+    pub network_label: String,
     /// Working directory for `@` file autocomplete.
     pub workdir: Option<PathBuf>,
 
@@ -482,6 +484,7 @@ impl App {
             model,
             project: String::new(),
             mode: "code".to_string(),
+            network_label: String::new(),
             workdir: None,
             entries: Vec::new(),
             composer: Composer::new(),
@@ -1329,6 +1332,13 @@ impl App {
 
         // Right: connection status (kept distinct from the brand crimson).
         let mut right_spans = Vec::new();
+        if !self.network_label.is_empty() {
+            right_spans.push(Span::styled(
+                self.network_label.clone(),
+                t.style(Token::TextMuted),
+            ));
+            right_spans.push(Span::styled("  ", Style::new()));
+        }
         if self.is_running() {
             right_spans.push(Span::styled(
                 format!("{} running", spinner_glyph(self.started)),

@@ -36,7 +36,7 @@ ratatui = "0.29"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 
 # HTTP / model client
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "socks"] }
 tokio-stream = "0.1"
 bytes = "1"
 
@@ -80,6 +80,7 @@ requiem-context = { path = "crates/context" }
 requiem-project = { path = "crates/project" }
 requiem-obsidian = { path = "crates/obsidian" }
 requiem-memory = { path = "crates/memory" }
+requiem-networking = { path = "crates/networking" }
 requiem-tui = { path = "crates/tui" }
 requiem-cli = { path = "crates/cli" }
 

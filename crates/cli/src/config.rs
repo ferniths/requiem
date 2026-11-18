@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use requiem_networking::NetworkConfig;
 
 /// The root config file for REQUIEM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +74,13 @@ pub struct Config {
     /// the user confirms the final step.
     #[serde(default)]
     pub initialized: bool,
+
+    // ── Networking ──────────────────────────────────────────────
+    /// Proxy pool and rate-limit configuration. All fields have serde
+    /// defaults so existing configs without this section deserialize
+    /// with a direct-connection default — zero behaviour change.
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 fn default_max_concurrency() -> u32 {
@@ -209,6 +217,7 @@ impl Default for Config {
             default_mode: "code".to_string(),
             vaults: Vec::new(),
             initialized: false,
+            network: NetworkConfig::default(),
         }
     }
 }

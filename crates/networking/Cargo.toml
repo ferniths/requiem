@@ -1,0 +1,21 @@
+[package]
+name = "requiem-networking"
+description = "Proxy pool, rate-limit management, and networking configuration for REQUIEM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+requiem-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

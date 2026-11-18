@@ -18,6 +18,7 @@ use crate::request::{ChatMessage, ChatRequest};
 use crate::response::{ModelResponse, StreamChunk, TokenUsage, ToolCallDelta};
 use crate::retry::{from_max_retries, RetryPolicy};
 use requiem_core::error::RequiemError;
+use requiem_networking::ProxyPool;
 
 /// A shared, concurrency-bounded model client.
 #[derive(Clone)]
@@ -33,6 +34,11 @@ pub struct ModelClient {
     /// Retained for `in_flight()` reporting.
     in_flight: Arc<AtomicU32>,
     max_concurrency: u32,
+    /// Optional proxy pool: when set, each request selects an endpoint
+    /// via the pool's strategy and builds a per-request client with the
+    /// matching proxy. When `None` (default), all requests use `self.http`
+    /// directly — zero behaviour change for existing setups.
+    proxy_pool: Option<Arc<ProxyPool>>,
 }
 
 impl ModelClient {
@@ -57,7 +63,22 @@ impl ModelClient {
             in_flight: Arc::new(AtomicU32::new(0)),
             max_concurrency: config.max_concurrency,
             semaphore,
+            proxy_pool: None,
         })
+    }
+
+    /// Attach a proxy pool. Subsequent requests will select an endpoint
+    /// via the pool's strategy and route through the chosen proxy.
+    /// When the pool is disabled or has no usable endpoint, requests fall
+    /// back to the direct client — no proxy is forced.
+    pub fn with_proxy_pool(mut self, pool: Arc<ProxyPool>) -> Self {
+        self.proxy_pool = Some(pool);
+        self
+    }
+
+    /// The proxy pool, if attached.
+    pub fn proxy_pool(&self) -> Option<&Arc<ProxyPool>> {
+        self.proxy_pool.as_ref()
     }
 
     pub fn model(&self) -> &str {
@@ -122,6 +143,13 @@ impl ModelClient {
     }
 
     /// A non-streaming chat completion with retries on transient errors.
+    ///
+    /// When a proxy pool is attached:
+    /// 1. The global rate-limit coordinator blocks if a 429 cooldown is active.
+    /// 2. The pool selects an endpoint for this request.
+    /// 3. A per-request client is built with the chosen proxy.
+    /// 4. On 429, the cooldown is recorded globally so all agents back off.
+    /// 5. On proxy-specific failure, the endpoint's failure count is incremented.
     pub async fn chat(&self, req: ChatRequest) -> Result<ModelResponse, RequiemError> {
         let _guard = self.acquire_slot().await;
         let res = self.chat_inner(&req).await;
@@ -129,12 +157,67 @@ impl ModelClient {
         res
     }
 
+    /// Build the HTTP client for a request, honouring the current proxy
+    /// selection. Returns `None` when no proxy is active (use `self.http`).
+    async fn http_for_request(&self) -> Option<(reqwest::Client, requiem_networking::EndpointSelection)> {
+        let pool = self.proxy_pool.as_ref()?;
+        let selection = pool.select().await;
+        if let requiem_networking::EndpointSelection::ViaProxy { proxy_url, .. } = &selection {
+            let proxy = reqwest::Proxy::all(proxy_url)
+                .ok()
+                .or_else(|| reqwest::Proxy::http(proxy_url.clone()).ok())?;
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(self.config.timeout_ms))
+                .proxy(proxy)
+                .build()
+                .ok()?;
+            Some((client, selection))
+        } else {
+            None
+        }
+    }
+
     async fn chat_inner(&self, req: &ChatRequest) -> Result<ModelResponse, RequiemError> {
+        // Global rate-limit gate: block all agents during a shared 429 cooldown.
+        if let Some(pool) = &self.proxy_pool {
+            pool.rate_limiter().acquire().await;
+        }
+
         let mut attempt = 0u32;
         loop {
-            match self.do_chat(req).await {
-                Ok(r) => return Ok(r),
+            let (client_opt, selection) = match self.http_for_request().await {
+                Some((c, s)) => (Some(c), s),
+                None => (None, requiem_networking::EndpointSelection::Direct),
+            };
+            let client = client_opt.as_ref().unwrap_or(&self.http);
+
+            match self.do_chat_with(client, req).await {
+                Ok(r) => {
+                    // Record success: reset endpoint failure count, clear global cooldown.
+                    if let Some(pool) = &self.proxy_pool {
+                        if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                            pool.record_success(&endpoint.id, 0).await;
+                        }
+                        pool.rate_limiter().record_success();
+                    }
+                    return Ok(r);
+                }
                 Err(e) if e.is_retryable() && self.retry.should_retry(attempt) => {
+                    // Record 429 globally: all agents will back off together.
+                    if let Some(pool) = &self.proxy_pool {
+                        if let RequiemError::RateLimited { retry_after_ms } = &e {
+                            pool.rate_limiter().record_rate_limit(*retry_after_ms).await;
+                            if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                                pool.record_rate_limit(&endpoint.id, *retry_after_ms).await;
+                            }
+                        } else {
+                            // Non-429 transport failure through a proxy:
+                            // increment the endpoint's failure count.
+                            if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                                pool.record_failure(&endpoint.id, &e.to_string()).await;
+                            }
+                        }
+                    }
                     let delay = crate::retry::delay_for_error(&self.retry, attempt, &e);
                     attempt += 1;
                     tracing::warn!(
@@ -170,13 +253,17 @@ impl ModelClient {
         Ok(chunks)
     }
 
-    /// A single HTTP chat request (non-streaming body parse).
-    async fn do_chat(&self, req: &ChatRequest) -> Result<ModelResponse, RequiemError> {
+    /// A single HTTP chat request using an explicit client (proxy-aware).
+    async fn do_chat_with(
+        &self,
+        client: &reqwest::Client,
+        req: &ChatRequest,
+    ) -> Result<ModelResponse, RequiemError> {
         let body = req.to_json_bytes()?;
         let url = self.config.completions_url();
         let http_req = self
             .authorize(
-                self.http
+                client
                     .post(&url)
                     .header(ACCEPT, HeaderValue::from_static("application/json"))
                     .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
@@ -260,15 +347,44 @@ impl ModelClient {
         req: &ChatRequest,
         tx: &tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ModelResponse, RequiemError> {
+        // Global rate-limit gate before streaming.
+        if let Some(pool) = &self.proxy_pool {
+            pool.rate_limiter().acquire().await;
+        }
+
         let mut sreq = req.clone();
         sreq.stream = true;
         let body = sreq.to_json_bytes()?;
 
         let mut attempt = 0u32;
         let resp = loop {
-            match self.connect_stream(&body).await {
-                Ok(r) => break r,
+            let (client_opt, selection) = match self.http_for_request().await {
+                Some((c, s)) => (Some(c), s),
+                None => (None, requiem_networking::EndpointSelection::Direct),
+            };
+            let client = client_opt.as_ref().unwrap_or(&self.http);
+            match self.connect_stream_with(client, &body).await {
+                Ok(r) => {
+                    // Record success.
+                    if let Some(pool) = &self.proxy_pool {
+                        if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                            pool.record_success(&endpoint.id, 0).await;
+                        }
+                        pool.rate_limiter().record_success();
+                    }
+                    break r;
+                }
                 Err(e) if e.is_retryable() && self.retry.should_retry(attempt) => {
+                    if let Some(pool) = &self.proxy_pool {
+                        if let RequiemError::RateLimited { retry_after_ms } = &e {
+                            pool.rate_limiter().record_rate_limit(*retry_after_ms).await;
+                            if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                                pool.record_rate_limit(&endpoint.id, *retry_after_ms).await;
+                            }
+                        } else if let requiem_networking::EndpointSelection::ViaProxy { endpoint, .. } = &selection {
+                            pool.record_failure(&endpoint.id, &e.to_string()).await;
+                        }
+                    }
                     let delay = crate::retry::delay_for_error(&self.retry, attempt, &e);
                     attempt += 1;
                     tracing::warn!("stream connect failed (retry {attempt}): {e}");
@@ -359,11 +475,15 @@ impl ModelClient {
         })
     }
 
-    async fn connect_stream(&self, body: &[u8]) -> Result<reqwest::Response, RequiemError> {
+    async fn connect_stream_with(
+        &self,
+        client: &reqwest::Client,
+        body: &[u8],
+    ) -> Result<reqwest::Response, RequiemError> {
         let url = self.config.completions_url();
         let req = self
             .authorize(
-                self.http
+                client
                     .post(&url)
                     .header(ACCEPT, "text/event-stream")
                     .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),

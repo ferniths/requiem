@@ -20,6 +20,7 @@ requiem-project = { path = "../project" }
 requiem-obsidian = { path = "../obsidian" }
 requiem-memory = { path = "../memory" }
 requiem-tui = { path = "../tui" }
+requiem-networking = { path = "../networking" }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -38,6 +39,7 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 arboard = { workspace = true }
 rpassword = "7"
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
