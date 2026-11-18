@@ -59,7 +59,7 @@ impl RateLimitManager {
 
         // Scale the cooldown with consecutive 429s: 1st = server's window,
         // 2nd = 2× server's window, 3rd = 3×, etc. (capped at 120 s).
-        let scaled = (retry_after_ms as u64 * count as u64).min(120_000);
+        let scaled = (retry_after_ms * count as u64).min(120_000);
         let until = Instant::now() + Duration::from_millis(scaled);
         *self.cooldown_until.lock().await = Some(until);
 
@@ -175,7 +175,7 @@ impl EndpointRateMap {
     pub fn record_429(&mut self, id: &uuid::Uuid, retry_after_ms: u64) {
         self.states
             .entry(*id)
-            .or_insert_with(EndpointRateState::new)
+            .or_default()
             .record_429(retry_after_ms);
     }
 

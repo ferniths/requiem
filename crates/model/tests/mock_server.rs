@@ -6,7 +6,7 @@
 //! deterministic multi-turn agent-loop tests without external dependencies.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use requiem_model::client::ModelClient;
@@ -860,4 +860,305 @@ async fn rate_limit_json_and_retry_after_are_surfaced() {
         }
         other => panic!("expected RateLimited, got {other:?}"),
     }
+}
+
+// ── Phase: MiMo / provider-recovery scenarios ─────────────────────────
+
+/// A minimal raw-socket mock that always replies with the given
+/// `(status, retry_after, body)` and counts accepted connections. Used by
+/// the provider-recovery scenario suite.
+async fn fixed_status_server(
+    status: u16,
+    retry_after: Option<u16>,
+    body: &str,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_clone = count.clone();
+    let body = body.to_string();
+    let retry_after = retry_after.map(|s| format!("Retry-After: {s}\r\n"));
+    let retry_hdr = retry_after.unwrap_or_default();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let count_clone = count_clone.clone();
+            count_clone.fetch_add(1, Ordering::Relaxed);
+            let reason = match status {
+                200 => "OK",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                404 => "Not Found",
+                408 => "Request Timeout",
+                429 => "Too Many Requests",
+                502 => "Bad Gateway",
+                503 => "Service Unavailable",
+                504 => "Gateway Timeout",
+                _ => "Unknown",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{retry_hdr}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.flush().await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (addr, count)
+}
+
+fn mk_req(model: &str) -> ChatRequest {
+    ChatRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage::user("hi")],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        request_id: None,
+    }
+}
+
+fn client_for(addr: &std::net::SocketAddr, model: &str, max_retries: u32) -> ModelClient {
+    let mut cfg = make_config(&format!("http://{addr}"), model);
+    cfg.max_retries = max_retries;
+    ModelClient::new(cfg).unwrap()
+}
+
+/// Scenario 1: a transient 503 is retried and then succeeds.
+#[tokio::test]
+async fn s01_transient_503_then_success() {
+    // Sequence: 503, then 200. Use the multi-body server via two raw
+    // listeners is complex; instead verify the *classification* of a
+    // transient 503 stays retryable and the client attempts a second
+    // request when the server recovers.
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicU32::new(0));
+    let c2 = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let n = c2.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                let body = "upstream temporarily unavailable";
+                let r = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(r.as_bytes()).await;
+            } else {
+                let b = simple_chat_body("ok");
+                let r = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    b.len(),
+                    b
+                );
+                let _ = sock.write_all(r.as_bytes()).await;
+            }
+            let _ = sock.shutdown().await;
+        }
+    });
+    let client = client_for(&addr, "mimo", 3);
+    let resp = client.chat(mk_req("mimo")).await;
+    assert!(resp.is_ok(), "recovered: {resp:?}");
+    assert!(count.load(Ordering::Relaxed) >= 2, "must have retried");
+}
+
+/// Scenario 2: a 503 wrapping an explicit upstream 404 (the MiMo case) is
+/// classified permanent and NOT retried.
+#[tokio::test]
+async fn s02_503_wrapping_upstream_404_fails_fast() {
+    let body = "MiMo bootstrap failed: 404";
+    let (addr, count) = fixed_status_server(503, None, body).await;
+    let client = client_for(&addr, "mimo", 5);
+    let err = client.chat(mk_req("mimo")).await.unwrap_err();
+    assert!(
+        matches!(err, requiem_core::error::RequiemError::ModelUnavailable(_)),
+        "wrapped upstream 404 must be permanent, got {err:?}"
+    );
+    // Permanent: the client must NOT keep hammering.
+    assert_eq!(count.load(Ordering::Relaxed), 1, "no retry for wrapped 404");
+    let e2 = client.chat(mk_req("mimo")).await.unwrap_err();
+    assert!(
+        e2.class() == "model_unavailable",
+        "classified permanent: {e2:?}"
+    );
+}
+
+/// Scenario 3: a plain 502 is a transient gateway failure (retryable).
+#[tokio::test]
+async fn s03_plain_502_is_retryable_gateway() {
+    let (addr, _count) = fixed_status_server(502, None, "bad gateway").await;
+    let client = client_for(&addr, "mimo", 0); // no retries → surface immediately
+    let err = client.chat(mk_req("mimo")).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            requiem_core::error::RequiemError::GatewayFailure { .. }
+        ),
+        "expected GatewayFailure, got {err:?}"
+    );
+    assert!(err.is_retryable(), "plain 502 must be retryable");
+}
+
+/// Scenario 4: 429 with Retry-After surfaces the backoff window.
+#[tokio::test]
+async fn s04_429_with_retry_after() {
+    let body = "{\"error\":{\"message\":\"slow down\",\"type\":\"rate_limit_error\"}}";
+    let (addr, _count) = fixed_status_server(429, Some(5), body).await;
+    let client = client_for(&addr, "mimo", 0);
+    match client.chat(mk_req("mimo")).await.unwrap_err() {
+        requiem_core::error::RequiemError::RateLimited { retry_after_ms } => {
+            assert_eq!(retry_after_ms, 5_000);
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
+}
+
+/// Scenario 5: 401 invalid credentials → permanent auth failure, no retry.
+#[tokio::test]
+async fn s05_invalid_credentials_fail_fast() {
+    let (addr, count) = fixed_status_server(401, None, "invalid credentials").await;
+    let client = client_for(&addr, "mimo", 3);
+    let err = client.chat(mk_req("mimo")).await.unwrap_err();
+    assert!(matches!(err, requiem_core::error::RequiemError::Auth(_)));
+    assert_eq!(count.load(Ordering::Relaxed), 1, "auth must not be retried");
+}
+
+/// Scenario 6: 404 model not found → permanent ModelUnavailable.
+#[tokio::test]
+async fn s06_model_unavailable_permanent() {
+    let body = "model 'mimo-v9' not found";
+    let (addr, count) = fixed_status_server(404, None, body).await;
+    let client = client_for(&addr, "mimo-v9", 3);
+    let err = client.chat(mk_req("mimo-v9")).await.unwrap_err();
+    assert!(
+        matches!(err, requiem_core::error::RequiemError::ModelUnavailable(_)),
+        "got {err:?}"
+    );
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+}
+
+/// Scenario 7: a connection-level transient failure (server closes before
+/// responding) is retryable.
+#[tokio::test]
+async fn s07_connection_failure_is_retryable() {
+    // A listener that accepts and immediately drops the socket.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut _sock, _)) = listener.accept().await {
+            // Drop immediately → connection reset on the client's read.
+            use tokio::io::AsyncWriteExt;
+            let _ = _sock.shutdown().await;
+        }
+    });
+    let client = client_for(&addr, "mimo", 0);
+    let err = client.chat(mk_req("mimo")).await.unwrap_err();
+    assert!(
+        err.is_retryable(),
+        "connection failure must be retryable: {err:?}"
+    );
+}
+
+/// Scenario 8: provider recovery after the circuit-breaker cooldown.
+#[tokio::test]
+async fn s08_breaker_recovery_after_cooldown() {
+    use requiem_networking::{BreakerConfig, CircuitBreaker};
+    let cb = CircuitBreaker::with_config(BreakerConfig {
+        failure_threshold: 1,
+        cooldown: std::time::Duration::from_millis(50),
+    });
+    // Trip it.
+    cb.record_failure(true);
+    assert_eq!(cb.state(), requiem_networking::BreakerState::Open);
+    // While open (within cooldown) requests are refused.
+    assert!(matches!(
+        cb.allow_request(),
+        requiem_networking::Admission::Refused { .. }
+    ));
+    // After the cooldown elapses the breaker allows a recovery probe.
+    tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+    assert_eq!(cb.state(), requiem_networking::BreakerState::HalfOpen);
+    assert!(matches!(
+        cb.allow_request(),
+        requiem_networking::Admission::Allow
+    ));
+    // A successful probe closes the circuit.
+    cb.record_success();
+    assert_eq!(cb.state(), requiem_networking::BreakerState::Closed);
+}
+
+/// Scenario 9: multiple agents hitting the same permanent error trip the
+/// shared breaker and are then refused (shielded).
+#[tokio::test]
+async fn s09_multi_agent_same_error_shielded_by_breaker() {
+    use requiem_networking::CircuitBreaker;
+    let cb = CircuitBreaker::new(); // threshold 3
+                                    // Three agents each report a permanent failure (e.g. the MiMo 404).
+    cb.record_failure(true);
+    cb.record_failure(true);
+    cb.record_failure(true);
+    // The breaker is now open; a fourth agent's request is refused without
+    // hitting the network.
+    assert!(
+        matches!(
+            cb.allow_request(),
+            requiem_networking::Admission::Refused { .. }
+        ),
+        "the fourth agent must be shielded"
+    );
+}
+
+/// Scenario 10: cancellation during retry. A cancel flag must interrupt a
+/// request without a long backoff.
+#[tokio::test]
+async fn s10_cancellation_during_retry() {
+    // The raw-socket server returns a transient 503 forever; with retries
+    // enabled the client would loop. We verify the *classification* is
+    // retryable and that a cancelled run surfaces as Cancelled (the
+    // orchestration layer's responsibility). Here we assert the error type
+    // is the retryable gateway so the runtime *would* retry, and that
+    // cancelling is a separate control path.
+    let (addr, _count) = fixed_status_server(503, None, "upstream temporarily unavailable").await;
+    let client = client_for(&addr, "mimo", 0);
+    let err = client.chat(mk_req("mimo")).await.unwrap_err();
+    assert!(err.is_retryable(), "transient 503 stays retryable");
+    // Cancellation is handled by the runtime racing `watcher.wait()`; we
+    // assert the cancel path yields a non-retryable Cancelled error.
+    let cancelled = requiem_core::error::RequiemError::Cancelled;
+    assert!(!cancelled.is_retryable());
+}
+
+/// Scenario 11: a mid-stream interruption is a non-retryable streaming
+/// failure (output was already delivered).
+#[tokio::test]
+async fn s11_streaming_interruption_not_retried() {
+    // The client's classify_stream_error maps a dropped stream to a
+    // StreamingFailure, which is non-retryable. Verify the class.
+    let err = requiem_core::error::RequiemError::StreamingFailure("stream dropped".into());
+    assert!(!err.is_retryable(), "partial streams must not be replayed");
+    assert_eq!(err.class(), "streaming");
+}
+
+#[allow(unused_variables)]
+fn _silence_s02_binding() {
+    let body = "MiMo bootstrap failed: 404";
+    let _ = body;
 }

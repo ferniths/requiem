@@ -69,11 +69,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
-        )
-        .init();
+    // Tracing is installed per-branch (see `requiem_cli::logging`): the
+    // full-screen TUI routes events to a rotating log file so they never
+    // paint over the dashboard, while piped / subcommand execution keeps
+    // the stderr subscriber. Exactly one subscriber is installed per
+    // process.
 
     // Resolve the colour capability once, before anything prints.
     requiem_tui::init_color_mode();
@@ -84,12 +84,17 @@ async fn main() -> ExitCode {
     match cli.command {
         None => run_default(&theme).await,
         Some(Commands::Banner) => {
+            requiem_cli::logging::install_stderr_logging();
             print_banner(&theme);
             print_version_line(&theme);
             ExitCode::SUCCESS
         }
-        Some(Commands::Model { test }) => finish(run_model_command(test).await, &theme),
+        Some(Commands::Model { test }) => {
+            requiem_cli::logging::install_stderr_logging();
+            finish(run_model_command(test).await, &theme)
+        }
         Some(Commands::Help) => {
+            requiem_cli::logging::install_stderr_logging();
             print_banner(&theme);
             print_cli_usage(&theme);
             print_slash_help(&theme);
@@ -99,11 +104,20 @@ async fn main() -> ExitCode {
             // The TUI renders its own welcome screen for fresh sessions and
             // restores the conversation for resumed ones. Skip the
             // pre-printed banner to avoid a flash-and-disappear artifact.
+            // Tracing init happens inside run_session (a rotating log file
+            // for the full-screen TUI, stderr for piped execution).
             finish(requiem_cli::session::run_session(resume).await, &theme)
         }
-        Some(Commands::Setup) => finish(run_setup(&theme), &theme),
-        Some(Commands::Install { dir }) => finish(run_install(dir, &theme), &theme),
+        Some(Commands::Setup) => {
+            requiem_cli::logging::install_stderr_logging();
+            finish(run_setup(&theme), &theme)
+        }
+        Some(Commands::Install { dir }) => {
+            requiem_cli::logging::install_stderr_logging();
+            finish(run_install(dir, &theme), &theme)
+        }
         Some(Commands::Uninstall { dir, purge }) => {
+            requiem_cli::logging::install_stderr_logging();
             finish(run_uninstall(dir, purge, &theme), &theme)
         }
     }

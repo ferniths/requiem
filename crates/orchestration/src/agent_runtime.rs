@@ -196,6 +196,108 @@ fn emit(events: Option<&EventTx>, event: Event) {
     }
 }
 
+/// True when the error is a *provider-level* failure worth surfacing as a
+/// structured card (a gateway problem, a missing model, an auth rejection,
+/// a tripped circuit breaker, rate limiting or quota). Plain request or
+/// tool errors are not provider failures.
+fn is_provider_failure(e: &RequiemError) -> bool {
+    matches!(
+        e,
+        RequiemError::GatewayFailure { .. }
+            | RequiemError::ModelUnavailable(_)
+            | RequiemError::Auth(_)
+            | RequiemError::MissingCredentials
+            | RequiemError::RateLimited { .. }
+            | RequiemError::QuotaExhausted(_)
+            | RequiemError::CircuitOpen(_)
+            | RequiemError::Connection(_)
+            | RequiemError::Dns(_)
+            | RequiemError::Tls(_)
+    )
+}
+
+/// Extract the HTTP status out of a `RequiemError`, if one was observed.
+fn error_status(e: &RequiemError) -> Option<u16> {
+    match e {
+        RequiemError::GatewayFailure { status, .. } => Some(*status),
+        RequiemError::Model { status, .. } => *status,
+        _ => None,
+    }
+}
+
+/// Emit a structured, deduplicable provider-failure card plus a compact
+/// "automatic retries stopped" notice when a model call fails with a
+/// provider-level error. The `dedup_key` collapses identical repeated
+/// failures (same class + circuit state) so a flood of agents hitting the
+/// same MiMo bootstrap 404 produces ONE card, not one per worker.
+fn emit_provider_failure(events: Option<&EventTx>, client: &ModelClient, e: &RequiemError) {
+    if !is_provider_failure(e) {
+        return;
+    }
+    let circuit = client
+        .circuit_breaker()
+        .map(|b| b.state().label().to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let dedup_key = format!("{}|{}", e.class(), circuit);
+    emit(
+        events,
+        Event::ProviderFailure {
+            dedup_key,
+            model: client.model().to_string(),
+            endpoint: client.endpoint().to_string(),
+            error: e.to_string(),
+            error_class: e.class().to_string(),
+            status: error_status(e),
+            circuit,
+        },
+    );
+    // Compact terminal notice: detailed diagnostics live in the log file.
+    emit(
+        events,
+        Event::RetryStatus {
+            status: "stopped".to_string(),
+            text: format!(
+                "Provider {} · automatic retries stopped · run /retry or /model test to probe recovery",
+                e.class()
+            ),
+        },
+    );
+}
+
+/// The circuit-breaker state label at a point in time (for capture before a
+/// request, so we can detect a recovery *transition* after the request
+/// closes it).
+fn breaker_state(client: &ModelClient) -> Option<requiem_networking::BreakerState> {
+    client.circuit_breaker().map(|b| b.state())
+}
+
+/// Emit a compact "provider recovered" notice when a request succeeds
+/// after the circuit breaker was open or half-open (a successful recovery
+/// probe). No notice when the breaker was already healthy — we only
+/// announce the *transition* so the user knows queued work can resume.
+fn emit_provider_recovery(
+    events: Option<&EventTx>,
+    _resp: &ModelResponse,
+    before: Option<requiem_networking::BreakerState>,
+) {
+    let Some(before) = before else {
+        return;
+    };
+    let was_degraded = matches!(
+        before,
+        requiem_networking::BreakerState::Open | requiem_networking::BreakerState::HalfOpen
+    );
+    if was_degraded {
+        emit(
+            events,
+            Event::RetryStatus {
+                status: "recovered".to_string(),
+                text: "Connection recovered · resuming queued work".to_string(),
+            },
+        );
+    }
+}
+
 /// A future that resolves when the cancel flag is set.
 ///
 /// Polls the flag on a fixed tick so a long-running model call can be
@@ -446,6 +548,7 @@ pub async fn run_agent_halted(
                             error_class: e.class().to_string(),
                         },
                     );
+                    emit_provider_failure(events, client, &e);
                     emit(
                         events,
                         Event::AgentStatus {
@@ -458,14 +561,24 @@ pub async fn run_agent_halted(
             }
         } else {
             let chat_result = if cancel.is_some() {
-                tokio::select! {
+                let breaker_state_before = breaker_state(client);
+                let res = tokio::select! {
                     res = client.chat(req) => res,
                     _ = watcher.wait() => {
                         return Err(cancelled_error(run, events));
                     }
+                };
+                if let Ok(r) = &res {
+                    emit_provider_recovery(events, r, breaker_state_before);
                 }
+                res
             } else {
-                client.chat(req).await
+                let breaker_state_before = breaker_state(client);
+                let res = client.chat(req).await;
+                if let Ok(r) = &res {
+                    emit_provider_recovery(events, r, breaker_state_before);
+                }
+                res
             };
             match chat_result {
                 Ok(r) => {
@@ -497,6 +610,7 @@ pub async fn run_agent_halted(
                             error_class: e.class().to_string(),
                         },
                     );
+                    emit_provider_failure(events, client, &e);
                     emit(
                         events,
                         Event::AgentStatus {

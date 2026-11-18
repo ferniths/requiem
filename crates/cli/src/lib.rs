@@ -7,5 +7,6 @@ pub mod clipboard;
 pub mod commands;
 pub mod config;
 pub mod history;
+pub mod logging;
 pub mod session;
 pub mod setup;

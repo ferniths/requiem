@@ -217,12 +217,19 @@ pub async fn run_session(
             None
         };
 
+    // Shared provider circuit breaker: one instance across every agent so
+    // a repeated permanent failure discovered by any agent (e.g. a MiMo
+    // bootstrap 404) shields the others from re-sending the same doomed
+    // request.
+    let breaker = requiem_networking::CircuitBreaker::new();
+
     let client = Arc::new({
         let mc = config.to_model_config();
         let mut client = requiem_model::client::ModelClient::new(mc)?;
         if let Some(pool) = &proxy_pool {
             client = client.with_proxy_pool(pool.clone());
         }
+        client = client.with_circuit_breaker(breaker.clone());
         client
     });
 
@@ -345,6 +352,12 @@ async fn run_fullscreen(
     };
     use ratatui::backend::CrosstermBackend;
     use ratatui::Terminal;
+
+    // Route all tracing to a rotating, size-bounded log file for the
+    // lifetime of the full-screen session so warnings (e.g. provider
+    // bootstrap failures) never paint over the dashboard. Held until the
+    // function returns so buffered events are flushed on exit.
+    let _log_guard = crate::logging::install_tui_logging();
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -913,6 +926,37 @@ async fn dispatch_slash(
                 can_admit,
             );
             app.push_system(&client_info, NoticeLevel::Info);
+
+            // Surface the shared circuit-breaker state so the user can see
+            // whether the provider is being shielded after repeated
+            // permanent failures (e.g. a MiMo bootstrap 404).
+            if let Some(breaker) = client.circuit_breaker() {
+                let state = breaker.state();
+                let level = match state {
+                    requiem_networking::BreakerState::Closed => NoticeLevel::Info,
+                    requiem_networking::BreakerState::HalfOpen => NoticeLevel::Warning,
+                    requiem_networking::BreakerState::Open => NoticeLevel::Error,
+                };
+                app.push_system(&format!("provider: {}", breaker.describe()), level);
+            }
+
+            // Point to where diagnostics are being logged.
+            let log_dir = crate::logging::log_dir();
+            app.push_system(
+                &format!("logs: {}  (run /logs for details)", log_dir.display()),
+                NoticeLevel::Info,
+            );
+            Directive::Continue
+        }
+        "logs" => {
+            let log_dir = crate::logging::log_dir();
+            app.push_system(
+                &format!(
+                    "REQUIEM log directory: {}\n  · full-screen TUI: all diagnostics (incl. provider failures) write here\n  · /diagnostics shows the live provider & circuit state",
+                    log_dir.display()
+                ),
+                NoticeLevel::Info,
+            );
             Directive::Continue
         }
         "dashboard" => {
@@ -1812,6 +1856,10 @@ async fn run_plain(
     session_id: Uuid,
     prior: Vec<requiem_memory::session::SessionRecord>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Piped / non-TTY execution keeps diagnostic tracing on stderr so the
+    // user still gets complete logs; only the full-screen TUI diverts to a
+    // log file.
+    crate::logging::install_stderr_logging();
     let _renderer = requiem_tui::ThemedRenderer::new(&theme);
     println!("{}", requiem_tui::banner::render_themed(&theme));
     println!(
@@ -1900,6 +1948,10 @@ async fn run_plain(
                         client.in_flight(),
                         client.max_context_tokens().unwrap_or(0)
                     );
+                }
+                "logs" => {
+                    let dir = crate::logging::log_dir();
+                    println!("  log directory: {}", dir.display());
                 }
                 "project" => {
                     match std::env::current_dir()

@@ -240,7 +240,7 @@ impl ProxyPool {
     /// Rotate to the next healthy endpoint (used by `/proxy rotate`).
     pub async fn rotate(&self) -> Option<ProxyEndpoint> {
         let config = self.config.read().await;
-        let healthy: Vec<_> = config.healthy_endpoints().iter().cloned().collect();
+        let healthy: Vec<_> = config.healthy_endpoints().to_vec();
         if healthy.is_empty() {
             return None;
         }
@@ -286,8 +286,10 @@ mod tests {
 
     #[tokio::test]
     async fn select_returns_direct_when_no_endpoints() {
-        let mut config = NetworkConfig::default();
-        config.proxy_enabled = true;
+        let config = NetworkConfig {
+            proxy_enabled: true,
+            ..NetworkConfig::default()
+        };
         let client = Client::new();
         let checker = Arc::new(HealthChecker::new(&client, 1_000));
         let pool = ProxyPool::new(config, checker);
@@ -297,8 +299,10 @@ mod tests {
 
     #[tokio::test]
     async fn select_returns_proxy_when_enabled_with_endpoint() {
-        let mut config = NetworkConfig::default();
-        config.proxy_enabled = true;
+        let mut config = NetworkConfig {
+            proxy_enabled: true,
+            ..NetworkConfig::default()
+        };
         let ep = ProxyEndpoint::new(
             "test",
             ProviderKind::None,
@@ -331,8 +335,10 @@ mod tests {
 
     #[tokio::test]
     async fn record_failure_increments_count() {
-        let mut config = NetworkConfig::default();
-        config.proxy_enabled = true;
+        let mut config = NetworkConfig {
+            proxy_enabled: true,
+            ..NetworkConfig::default()
+        };
         let ep = ProxyEndpoint::new(
             "test",
             ProviderKind::None,

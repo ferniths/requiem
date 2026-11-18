@@ -93,12 +93,10 @@ impl HealthChecker {
             .strip_prefix("socks5://")
             .or_else(|| endpoint.url.strip_prefix("socks://"))
             .unwrap_or(&endpoint.url);
-        match tokio::net::TcpStream::connect(host_port)
+        tokio::net::TcpStream::connect(host_port)
             .await
-            .map_err(|e| format!("socket connect failed: {e}"))?
-        {
-            _ => Ok(()),
-        }
+            .map_err(|e| format!("socket connect failed: {e}"))?;
+        Ok(())
     }
 }
 

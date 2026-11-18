@@ -92,6 +92,12 @@ pub enum RequiemError {
     #[error("gateway failure [{status}]: {message}")]
     GatewayFailure { status: u16, message: String },
 
+    /// The provider circuit breaker is open: repeated permanent failures
+    /// have tripped it and new requests are refused until a cooldown
+    /// elapses. Not retryable — retrying just re-trips the breaker.
+    #[error("provider circuit open: {0}")]
+    CircuitOpen(String),
+
     /// A filesystem or I/O failure.
     #[error("io: {0}")]
     Io(String),
@@ -137,6 +143,10 @@ impl RequiemError {
             | Self::RateLimited { .. }
             | Self::Timeout(_)
             | Self::GatewayFailure { .. } => true,
+            // A tripped circuit breaker is a *decision*, not a transient
+            // fault: retrying immediately would just re-trip it. The
+            // breaker's own cooldown/half-open logic handles recovery.
+            Self::CircuitOpen(_) => false,
             // A stream that failed after data was delivered cannot be
             // transparently replayed without duplicating output.
             Self::StreamingFailure(_) => false,
@@ -166,6 +176,7 @@ impl RequiemError {
             Self::ToolCallingIncompatible(_) => "tool_calling",
             Self::StreamingFailure(_) => "streaming",
             Self::GatewayFailure { .. } => "gateway",
+            Self::CircuitOpen(_) => "circuit_open",
             Self::Io(_) => "io",
             Self::Tool { .. } => "tool",
             Self::Session(_) => "session",

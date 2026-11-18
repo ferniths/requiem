@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 requiem-core = { path = "../core" }
 requiem-model = { path = "../model" }
+requiem-networking = { path = "../networking" }
 requiem-context = { path = "../context" }
 tokio = { workspace = true }
 serde = { workspace = true }

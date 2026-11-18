@@ -31,6 +31,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         "session status: mode, model, tokens, tasks",
     ),
     CommandSpec::new("events", "View", "recent runtime events"),
+    CommandSpec::new("logs", "View", "show where REQUIEM writes its log files"),
     // ── Config ──────────────────────────────────────────────────────
     CommandSpec::new("model", "Config", "show or test the configured model").with_args(&["--test"]),
     CommandSpec::new("theme", "Config", "list themes or switch: /theme [name]")

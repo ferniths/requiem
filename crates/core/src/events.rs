@@ -109,6 +109,41 @@ pub enum Event {
     RunCancelled { agent: String, task: Id },
     /// A free-form system notice (config changes, session events…).
     Notice { text: String, level: NoticeLevel },
+    /// A provider/model request failed with a structured, deduplicable
+    /// card. Emitted by the agent runtime when a model call fails with a
+    /// provider-level error (gateway, missing model, auth, tripped circuit
+    /// breaker). The UI renders this as a multi-line card in the
+    /// transcript and dashboard feed, and deduplicates repeated identical
+    /// failures across workers.
+    ProviderFailure {
+        /// Stable dedup key: error class + circuit state. Identical keys
+        /// within a short window collapse to one card.
+        dedup_key: String,
+        /// Provider/model identifier.
+        model: String,
+        /// Endpoint host (credentials never included).
+        endpoint: String,
+        /// The extracted error message (sanitized, no secrets).
+        error: String,
+        /// Stable error class, e.g. `model_unavailable`, `gateway`,
+        /// `circuit_open`, `auth`.
+        error_class: String,
+        /// The HTTP status if one was observed.
+        status: Option<u16>,
+        /// Circuit-breaker state label at the time of failure.
+        circuit: String,
+    },
+    /// A compact, user-facing notice about retry progress or provider
+    /// recovery. Kept deliberately terse so a flurry of retries does not
+    /// flood the feed; detailed diagnostics stay in the log file.
+    RetryStatus {
+        /// One of the compact statuses, e.g. "retrying", "recovered",
+        /// "stopped".
+        status: String,
+        /// Human-readable message, e.g. "Provider unavailable · retry 2/3 ·
+        /// waiting 2.0s".
+        text: String,
+    },
 }
 
 /// Severity for `Event::Notice`.
@@ -206,6 +241,18 @@ impl Event {
             Event::RunFailed { agent, error, .. } => format!("{agent} failed: {error}"),
             Event::RunCancelled { agent, .. } => format!("{agent} cancelled"),
             Event::Notice { text, .. } => text.clone(),
+            Event::ProviderFailure {
+                error,
+                error_class,
+                status,
+                ..
+            } => {
+                let http = status.map(|s| format!(" · HTTP {s}")).unwrap_or_default();
+                format!("provider failure [{error_class}]{http}: {error}")
+            }
+            Event::RetryStatus { status, text, .. } => {
+                format!("retry [{status}]: {text}")
+            }
         }
     }
 }

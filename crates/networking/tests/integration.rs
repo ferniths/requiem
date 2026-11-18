@@ -127,8 +127,10 @@ async fn start_mock_proxy() -> (MockProxy, tokio::task::JoinHandle<()>) {
 #[tokio::test]
 async fn proxy_pool_selects_healthy_endpoint() {
     let (mock, _handle) = start_mock_proxy().await;
-    let mut config = NetworkConfig::default();
-    config.proxy_enabled = true;
+    let mut config = NetworkConfig {
+        proxy_enabled: true,
+        ..NetworkConfig::default()
+    };
 
     let ep = ProxyEndpoint::new("mock", ProviderKind::None, &mock.addr, ProxyProtocol::Http);
     config.endpoints.push(ep);
@@ -143,8 +145,10 @@ async fn proxy_pool_selects_healthy_endpoint() {
 
 #[tokio::test]
 async fn proxy_pool_falls_back_to_direct_when_no_healthy_endpoints() {
-    let mut config = NetworkConfig::default();
-    config.proxy_enabled = true;
+    let config = NetworkConfig {
+        proxy_enabled: true,
+        ..NetworkConfig::default()
+    };
     // No endpoints at all.
     let client = Client::new();
     let checker = Arc::new(HealthChecker::new(&client, 1_000));
@@ -199,8 +203,10 @@ async fn multiple_consecutive_429s_scale_cooldown() {
 
 #[tokio::test]
 async fn proxy_endpoint_failure_increments_count() {
-    let mut config = NetworkConfig::default();
-    config.proxy_enabled = true;
+    let mut config = NetworkConfig {
+        proxy_enabled: true,
+        ..NetworkConfig::default()
+    };
     let ep = ProxyEndpoint::new(
         "dead",
         ProviderKind::None,
@@ -226,8 +232,10 @@ async fn proxy_endpoint_failure_increments_count() {
 
 #[tokio::test]
 async fn proxy_endpoint_recovery_after_success() {
-    let mut config = NetworkConfig::default();
-    config.proxy_enabled = true;
+    let mut config = NetworkConfig {
+        proxy_enabled: true,
+        ..NetworkConfig::default()
+    };
     let ep = ProxyEndpoint::new(
         "rec",
         ProviderKind::None,
@@ -253,8 +261,10 @@ async fn proxy_endpoint_recovery_after_success() {
 
 #[tokio::test]
 async fn proxy_rotate_returns_next_healthy_endpoint() {
-    let mut config = NetworkConfig::default();
-    config.proxy_enabled = true;
+    let mut config = NetworkConfig {
+        proxy_enabled: true,
+        ..NetworkConfig::default()
+    };
     config.endpoints.push(ProxyEndpoint::new(
         "a",
         ProviderKind::None,
@@ -310,8 +320,10 @@ async fn socks5_protocol_detection() {
 
 #[tokio::test]
 async fn config_persistence_roundtrip() {
-    let mut config = NetworkConfig::default();
-    config.proxy_enabled = true;
+    let mut config = NetworkConfig {
+        proxy_enabled: true,
+        ..NetworkConfig::default()
+    };
     config.endpoints.push(ProxyEndpoint::new(
         "persist",
         ProviderKind::Free,
@@ -365,7 +377,7 @@ async fn concurrent_agents_share_global_rate_limit() {
         t0.elapsed()
     });
 
-    let _ = h1.await.unwrap();
+    h1.await.unwrap();
     let elapsed = h2.await.unwrap();
     // The second agent should have been blocked by the global cooldown.
     assert!(

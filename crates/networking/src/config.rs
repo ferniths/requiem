@@ -243,8 +243,10 @@ mod tests {
 
     #[test]
     fn healthy_endpoint_list_filters_unhealthy() {
-        let mut config = NetworkConfig::default();
-        config.proxy_enabled = true;
+        let mut config = NetworkConfig {
+            proxy_enabled: true,
+            ..NetworkConfig::default()
+        };
         let mut good = ProxyEndpoint::new(
             "test",
             ProviderKind::None,

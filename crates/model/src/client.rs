@@ -18,7 +18,7 @@ use crate::request::{ChatMessage, ChatRequest};
 use crate::response::{ModelResponse, StreamChunk, TokenUsage, ToolCallDelta};
 use crate::retry::{from_max_retries, RetryPolicy};
 use requiem_core::error::RequiemError;
-use requiem_networking::ProxyPool;
+use requiem_networking::{Admission, CircuitBreaker, ProxyPool};
 
 /// A shared, concurrency-bounded model client.
 #[derive(Clone)]
@@ -39,6 +39,12 @@ pub struct ModelClient {
     /// matching proxy. When `None` (default), all requests use `self.http`
     /// directly — zero behaviour change for existing setups.
     proxy_pool: Option<Arc<ProxyPool>>,
+    /// Shared provider circuit breaker. When set, every chat/stream call
+    /// first asks the breaker for admission; a refusal short-circuits the
+    /// request so one agent's permanent failure shields every other agent
+    /// from re-sending the same doomed request. When `None` (default) the
+    /// client behaves exactly as before — zero behaviour change.
+    breaker: Option<Arc<CircuitBreaker>>,
     /// Wall-clock duration of the most recent model request in milliseconds.
     /// Updated atomically so the dashboard can read it without a lock.
     last_request_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -67,6 +73,7 @@ impl ModelClient {
             max_concurrency: config.max_concurrency,
             semaphore,
             proxy_pool: None,
+            breaker: None,
             last_request_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -83,6 +90,20 @@ impl ModelClient {
     /// The proxy pool, if attached.
     pub fn proxy_pool(&self) -> Option<&Arc<ProxyPool>> {
         self.proxy_pool.as_ref()
+    }
+
+    /// Attach a shared provider circuit breaker. Subsequent chat/stream
+    /// calls consult the breaker for admission before sending, and record
+    /// their outcome. When the breaker is open (repeated permanent
+    /// failures) new requests are refused without hitting the gateway.
+    pub fn with_circuit_breaker(mut self, breaker: Arc<CircuitBreaker>) -> Self {
+        self.breaker = Some(breaker);
+        self
+    }
+
+    /// The circuit breaker, if attached.
+    pub fn circuit_breaker(&self) -> Option<&Arc<CircuitBreaker>> {
+        self.breaker.as_ref()
     }
 
     pub fn model(&self) -> &str {
@@ -193,6 +214,23 @@ impl ModelClient {
     }
 
     async fn chat_inner(&self, req: &ChatRequest) -> Result<ModelResponse, RequiemError> {
+        // Circuit-breaker admission gate: refuse to send when the shared
+        // breaker is open (repeated permanent failures), shielding every
+        // other agent from re-sending the same doomed request. A refusal is
+        // surfaced as a distinct, non-retryable `CircuitOpen` error.
+        if let Some(breaker) = &self.breaker {
+            if let Admission::Refused { wait_ms } = breaker.allow_request() {
+                let desc = breaker.describe();
+                tracing::warn!(
+                    "provider circuit open; refusing model request ({}s remaining): {desc}",
+                    wait_ms / 1000
+                );
+                return Err(RequiemError::CircuitOpen(format!(
+                    "{desc} · retrying in {wait_ms}ms"
+                )));
+            }
+        }
+
         // Global rate-limit gate: block all agents during a shared 429 cooldown.
         if let Some(pool) = &self.proxy_pool {
             pool.rate_limiter().acquire().await;
@@ -209,6 +247,9 @@ impl ModelClient {
             match self.do_chat_with(client, req).await {
                 Ok(r) => {
                     // Record success: reset endpoint failure count, clear global cooldown.
+                    if let Some(b) = self.breaker.as_ref() {
+                        b.record_success();
+                    }
                     if let Some(pool) = &self.proxy_pool {
                         if let requiem_networking::EndpointSelection::ViaProxy {
                             endpoint, ..
@@ -221,6 +262,11 @@ impl ModelClient {
                     return Ok(r);
                 }
                 Err(e) if e.is_retryable() && self.retry.should_retry(attempt) => {
+                    // Transient failure: record it as *non-permanent* so a
+                    // single blip does not trip the shared breaker.
+                    if let Some(b) = self.breaker.as_ref() {
+                        b.record_failure(false);
+                    }
                     // Record 429 globally: all agents will back off together.
                     if let Some(pool) = &self.proxy_pool {
                         if let RequiemError::RateLimited { retry_after_ms } = &e {
@@ -251,7 +297,15 @@ impl ModelClient {
                     );
                     sleep(delay).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Terminal (permanent) failure: record it as permanent so
+                    // repeated hard failures can trip the shared breaker and
+                    // shield the other agents.
+                    if let Some(b) = self.breaker.as_ref() {
+                        b.record_failure(true);
+                    }
+                    return Err(e);
+                }
             }
         }
     }
@@ -376,6 +430,20 @@ impl ModelClient {
         req: &ChatRequest,
         tx: &tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ModelResponse, RequiemError> {
+        // Circuit-breaker admission gate (mirror of `chat_inner`).
+        if let Some(breaker) = &self.breaker {
+            if let Admission::Refused { wait_ms } = breaker.allow_request() {
+                let desc = breaker.describe();
+                tracing::warn!(
+                    "provider circuit open; refusing stream request ({}s remaining): {desc}",
+                    wait_ms / 1000
+                );
+                return Err(RequiemError::CircuitOpen(format!(
+                    "{desc} · retrying in {wait_ms}ms"
+                )));
+            }
+        }
+
         // Global rate-limit gate before streaming.
         if let Some(pool) = &self.proxy_pool {
             pool.rate_limiter().acquire().await;
@@ -395,6 +463,9 @@ impl ModelClient {
             match self.connect_stream_with(client, &body).await {
                 Ok(r) => {
                     // Record success.
+                    if let Some(b) = self.breaker.as_ref() {
+                        b.record_success();
+                    }
                     if let Some(pool) = &self.proxy_pool {
                         if let requiem_networking::EndpointSelection::ViaProxy {
                             endpoint, ..
@@ -407,6 +478,9 @@ impl ModelClient {
                     break r;
                 }
                 Err(e) if e.is_retryable() && self.retry.should_retry(attempt) => {
+                    if let Some(b) = self.breaker.as_ref() {
+                        b.record_failure(false);
+                    }
                     if let Some(pool) = &self.proxy_pool {
                         if let RequiemError::RateLimited { retry_after_ms } = &e {
                             pool.rate_limiter().record_rate_limit(*retry_after_ms).await;
@@ -430,7 +504,12 @@ impl ModelClient {
                     tracing::warn!("stream connect failed (retry {attempt}): {e}");
                     sleep(delay).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if let Some(b) = self.breaker.as_ref() {
+                        b.record_failure(true);
+                    }
+                    return Err(e);
+                }
             }
         };
 
@@ -891,15 +970,107 @@ fn classify_http_error_with_id(
             RequiemError::RateLimited { retry_after_ms }
         }
         409 => RequiemError::StreamingFailure(snippet),
-        502..=504 => RequiemError::GatewayFailure {
-            status,
-            message: format!("{snippet}{suffix}"),
-        },
+        502..=504 => {
+            // A 502/503/504 is usually a *transient* gateway problem — safe to
+            // retry. But when the gateway's body explicitly wraps a *permanent*
+            // upstream error (an upstream 404, "not found", "model unavailable",
+            // a failed bootstrap…), retrying the outer status just repeats the
+            // same failure across every agent. Detect that case and classify it
+            // as a permanent `ModelUnavailable` so the retry loop stops
+            // immediately and the circuit breaker records a hard failure.
+            //
+            // We preserve the outer gateway status, the upstream status when it
+            // can be read, the provider message and the request id in the
+            // error text so diagnostics stay truthful.
+            if let Some(upstream_status) = detect_wrapped_upstream_permanent(&hints, &snippet) {
+                let detail = format!(
+                    "gateway {status} wraps permanent upstream {upstream_status}: {snippet}{suffix}"
+                );
+                return RequiemError::ModelUnavailable(detail);
+            }
+            RequiemError::GatewayFailure {
+                status,
+                message: format!("{snippet}{suffix}"),
+            }
+        }
         _ => RequiemError::Model {
             status: Some(status),
             message: format!("{snippet}{suffix}"),
         },
     }
+}
+
+/// Detect an explicit *permanent* upstream error wrapped inside a 502/503/504
+/// gateway body, returning the upstream status code when one can be read.
+///
+/// Returns `None` when the body looks like an ordinary transient gateway
+/// failure (blank page, "bad gateway", "upstream timeout", …) so those keep
+/// their retryable classification.
+fn detect_wrapped_upstream_permanent(hints: &str, snippet: &str) -> Option<u16> {
+    // Strong, unambiguous signals that the gateway is reporting a permanent
+    // 404 from the provider it tried to bootstrap / route to.
+    const PERMANENT_NEEDLES: [&str; 8] = [
+        "model unavailable",
+        "model not found",
+        "model does not exist",
+        "unsupported model",
+        "bootstrap failed",
+        "upstream 404",
+        "provider not found",
+        "no such model",
+    ];
+    let lower_snip = snippet.to_lowercase();
+    let is_permanent = PERMANENT_NEEDLES
+        .iter()
+        .any(|n| hints.contains(n) || lower_snip.contains(n));
+
+    // A 404-family body with a generic "not found" / "does not exist" phrase
+    // pointing at a model/route/provider is also permanent.
+    let not_found_model = (hints.contains("not found") || hints.contains("does not exist"))
+        && (hints.contains("model") || hints.contains("route") || hints.contains("provider"));
+
+    // A body that explicitly reports an upstream 4xx status (e.g. "upstream
+    // status 404: not found") is a permanent upstream error, even when it
+    // does not name the model.
+    let upstream_4xx = lower_snip.contains("upstream")
+        && extract_upstream_status(&snippet.to_uppercase())
+            .is_some_and(|c| (400..=499).contains(&c));
+
+    if !is_permanent && !not_found_model && !upstream_4xx {
+        return None;
+    }
+
+    // Best-effort: pull the upstream status out of the body. Common gateway
+    // shapes: "… upstream status 404 …", "upstream: 404", "404 Not Found".
+    let upper = snippet.to_uppercase();
+    let upstream_status = extract_upstream_status(&upper);
+    // If we found a permanent signal but no explicit upstream code, still
+    // report 404 since that is what all of these phrases imply.
+    Some(upstream_status.unwrap_or(404))
+}
+
+/// Pull a 4xx/5xx upstream status code out of an uppercased error snippet.
+fn extract_upstream_status(upper_snippet: &str) -> Option<u16> {
+    let text = upper_snippet.to_string();
+    // Look for "UPSTREAM 404" / "UPSTREAM: 404" / "UPSTREAM STATUS 404".
+    if let Some(idx) = text.find("UPSTREAM") {
+        let after = &text[idx..];
+        // Grab the next run of digits within the first ~24 chars.
+        let mut digits = String::new();
+        for c in after.chars().take(24) {
+            if c.is_ascii_digit() {
+                digits.push(c);
+            } else if !digits.is_empty() {
+                break;
+            }
+        }
+        if let Ok(code) = digits.parse::<u16>() {
+            if (400..=599).contains(&code) {
+                return Some(code);
+            }
+        }
+    }
+    None
 }
 
 /// Walk an error's source chain and collect lowercase messages.
@@ -948,6 +1119,18 @@ fn classify_reqwest_error(err: &reqwest::Error, timeout_ms: u64) -> RequiemError
         ));
     }
     if err.is_builder() || err.is_request() {
+        // A send that failed because the socket was dropped or reset is
+        // transient, not a malformed request. Classify connection-drop
+        // phrases as retryable `Connection`; a genuinely malformed request
+        // (bad URL, invalid header) keeps the permanent `Config` class.
+        if chain.contains("connection closed")
+            || chain.contains("connection reset")
+            || chain.contains("broken pipe")
+            || chain.contains("canceled")
+            || chain.contains("closed before message")
+        {
+            return RequiemError::Connection(sanitize_text(&chain, 240));
+        }
         // Malformed request or invalid configuration — permanent.
         return RequiemError::Config(sanitize_text(&chain, 240));
     }
@@ -1228,6 +1411,70 @@ mod tests {
     fn classify_504_is_gateway() {
         let err = classify_http_error(504, "gateway timeout", None);
         assert!(matches!(err, RequiemError::GatewayFailure { .. }));
+    }
+
+    #[test]
+    fn classify_503_wraps_upstream_404_mimo() {
+        // The actual MiMo failure: a 503 gateway body reporting an upstream
+        // bootstrap 404. Must be permanent (ModelUnavailable), not retried.
+        let err = classify_http_error(503, "MiMo bootstrap failed: 404", Some("x"));
+        match err {
+            RequiemError::ModelUnavailable(ref msg) => {
+                assert!(msg.contains("503"), "outer status kept: {msg}");
+                assert!(msg.contains("404"), "upstream status kept: {msg}");
+                assert!(msg.contains("bootstrap failed"), "got: {msg}");
+                assert!(!err.is_retryable(), "wrapped 404 must not be retried");
+            }
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_502_wraps_model_unavailable() {
+        let err = classify_http_error(502, "upstream error: model unavailable", None);
+        assert!(matches!(err, RequiemError::ModelUnavailable(_)));
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn classify_503_with_upstream_code_in_body() {
+        let err = classify_http_error(503, "upstream status 404: not found", None);
+        match err {
+            RequiemError::ModelUnavailable(msg) => {
+                assert!(msg.contains("404"), "upstream code in message: {msg}");
+            }
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transient_502_remains_gateway_failure() {
+        // Ordinary gateway outages must stay retryable.
+        for body in [
+            "bad gateway",
+            "upstream timeout",
+            "service temporarily unavailable",
+            "502",
+            "",
+        ] {
+            let err = classify_http_error(502, body, None);
+            assert!(
+                matches!(err, RequiemError::GatewayFailure { .. }),
+                "expected GatewayFailure for {body:?}, got {err:?}"
+            );
+            assert!(err.is_retryable(), "{body:?} must be retryable");
+        }
+    }
+
+    #[test]
+    fn wrapped_permanent_preserves_request_id() {
+        let err =
+            classify_http_error_with_id(503, "MiMo bootstrap failed: 404", None, Some("req-12345"));
+        if let RequiemError::ModelUnavailable(msg) = err {
+            assert!(msg.contains("req-12345"), "request id kept: {msg}");
+        } else {
+            panic!("expected ModelUnavailable");
+        }
     }
 
     #[test]

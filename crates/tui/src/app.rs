@@ -260,6 +260,10 @@ fn format_error_card(error: &str, error_class: &str, model: &str) -> String {
         "tool_calling" => ("Tool Schema", "The provider rejected the tool-call schema. Simplify or remove the tools from the request."),
         "streaming" => ("Stream Error", "The SSE stream was interrupted mid-response. Retry the request."),
         "gateway" => ("Gateway", "An upstream gateway or proxy returned an error. The provider may be temporarily unavailable — retry in a moment."),
+        "circuit_open" => (
+            "Provider Shielded",
+            "The shared provider circuit breaker has tripped after repeated failures. New requests are paused; the provider is being probed after a cooldown. Use /retry or /model test to force a recovery probe.",
+        ),
         "invalid_state" => ("State", "The internal task graph state is inconsistent. Try a new session."),
         "internal" => ("Internal", "A worker task failed unexpectedly. Its partial state was discarded — retry the request."),
         _ => ("Unknown", "An unexpected error occurred. See the log for details."),
@@ -325,6 +329,68 @@ fn extract_http_status(error: &str) -> Option<u16> {
     let start = error.find('[')? + 1;
     let end = error[start..].find(']')? + start;
     error[start..end].trim().parse::<u16>().ok()
+}
+
+/// Build the markdown card for a structured [`Event::ProviderFailure`].
+///
+/// Unlike the generic `RunFailed` card this one is data-driven: it shows
+/// the provider/model, the observed HTTP status, the circuit-breaker
+/// state and the suggested commands. No credentials are ever rendered.
+fn format_provider_failure_card(event: &Event) -> String {
+    let Event::ProviderFailure {
+        model,
+        endpoint,
+        error,
+        error_class,
+        status,
+        circuit,
+        ..
+    } = event
+    else {
+        // Not a provider failure; fall back to the generic card.
+        return String::new();
+    };
+    let (category, action) = match error_class.as_str() {
+        "circuit_open" => (
+            "Provider Shielded",
+            "Repeated failures tripped the shared circuit breaker. New requests are paused until a recovery probe succeeds.",
+        ),
+        "model_unavailable" => (
+            "Model Not Found",
+            "The provider route or model is missing. Verify the model id and endpoint; the gateway reported a permanent upstream 404.",
+        ),
+        "gateway" => (
+            "Gateway",
+            "An upstream gateway or proxy returned an error. The provider may be temporarily unavailable.",
+        ),
+        "auth" => ("Authentication", "The provider rejected the credentials. Reconfigure the API key via /setup."),
+        "rate_limited" => ("Rate Limit", "The provider is throttling. Wait for the backoff window, then /retry."),
+        "quota_exhausted" => ("Quota / Billing", "The provider's quota or billing limit has been reached."),
+        "connection" | "dns" | "tls" => (
+            "Network",
+            "A transient network failure. Verify connectivity and /model test, then /retry.",
+        ),
+        _ => ("Provider", "A provider-level failure occurred. See the log for details."),
+    };
+
+    let mut card = String::from("**PROVIDER FAILURE**\n\n");
+    card.push_str(&format!("**Category:** {category}  \n"));
+    card.push_str(&format!("**Provider / Model:** {model}  \n"));
+    card.push_str(&format!("**Endpoint:** {endpoint}  \n"));
+    if let Some(s) = status {
+        card.push_str(&format!("**HTTP status:** {s}  \n"));
+    }
+    if circuit != "n/a" {
+        card.push_str(&format!("**Circuit:** {circuit}  \n"));
+    }
+    card.push_str(&format!("**Detail:** {error}\n\n"));
+    card.push_str("**Suggested actions:**  \n");
+    card.push_str("- Check model availability: `/model test`\n");
+    card.push_str("- Inspect live provider & circuit state: `/diagnostics`\n");
+    card.push_str("- Open the log file: `/logs`\n");
+    card.push_str("- Force a recovery probe: `/retry`\n");
+    card.push_str(&format!("- {action}"));
+    card
 }
 
 /// Walk up to `limit` files/dirs under `root` (skipping common noise
@@ -534,6 +600,12 @@ pub struct App {
 
     // Dashboard state
     pub dash: DashState,
+
+    // Provider-failure dedup: repeated identical failures (same error
+    // class + circuit state) from many agents collapse into one card. The
+    // map remembers the count so the card can read "×N agents" instead of
+    // emitting a new card per worker.
+    provider_failure_counts: std::collections::HashMap<String, u32>,
 }
 
 impl App {
@@ -566,6 +638,7 @@ impl App {
             active_task: None,
             streaming: HashMap::new(),
             dash: DashState::default(),
+            provider_failure_counts: std::collections::HashMap::new(),
         }
     }
 
@@ -1070,6 +1143,54 @@ impl App {
                 }
             }
             Event::Notice { text, level } => self.push_system(text, *level),
+            Event::ProviderFailure { dedup_key, .. } => {
+                // Deduplicate identical provider failures across workers.
+                // The first occurrence renders the full structured card;
+                // repeats collapse to a terse "×N" line so a flood of agents
+                // hitting the same MiMo bootstrap 404 produces one card,
+                // not one per worker.
+                let prev = self
+                    .provider_failure_counts
+                    .get(dedup_key)
+                    .copied()
+                    .unwrap_or(0);
+                let new_count = prev + 1;
+                self.provider_failure_counts
+                    .insert(dedup_key.clone(), new_count);
+                if prev == 0 {
+                    let card = format_provider_failure_card(event);
+                    let mut e = TranscriptEntry::new("⚡", card, Token::Error);
+                    e.markdown = true;
+                    self.entries.push(e);
+                } else {
+                    let line = format!(
+                        "⚑ repeated provider failure (×{new_count} agents) — see the card above · /retry to probe",
+                    );
+                    let mut e = TranscriptEntry::new("⚑", line, Token::Warning);
+                    e.indent = 4;
+                    self.entries.push(e);
+                }
+            }
+            Event::RetryStatus { text, status, .. } => {
+                // Compact, bounded retry / recovery notice. Success and
+                // "stopped" are the only ones that carry meaning to the
+                // user; the in-flight "retrying N/M" lines are logged to the
+                // file and shown in the feed ticker, not the transcript.
+                match status.as_str() {
+                    "recovered" => {
+                        self.push_system(text, NoticeLevel::Success);
+                    }
+                    "stopped" => {
+                        self.push_system(text, NoticeLevel::Error);
+                    }
+                    _ => {
+                        // "retrying" and others: a light-weight feed entry.
+                        let mut e = TranscriptEntry::new("↻", text.clone(), Token::Info);
+                        e.indent = 4;
+                        self.entries.push(e);
+                    }
+                }
+            }
         }
     }
 
@@ -2811,6 +2932,16 @@ fn event_token(event: &Event) -> Token {
         Event::ToolCallStarted { .. } => Token::TextSecondary,
         Event::AgentSpawned { .. } => Token::Violet,
         Event::RunStarted { .. } => Token::Info,
+        Event::ProviderFailure { .. } => Token::Error,
+        Event::RetryStatus { status, .. } => {
+            if status == "stopped" {
+                Token::Error
+            } else if status == "recovered" {
+                Token::Success
+            } else {
+                Token::Info
+            }
+        }
         _ => Token::TextSecondary,
     }
 }
@@ -4465,5 +4596,81 @@ fn hello() {
         assert_eq!(app.dash.focus, DashFocus::Inspector);
         app.handle_key(test_key(KeyCode::F(5)));
         assert_eq!(app.dash.focus, DashFocus::Feed);
+    }
+
+    fn provider_failure(dedup_key: &str) -> Event {
+        Event::ProviderFailure {
+            dedup_key: dedup_key.to_string(),
+            model: "mimo".into(),
+            endpoint: "127.0.0.1:8080".into(),
+            error: "gateway 503 wraps permanent upstream 404: MiMo bootstrap failed: 404".into(),
+            error_class: "model_unavailable".into(),
+            status: Some(503),
+            circuit: "open".into(),
+        }
+    }
+
+    /// A flood of identical provider failures across agents collapses to one
+    /// structured card plus terse "×N" lines, and the dashboard log feed
+    /// stays bounded. This is the concrete guarantee that MiMo bootstrap
+    /// errors cannot paint over or reset the full-screen dashboard.
+    #[test]
+    fn provider_failure_dedupes_and_feed_stays_bounded() {
+        let mut app = test_app();
+
+        // Three agents all hit the same MiMo 404 → same dedup_key.
+        for _ in 0..3 {
+            app.push_event(&provider_failure("model_unavailable|open"));
+        }
+
+        // Dedup: exactly 3 transcript entries, only the first is the card.
+        assert_eq!(app.entries.len(), 3);
+        let card = &app.entries[0];
+        assert!(card.glyph == "⚡", "first failure is the structured card");
+        assert!(card.markdown, "card renders as markdown");
+        let repeat = &app.entries[1];
+        assert!(repeat.glyph == "⚑", "repeat collapses to a terse line");
+        assert!(repeat.text.contains("×2"), "repeat shows the count");
+
+        // The dashboard log feed is bounded to 200 events.
+        for _ in 0..500 {
+            app.push_event(&Event::Notice {
+                text: "noise".into(),
+                level: NoticeLevel::Info,
+            });
+        }
+        assert_eq!(app.dash.events.len(), 200, "feed must stay bounded");
+        // Bounding the feed must NOT erase the deduped provider cards from
+        // the transcript: the first three entries are still the card + 2
+        // collapsed repeats.
+        assert_eq!(app.entries[0].glyph, "⚡", "card survives feed bounding");
+        assert!(app.entries[1].text.contains("×2"), "dedup count survives");
+    }
+
+    /// A provider failure that trips the circuit breaker surfaces as a
+    /// distinct card (dedup_key includes the circuit state) and does not
+    /// reset the layout/selection.
+    #[test]
+    fn circuit_open_failure_renders_distinct_card() {
+        let mut app = test_app();
+        app.dash.open = true;
+        let before = app.dash.focus;
+
+        app.push_event(&Event::ProviderFailure {
+            dedup_key: "circuit_open|open".into(),
+            model: "mimo".into(),
+            endpoint: "127.0.0.1:8080".into(),
+            error: "provider circuit open · retrying in 20000ms".into(),
+            error_class: "circuit_open".into(),
+            status: None,
+            circuit: "open".into(),
+        });
+
+        assert_eq!(app.entries.len(), 1);
+        let card = &app.entries[0];
+        assert!(card.glyph == "⚡");
+        assert!(card.text.contains("/retry"), "card offers a recovery action");
+        // Layout/selection is preserved when the card lands.
+        assert_eq!(app.dash.focus, before, "error must not reset the selection");
     }
 }
