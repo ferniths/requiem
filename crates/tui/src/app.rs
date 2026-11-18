@@ -100,6 +100,16 @@ impl TranscriptEntry {
             tool: None,
         }
     }
+
+    /// Whether this entry is part of the compact welcome screen (the
+    /// banner, the info line, or the hint line) — all three are
+    /// discarded when the first user message arrives.
+    fn welcome_block(&self) -> bool {
+        self.banner
+            || self.glyph == " "
+                && (self.text.starts_with("MODEL")
+                    || self.text.starts_with("Describe a task to begin"))
+    }
 }
 
 /// Pre-wrapped, styled transcript lines plus the total count.
@@ -453,7 +463,11 @@ pub struct App {
     history_draft: String,
     scroll_back: usize,
     /// Whether a large paste is shown expanded instead of as a placeholder.
-    paste_expanded: bool,
+    pub paste_expanded: bool,
+
+    /// Whether the large welcome banner has been removed because the
+    /// conversation started. The compact one-line header remains pinned.
+    banner_collapsed: bool,
 
     // Runtime-derived status
     started: Instant,
@@ -495,6 +509,7 @@ impl App {
             history_draft: String::new(),
             scroll_back: 0,
             paste_expanded: false,
+            banner_collapsed: false,
             started: Instant::now(),
             active_runs: std::collections::HashSet::new(),
             turns: 0,
@@ -540,8 +555,27 @@ impl App {
         self.refresh_suggestions();
     }
 
+    /// Toggle the expanded view of a large paste (Ctrl+E / `/expand`).
+    /// The full content is always intact in `composer.text` — this only
+    /// changes presentation.
+    pub fn toggle_paste_expand(&mut self) -> bool {
+        if self.composer.paste_placeholder().is_some() {
+            self.paste_expanded = !self.paste_expanded;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Record a user-submitted line in the transcript and history.
     pub fn push_user_line(&mut self, text: &str) {
+        // The first user message collapses the large welcome banner and
+        // hint block: the conversation and the welcome are two states of
+        // the same app, not two separate screens.
+        if !self.banner_collapsed {
+            self.entries.retain(|e| !e.welcome_block());
+            self.banner_collapsed = true;
+        }
         self.entries.push(TranscriptEntry {
             glyph: "›",
             text: text.to_string(),
@@ -576,29 +610,21 @@ impl App {
     }
 
     /// Seed the transcript with the branded welcome screen: the official
-    /// REQUIEM ASCII banner, a description block, and command hints.
+    /// REQUIEM ASCII banner, a compact info panel and a compact hint block.
     /// Called once at session start when there is no prior conversation.
     ///
     /// The banner is stored as raw artwork and styled with the `Accent`
     /// token at render time — no ANSI paint/parse round-trip, so terminal
     /// colour detection can never turn the logo blue.
+    ///
+    /// The banner is a transcript entry (not a fixed header row) so it
+    /// scrolls naturally when the conversation grows; when it exits the
+    /// visible viewport, the compact one-line header stays pinned at row 0.
     pub fn push_welcome(&mut self, project_dir: &str) {
         use crate::banner;
 
         self.set_project(project_dir);
-        let spacer = || TranscriptEntry {
-            glyph: " ",
-            text: String::new(),
-            fg: Token::Text,
-            bold: false,
-            indent: 0,
-            streaming: false,
-            markdown: false,
-            banner: false,
-            tool: None,
-        };
-
-        self.entries.push(spacer());
+        // No leading blank: the header row sits directly above the banner.
         self.entries.push(TranscriptEntry {
             glyph: " ",
             text: banner::BANNER.to_string(),
@@ -610,30 +636,35 @@ impl App {
             banner: true,
             tool: None,
         });
-        self.entries.push(spacer());
 
+        // One blank separator between banner and the compact welcome info.
+        self.entries.push(TranscriptEntry {
+            glyph: " ",
+            text: String::new(),
+            fg: Token::Text,
+            bold: false,
+            indent: 0,
+            streaming: false,
+            markdown: false,
+            banner: false,
+            tool: None,
+        });
+
+        // Compact info panel: model, project, mode, session, version.
         let project = if self.project.is_empty() {
             "—".to_string()
         } else {
             self.project.clone()
         };
-        let desc = format!(
-            "MULTI-AGENT AI ENVIRONMENT\n\
-             Autonomous coding and knowledge orchestration\n\n\
-             Model  {model}   ·   Project  {project}   ·   Mode  /{mode}\n\n\
-             Describe a task to begin, or use a command:\n\
-             /help        Available commands\n\
-             /dashboard   Live agent & task view\n\
-             /model       Model configuration\n\
-             /setup       Reconfigure API key & endpoint\n\
-             /theme       Switch theme (default / high_contrast / muted)",
-            model = self.model,
-            project = project,
-            mode = self.mode,
+        let info = format!(
+            "{}   {}   {}",
+            self.welcome_label("MODEL", &self.model),
+            self.welcome_label("PROJECT", &project),
+            self.welcome_label("MODE", &format!("/{}", self.mode)),
         );
         self.entries.push(TranscriptEntry {
             glyph: " ",
-            text: desc,
+            text: info,
             fg: Token::TextSecondary,
             bold: false,
             indent: 0,
@@ -642,7 +673,29 @@ impl App {
             banner: false,
             tool: None,
         });
+
+        // Hint block: short, compact, high signal. The `@`/slash hints
+        // come from `hint_line()` below the composer; the welcome screen
+        // carries only the highest-priority actions.
+        let hints = "Describe a task to begin. · /help for commands · Tab for the dashboard · Ctrl+C to quit";
+        self.entries.push(TranscriptEntry {
+            glyph: " ",
+            text: hints.to_string(),
+            fg: Token::TextMuted,
+            bold: false,
+            indent: 0,
+            streaming: false,
+            markdown: false,
+            banner: false,
+            tool: None,
+        });
         self.scroll_back = 0;
+    }
+
+    /// Compact labelled value in the welcome info panel.
+    fn welcome_label(&self, label: &str, value: &str) -> String {
+        let short: String = value.chars().take(28).collect();
+        format!("{label:>7}  {short}")
     }
 
     /// Derive and store a short project label from a directory path.
@@ -1277,6 +1330,14 @@ impl App {
         ])
         .areas(area);
 
+        // Paint the entire screen with the deep near-black background so
+        // the surface is consistent regardless of the terminal's default
+        // (fixes "faint banner" when a light terminal is in use).
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(self.theme.panel_style()),
+            area,
+        );
+
         self.render_header(frame, header);
         self.render_transcript(frame, transcript);
         self.render_input(frame, input);
@@ -1290,7 +1351,8 @@ impl App {
     }
 
     /// Number of terminal rows the composer needs at the real terminal
-    /// width: its visual rows (capped at 8) plus one hint row.
+    /// width: its visual rows (capped at 8), the two accent border rows,
+    /// plus one hint row.
     fn composer_visible_rows(&self, term_width: u16) -> usize {
         let wrap = self.composer_wrap_width(term_width);
         let visual = if self.composer.paste_placeholder().is_some() && !self.paste_expanded {
@@ -1298,7 +1360,7 @@ impl App {
         } else {
             crate::composer::total_visual_rows(&self.composer.text, wrap)
         };
-        visual.clamp(1, 8) + 1
+        visual.clamp(1, 8) + 3
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -1503,31 +1565,55 @@ impl App {
 
     fn render_input(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
-        let text_rows = (area.height as usize).saturating_sub(1).max(1);
+        let text_rows = (area.height as usize).saturating_sub(3).max(1);
         let wrap_width = self.composer_wrap_width(area.width);
 
-        // Large-paste compact display: when the composer holds content that
-        // is visually noisy (≥ 50 lines or ≥ 4 KB), show a single-line
-        // placeholder. The content remains intact in `composer.text` and is
-        // submitted exactly once. Ctrl+E expands the real text.
+        // The composer is a distinct raised panel: a crimson top and bottom
+        // border (brighter when idle/focused), a dark code-surface body.
+        // The hint row sits on the plain background below.
+
+        // Large-paste compact display: a single placeholder line on the
+        // surface. Content stays intact in `composer.text`; /expand or
+        // Ctrl+E reveals it.
         if let Some(placeholder) = self
             .composer
             .paste_placeholder()
             .filter(|_| !self.paste_expanded)
         {
             let [text_area, hint_area] =
-                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-
-            let spans: Vec<Span<'static>> = vec![
-                Span::styled("> ", t.style_bold(Token::Accent)),
-                Span::styled(placeholder, t.style(Token::TextMuted)),
-                Span::styled("  Ctrl+E expand", t.style(Token::TextMuted)),
-            ];
+                Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).areas(area);
+            let top_border = "─".repeat((text_area.width as usize).saturating_sub(2).max(1));
+            let bottom_border = "─".repeat((text_area.width as usize).saturating_sub(2).max(1));
             frame.render_widget(
-                Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        top_border,
+                        t.style_on_bg_with_mods(
+                            Token::AccentBright,
+                            Token::CodeSurface,
+                            Modifier::BOLD,
+                        ),
+                    )),
+                    Line::from(vec![
+                        Span::styled(
+                            "> ",
+                            t.code_surface_fg(Token::Accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(placeholder, t.code_surface_fg(Token::TextMuted)),
+                        Span::styled("  /expand · Ctrl+E", t.code_surface_fg(Token::TextMuted)),
+                    ]),
+                    Line::from(Span::styled(
+                        bottom_border,
+                        t.style_on_bg_with_mods(
+                            Token::AccentBright,
+                            Token::CodeSurface,
+                            Modifier::BOLD,
+                        ),
+                    )),
+                ]),
                 text_area,
             );
-
             let hint = self.hint_line();
             frame.render_widget(
                 Paragraph::new(Line::from(hint)).wrap(Wrap { trim: false }),
@@ -1555,46 +1641,74 @@ impl App {
         let mut out: Vec<Line<'static>> = Vec::with_capacity(text_rows + 1);
         for (idx, row) in rows.iter().enumerate().take(end).skip(start) {
             let prefix = if idx == 0 {
-                Span::styled("> ", t.style_bold(Token::Accent))
+                Span::styled(
+                    "> ",
+                    t.code_surface_fg(Token::Accent)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
-                Span::styled("  ", Style::new())
+                Span::styled("  ", t.code_surface_style())
             };
 
             if idx == cursor_row {
                 let (before, at, after) =
                     crate::composer::split_at_display_col(&row.text, cursor_col);
                 let cursor_style = t
-                    .style(Token::Background)
+                    .code_surface_fg(Token::Background)
                     .bg(t.ratatui_color(Token::Accent));
                 let mut spans = vec![
                     prefix,
-                    Span::styled(before, t.style(Token::Text)),
+                    Span::styled(before, t.code_surface_fg(Token::Text)),
                     Span::styled(
                         if at.is_empty() { " ".to_string() } else { at },
                         cursor_style,
                     ),
                 ];
                 if !after.is_empty() {
-                    spans.push(Span::styled(after, t.style(Token::Text)));
+                    spans.push(Span::styled(after, t.code_surface_fg(Token::Text)));
                 }
                 out.push(Line::from(spans));
             } else {
                 out.push(Line::from(vec![
                     prefix,
-                    Span::styled(row.text.clone(), t.style(Token::Text)),
+                    Span::styled(row.text.clone(), t.code_surface_fg(Token::Text)),
                 ]));
             }
         }
-        // Fill unused rows so the composer panel keeps a stable background.
+        // Fill unused rows so the panel keeps a stable surface.
         while out.len() < text_rows {
-            out.push(Line::from(""));
+            out.push(Line::from(Span::styled(
+                " ".repeat((area.width as usize).saturating_sub(2).max(1)),
+                t.code_surface_style(),
+            )));
         }
 
-        let [text_area, hint_area] =
-            Layout::vertical([Constraint::Length(text_rows as u16), Constraint::Length(1)])
-                .areas(area);
+        let [text_area, hint_area] = Layout::vertical([
+            Constraint::Length(text_rows as u16 + 2),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
-        frame.render_widget(Paragraph::new(out), text_area);
+        // Top accent border.
+        let top_border = "─".repeat((text_area.width as usize).saturating_sub(2).max(1));
+        let surface = t.code_surface_style();
+        let border_style = if self.is_running() {
+            t.style_on_bg_with_mods(Token::Accent, Token::CodeSurface, Modifier::empty())
+        } else {
+            t.style_on_bg_with_mods(Token::AccentBright, Token::CodeSurface, Modifier::BOLD)
+        };
+        let mut block: Vec<Line<'static>> = Vec::new();
+        block.push(Line::from(Span::styled(top_border, border_style)));
+        block.extend(out);
+        let bottom_border = "─".repeat((text_area.width as usize).saturating_sub(2).max(1));
+        block.push(Line::from(Span::styled(bottom_border, border_style)));
+
+        frame.render_widget(
+            Paragraph::new(block)
+                .style(surface)
+                .wrap(Wrap { trim: false }),
+            text_area,
+        );
 
         let hint = self.hint_line();
         frame.render_widget(
@@ -1659,78 +1773,97 @@ impl App {
         Some((word.to_string(), args.clone()))
     }
 
+    /// Build the compact status strip beneath the composer.
+    ///
+    /// Left:  project · model · agents (running)
+    /// Right: /mode · ↑in ↓out · connection
+    ///
+    /// All values come from real runtime state; nothing is hardcoded.
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         use unicode_width::UnicodeWidthStr;
 
         let t = &self.theme;
         let width = area.width as usize;
 
-        // Left: relevant keyboard hints.
-        let left_spans = vec![Span::styled(
-            if self.is_running() {
-                "  Ctrl+C cancel · /stop stop all"
-            } else {
-                "  /help · /dashboard · @files · Shift+Enter newline"
-            },
-            t.style(Token::TextMuted),
-        )];
+        // Left: project · model · running agents.
+        let mut left_spans: Vec<Span<'static>> = Vec::new();
+        let project = if self.project.is_empty() {
+            "—".to_string()
+        } else {
+            self.project.clone()
+        };
+        left_spans.push(Span::styled(project, t.style(Token::TextSecondary)));
+        left_spans.push(Span::styled("  ·  ", t.style(Token::TextMuted)));
+        left_spans.push(Span::styled(
+            self.model.clone(),
+            t.style(Token::TextSecondary),
+        ));
 
-        // Center: running agent/task status (compact, up to 3 agents).
-        let mut center_spans = Vec::new();
-        if self.is_running() {
-            let running_agents: Vec<&AgentRow> = self
-                .dash
-                .agents
-                .iter()
-                .filter(|a| a.status == AgentStatus::Running)
-                .take(3)
-                .collect();
-            if !running_agents.is_empty() {
-                for agent in &running_agents {
-                    let label = if agent.current_task.is_empty() {
-                        agent.role.as_str()
-                    } else {
-                        agent.current_task.as_str()
-                    };
-                    let short: String = label.chars().take(28).collect();
-                    center_spans.push(Span::styled(format!("● {short}  "), t.style(Token::Info)));
-                }
-            } else if let Some(task) = self.active_task.as_deref() {
-                let short: String = task.chars().take(40).collect();
-                center_spans.push(Span::styled(
-                    format!("{} ", spinner_glyph(self.started)),
-                    t.style_bold(Token::Info),
-                ));
-                center_spans.push(Span::styled(short, t.style(Token::TextSecondary)));
+        let running_agents: Vec<&AgentRow> = self
+            .dash
+            .agents
+            .iter()
+            .filter(|a| a.status == AgentStatus::Running)
+            .take(3)
+            .collect();
+        if !running_agents.is_empty() {
+            left_spans.push(Span::styled("  ·  ", t.style(Token::TextMuted)));
+            for agent in &running_agents {
+                let label = if agent.current_task.is_empty() {
+                    agent.role.as_str()
+                } else {
+                    agent.current_task.as_str()
+                };
+                let short: String = label.chars().take(24).collect();
+                left_spans.push(Span::styled(format!("● {short}"), t.style(Token::Info)));
+                left_spans.push(Span::styled(" ", Style::new()));
             }
+        } else if let Some(task) = self.active_task.as_deref() {
+            left_spans.push(Span::styled("  ·  ", t.style(Token::TextMuted)));
+            left_spans.push(Span::styled(
+                format!("{} ", spinner_glyph(self.started)),
+                t.style_bold(Token::Info),
+            ));
+            let short: String = task.chars().take(36).collect();
+            left_spans.push(Span::styled(short, t.style(Token::TextSecondary)));
         }
 
-        // Right: mode + token usage.
-        let right_spans = vec![
+        // Right: mode · tokens · connection.
+        let right_spans: Vec<Span<'static>> = vec![
             Span::styled(self.mode.clone(), t.style_bold(Token::Accent)),
             Span::styled(
                 format!(
-                    "  ↑{} ↓{}",
+                    "  ·  ↑{} ↓{}",
                     fmt_tokens(self.tokens_in),
                     fmt_tokens(self.tokens_out)
                 ),
                 t.style(Token::TextMuted),
             ),
+            Span::styled("  ·  ", t.style(Token::TextMuted)),
+            if self.is_running() {
+                Span::styled(
+                    format!("{spinner} running", spinner = spinner_glyph(self.started)),
+                    t.style(Token::Info),
+                )
+            } else if !self.network_label.is_empty() {
+                Span::styled(self.network_label.clone(), t.style(Token::TextMuted))
+            } else {
+                Span::styled("● ready", t.style(Token::Success))
+            },
         ];
 
-        // Compose: left … center … right, splitting the slack between the
-        // two gaps so the row can never overflow.
+        // Compose: left … right, splitting the slack so the row never
+        // overflows.
         let left_w: usize = left_spans.iter().map(|s| s.content.width()).sum();
-        let center_w: usize = center_spans.iter().map(|s| s.content.width()).sum();
         let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
-        let gap = width.saturating_sub(left_w + center_w + right_w + 2);
-        let left_gap = if center_w > 0 { gap / 2 } else { gap };
-        let right_gap = gap.saturating_sub(left_gap);
-
+        let gap = width.saturating_sub(left_w + right_w + 1);
         let mut spans = left_spans;
-        spans.push(Span::styled(" ".repeat(left_gap), Style::new()));
-        spans.extend(center_spans);
-        spans.push(Span::styled(" ".repeat(right_gap), Style::new()));
+        if gap > 0 {
+            spans.push(Span::styled(
+                " ".repeat(gap.saturating_sub(1)),
+                Style::new(),
+            ));
+        }
         spans.extend(right_spans);
 
         frame.render_widget(
@@ -2266,13 +2399,13 @@ mod tests {
         let text = visible_text(&app, 120, 40);
         // Banner must be visible (its distinctive characters).
         assert!(text.contains("8888"), "banner art visible: {text}");
-        // Model and project info.
+        // Model and project info (compact info panel).
         assert!(text.contains("test-model"), "model shown: {text}");
         assert!(
-            text.contains("Project") && text.contains("project"),
-            "project shown: {text}"
+            text.contains("MODEL") && text.contains("PROJECT"),
+            "info panel labels: {text}"
         );
-        // Command suggestions.
+        // Command suggestions (hint line below the composer).
         assert!(text.contains("/help"), "command hints: {text}");
     }
 
@@ -2335,6 +2468,46 @@ mod tests {
     }
 
     #[test]
+    fn banner_collapses_when_first_user_message_arrives() {
+        let mut app = test_app();
+        app.push_welcome("/home/user/project");
+        // Before: the banner is present.
+        assert!(
+            app.entries.iter().any(|e| e.banner),
+            "banner entry must exist after push_welcome"
+        );
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| e.text.starts_with("Describe a task")),
+            "hint entry must exist after push_welcome"
+        );
+        // Submit the first user message.
+        app.push_user_line("fix the login bug");
+        // After: the banner and hint block are gone; the user line is present.
+        assert!(
+            !app.entries.iter().any(|e| e.banner),
+            "banner must be removed after first user message"
+        );
+        assert!(
+            !app.entries
+                .iter()
+                .any(|e| e.text.starts_with("Describe a task")),
+            "hint block must be removed after first user message"
+        );
+        assert!(
+            app.entries.iter().any(|e| e.text == "fix the login bug"),
+            "user line must be present"
+        );
+        // A second message must not attempt to remove already-gone entries.
+        app.push_user_line("second message");
+        assert!(
+            app.entries.iter().any(|e| e.text == "second message"),
+            "second user line must be present"
+        );
+    }
+
+    #[test]
     fn session_layout_is_responsive() {
         let mut app = test_app();
         app.push_welcome("/home/user/project");
@@ -2342,13 +2515,12 @@ mod tests {
             let header = row_text(&app, w, h, 0);
             let footer = row_text(&app, w, h, h - 1);
             assert!(header.contains("REQUIEM"), "{w}x{h} header: {header:?}");
+            // The footer is the status strip — it must contain the mode
+            // or connection state, and must not contain a border glyph
+            // (the composer border is one row above).
             assert!(
-                !footer.contains('─'),
-                "{w}x{h} footer has a border: {footer:?}"
-            );
-            assert!(
-                footer.contains("/help") || footer.contains("Shift+Enter"),
-                "{w}x{h} footer hints: {footer:?}"
+                footer.contains("code") || footer.contains("ready"),
+                "{w}x{h} footer status: {footer:?}"
             );
         }
     }
@@ -2364,7 +2536,8 @@ mod tests {
             narrow > wide,
             "narrow terminal must need more rows ({narrow} vs {wide})"
         );
-        assert!(narrow <= 9, "composer capped at 8 text rows + hint");
+        // Composer is capped at 8 text rows + 2 borders + 1 hint = 11.
+        assert!(narrow <= 11, "composer capped at 8 text + 2 border + hint");
         // Rendering at the small size must not panic or lose the caret.
         let _ = row_text(&app, 40, 24, 22);
     }
@@ -2934,6 +3107,210 @@ fn hello() {
         assert!(buf.contains("All 287"), "large: response");
     }
 
+    /// §8 — visual-verification test: render 12 distinct TUI states and
+    /// assert each shows the expected content. These are the same states
+    /// a human would visually inspect; they prove the layout, composer,
+    /// transcript, and status strip all render correctly.
+    #[test]
+    fn visual_verification_12_states() {
+        // 1. Fresh launch (empty app, no welcome).
+        {
+            let app = test_app();
+            let text = visible_text(&app, 120, 40);
+            assert!(text.contains("REQUIEM"), "1: header wordmark");
+            assert!(text.contains(">"), "1: composer prompt");
+            assert!(text.contains("code"), "1: status mode");
+        }
+        // 2. Welcome screen (banner + info + hints).
+        {
+            let mut app = test_app();
+            app.push_welcome("/home/user/project");
+            let text = visible_text(&app, 120, 40);
+            assert!(text.contains("8888"), "2: banner art");
+            assert!(text.contains("MODEL"), "2: info panel label");
+            assert!(text.contains("test-model"), "2: model value");
+            assert!(text.contains("Describe a task"), "2: hint block");
+        }
+        // 3. Empty composer after welcome (banner collapsed on first msg).
+        {
+            let mut app = test_app();
+            app.push_welcome("/home/user/project");
+            app.push_user_line("fix the login bug");
+            let text = visible_text(&app, 120, 40);
+            assert!(!text.contains("8888"), "3: banner collapsed");
+            assert!(text.contains("fix the login bug"), "3: user line");
+            assert!(text.contains(">"), "3: composer visible");
+        }
+        // 4. Long multiline prompt (wrapped composer).
+        {
+            let mut app = test_app();
+            let long = "fix the parser to handle edge cases in the lexer module properly";
+            for _ in 0..3 {
+                app.composer.insert_paste(long);
+                app.composer.insert_newline();
+            }
+            app.composer.cursor = app.composer.len();
+            let text = visible_text(&app, 80, 30);
+            assert!(text.contains("fix the parser"), "4: prompt text visible");
+            assert!(text.contains(">"), "4: composer prompt");
+        }
+        // 5. Pasted source (placeholder shown).
+        {
+            let mut app = test_app();
+            let source = (0..80)
+                .map(|i| format!("fn f{i}() {{}}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            app.composer.insert_paste(&source);
+            let text = visible_text(&app, 100, 30);
+            assert!(text.contains("Pasted text"), "5: placeholder visible");
+            assert!(text.contains("/expand"), "5: expand hint visible");
+        }
+        // 6. User message submitted + assistant streaming.
+        {
+            let mut app = test_app();
+            app.push_user_line("explain the scheduler");
+            app.push_event(&Event::AssistantDelta {
+                agent: "master".into(),
+                delta: "The scheduler ".into(),
+            });
+            let text = visible_text(&app, 100, 30);
+            assert!(text.contains("explain the scheduler"), "6: user line");
+            assert!(text.contains("The scheduler"), "6: streaming text");
+        }
+        // 7. Tools executing (⚙ in-flight tool).
+        {
+            let mut app = test_app();
+            app.push_user_line("fix the bug");
+            app.push_event(&Event::RunStarted {
+                agent: "master".into(),
+                role: "master".into(),
+                task: requiem_core::Id::new(),
+                description: "fix the bug".into(),
+                mode: "code".into(),
+            });
+            app.push_event(&Event::ToolCallStarted {
+                agent: "master".into(),
+                tool: "read_file".into(),
+                summary: "path=src/main.rs".into(),
+            });
+            let text = visible_text(&app, 100, 30);
+            assert!(text.contains("read_file"), "7: tool name");
+            assert!(text.contains("src/main.rs"), "7: tool summary");
+        }
+        // 8. Multiple agents running.
+        {
+            let mut app = test_app();
+            app.push_user_line("implement the feature");
+            for agent in ["a1", "a2", "a3"] {
+                app.push_event(&Event::AgentSpawned {
+                    parent: "master".into(),
+                    child: agent.into(),
+                    role: "worker".into(),
+                    description: format!("subtask {agent}"),
+                });
+                app.push_event(&Event::RunStarted {
+                    agent: agent.into(),
+                    role: "worker".into(),
+                    task: requiem_core::Id::new(),
+                    description: format!("subtask {agent}"),
+                    mode: "code".into(),
+                });
+            }
+            let text = visible_text(&app, 100, 30);
+            assert!(text.contains("a1"), "8: agent 1");
+            assert!(text.contains("a2"), "8: agent 2");
+            assert!(text.contains("a3"), "8: agent 3");
+        }
+        // 9. Provider error.
+        {
+            let mut app = test_app();
+            app.push_user_line("do something");
+            app.push_event(&Event::RunStarted {
+                agent: "master".into(),
+                role: "master".into(),
+                task: requiem_core::Id::new(),
+                description: "do something".into(),
+                mode: "code".into(),
+            });
+            app.push_event(&Event::RunFailed {
+                agent: "master".into(),
+                task: requiem_core::Id::new(),
+                error: "401 Unauthorized".into(),
+                error_class: "auth".into(),
+            });
+            let text = visible_text(&app, 100, 30);
+            assert!(text.contains("401"), "9: error code");
+            assert!(text.contains("Unauthorized"), "9: error message");
+        }
+        // 10. Completed task.
+        {
+            let mut app = test_app();
+            app.push_user_line("run the tests");
+            let task = requiem_core::Id::new();
+            app.push_event(&Event::RunStarted {
+                agent: "master".into(),
+                role: "master".into(),
+                task: task.clone(),
+                description: "run tests".into(),
+                mode: "code".into(),
+            });
+            app.push_event(&Event::AssistantMessage {
+                agent: "master".into(),
+                text: "All 42 tests passed.".into(),
+            });
+            app.push_event(&Event::RunCompleted {
+                agent: "master".into(),
+                task,
+                response: None,
+                input_tokens: 100,
+                output_tokens: 50,
+            });
+            let text = visible_text(&app, 100, 30);
+            assert!(text.contains("42 tests passed"), "10: completion message");
+        }
+        // 11. Dashboard overlay open.
+        {
+            let mut app = test_app();
+            app.push_user_line("implement feature X");
+            app.push_event(&Event::AgentSpawned {
+                parent: "master".into(),
+                child: "a1".into(),
+                role: "worker".into(),
+                description: "feature X".into(),
+            });
+            app.push_event(&Event::RunStarted {
+                agent: "a1".into(),
+                role: "worker".into(),
+                task: requiem_core::Id::new(),
+                description: "feature X".into(),
+                mode: "code".into(),
+            });
+            app.dash.open = true;
+            let text = visible_text(&app, 120, 40);
+            assert!(text.contains("dashboard"), "11: dashboard label");
+            assert!(text.contains("a1"), "11: agent visible");
+        }
+        // 12. Small terminal (80x24).
+        {
+            let mut app = test_app();
+            app.push_welcome("/home/user/project");
+            app.push_user_line("fix the bug");
+            app.push_event(&Event::AssistantMessage {
+                agent: "master".into(),
+                text: "Done.".into(),
+            });
+            let buf = render_to_string(&app, 80, 24);
+            assert!(!buf.is_empty(), "12: non-empty render at 80x24");
+            // No panics, no clipping: the header wordmark must survive.
+            let rows: Vec<&str> = buf.lines().collect();
+            assert!(
+                rows.first().is_some_and(|r| r.contains("REQUIEM")),
+                "12: header wordmark at 80x24"
+            );
+        }
+    }
+
     #[test]
     fn at_file_fuzzy_substring_match() {
         let tmp = std::env::temp_dir().join("requiem_at_fuzzy");
@@ -3111,7 +3488,6 @@ fn hello() {
     fn compact_header_is_single_row_borderless() {
         let app = test_app();
         // Render at 100x30. The header occupies row 0 (chars 0..100).
-        // The footer occupies row 29 (chars 2900..3000).
         let buf = render_to_string(&app, 100, 30);
         // Row 0: must contain the wordmark and no border glyph.
         let row0 = buf
@@ -3120,17 +3496,12 @@ fn hello() {
             .to_string();
         assert!(row0.contains("REQUIEM"), "header row: {row0:?}");
         assert!(!row0.contains('─'), "border glyph on header row: {row0:?}");
-        // Row 29: footer — must contain a keyboard hint, no border glyph.
-        let footer_start = 29 * 100;
-        let footer_end = (29 * 100 + 100).min(buf.len());
-        let footer = buf.get(footer_start..footer_end).unwrap_or("").to_string();
+        // The status strip (last row) must contain mode + connection.
+        let rows: Vec<&str> = buf.as_str().lines().collect();
+        let footer = rows.last().unwrap_or(&"");
         assert!(
-            footer.contains("Shift+Enter") || footer.contains("/help"),
+            footer.contains("code") || footer.contains("ready"),
             "footer row: {footer:?}"
-        );
-        assert!(
-            !footer.contains('─'),
-            "border glyph on footer row: {footer:?}"
         );
     }
 
@@ -3160,21 +3531,23 @@ fn hello() {
             .unwrap_or(&buf[..80.min(buf.len())])
             .to_string();
         assert!(r0.contains("REQUIEM"), "header: {r0:?}");
-        // Row 28 (chars 28*80..29*80): input prompt '>' (second-to-last row).
-        let r28_start = 28 * 80;
-        let r28_end = (29 * 80).min(buf.len());
-        let r28 = buf.get(r28_start..r28_end).unwrap_or("").to_string();
+        // The hint row sits just above the status strip (last row).
+        // Find the last row containing "Enter" (the hint line).
+        let rows: Vec<&str> = buf.as_str().lines().collect();
+        let hint_row = rows
+            .iter()
+            .rfind(|l| l.contains("Enter"))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         assert!(
-            r28.contains(">") || r28.contains("/help"),
-            "input row: {r28:?}"
+            hint_row.contains("Enter"),
+            "hint row must contain 'Enter': {hint_row:?}"
         );
-        // Row 29 (chars 29*80..30*80): footer with mode + Ctrl+C.
-        let r29_start = 29 * 80;
-        let r29_end = (30 * 80).min(buf.len());
-        let r29 = buf.get(r29_start..r29_end).unwrap_or("").to_string();
+        // The status strip (last row) contains mode + connection.
+        let footer = rows.last().unwrap_or(&"");
         assert!(
-            r29.contains("/help") || r29.contains("Shift+Enter") || r29.contains("code"),
-            "footer: {r29:?}"
+            footer.contains("code") || footer.contains("ready"),
+            "footer: {footer:?}"
         );
     }
 

@@ -209,9 +209,10 @@ pub async fn run_session(
                 &http,
                 config.network.proxy_timeout_ms,
             ));
-            Some(Arc::new(
-                requiem_networking::ProxyPool::new(config.network.clone(), health_checker),
-            ))
+            Some(Arc::new(requiem_networking::ProxyPool::new(
+                config.network.clone(),
+                health_checker,
+            )))
         } else {
             None
         };
@@ -1021,15 +1022,30 @@ async fn dispatch_slash(
             });
             Directive::Continue
         }
+        "expand" => {
+            let changed = app.toggle_paste_expand();
+            if changed {
+                app.push_system(
+                    if app.paste_expanded {
+                        "showing full pasted content"
+                    } else {
+                        "collapsed to paste placeholder"
+                    },
+                    NoticeLevel::Info,
+                );
+            } else {
+                app.push_system(
+                    "no large paste to expand — composer is empty or below the placeholder threshold",
+                    NoticeLevel::Info,
+                );
+            }
+            Directive::Continue
+        }
         "theme" => {
             if rest.is_empty() {
                 let mut out = String::from("themes (use /theme <name>):");
                 for name in THEME_NAMES {
-                    let mark = if *name == config.theme {
-                        " ✓"
-                    } else {
-                        ""
-                    };
+                    let mark = if *name == config.theme { " ✓" } else { "" };
                     out.push_str(&format!("\n  {name}{mark}"));
                 }
                 app.push_system(&out, NoticeLevel::Info);
@@ -1142,13 +1158,11 @@ async fn dispatch_slash(
                     match pool {
                         Some(p) => {
                             let cfg = p.config().await;
-                            let mut out = String::from(
-                                if cfg.proxy_enabled {
-                                    "proxy pool: ENABLED — strategy "
-                                } else {
-                                    "proxy pool: DISABLED — "
-                                },
-                            );
+                            let mut out = String::from(if cfg.proxy_enabled {
+                                "proxy pool: ENABLED — strategy "
+                            } else {
+                                "proxy pool: DISABLED — "
+                            });
                             out.push_str(&cfg.strategy.to_string());
                             out.push_str(&format!(" · {} endpoints", cfg.endpoints.len()));
                             for ep in &cfg.endpoints {
@@ -1214,7 +1228,8 @@ async fn dispatch_slash(
                         } else {
                             let mut out = String::from("proxy health check:");
                             for (ep, status, latency) in &results {
-                                let lat = latency.map(|ms| format!(" ({ms}ms)")).unwrap_or_default();
+                                let lat =
+                                    latency.map(|ms| format!(" ({ms}ms)")).unwrap_or_default();
                                 out.push_str(&format!(
                                     "\n  {} — {}{lat}",
                                     ep.redacted_url(),
@@ -1229,15 +1244,9 @@ async fn dispatch_slash(
                 }
                 Some("add") => {
                     // /proxy add <url> [provider] — parse the remaining args
-                    let args: Vec<&str> = rest
-                        .split_whitespace()
-                        .skip(1)
-                        .collect();
+                    let args: Vec<&str> = rest.split_whitespace().skip(1).collect();
                     if args.is_empty() {
-                        app.push_system(
-                            "usage: /proxy add <url> [provider]",
-                            NoticeLevel::Warning,
-                        );
+                        app.push_system("usage: /proxy add <url> [provider]", NoticeLevel::Warning);
                     } else {
                         let url = args[0].to_string();
                         let provider = args.get(1).unwrap_or(&"custom").to_string();
@@ -1257,7 +1266,9 @@ async fn dispatch_slash(
                         if let Some(p) = pool {
                             p.add_endpoint(ep).await;
                             app.push_system(
-                                &format!("added proxy {id} — {display_url} (run /proxy test to verify)"),
+                                &format!(
+                                    "added proxy {id} — {display_url} (run /proxy test to verify)"
+                                ),
                                 NoticeLevel::Success,
                             );
                         } else {
@@ -1277,15 +1288,27 @@ async fn dispatch_slash(
                             Ok(id) => {
                                 if let Some(p) = pool {
                                     if p.remove_endpoint(&id).await {
-                                        app.push_system(&format!("removed proxy {id}"), NoticeLevel::Success);
+                                        app.push_system(
+                                            &format!("removed proxy {id}"),
+                                            NoticeLevel::Success,
+                                        );
                                     } else {
-                                        app.push_system(&format!("proxy {id} not found"), NoticeLevel::Warning);
+                                        app.push_system(
+                                            &format!("proxy {id} not found"),
+                                            NoticeLevel::Warning,
+                                        );
                                     }
                                 } else {
-                                    app.push_system("proxy pool not attached", NoticeLevel::Warning);
+                                    app.push_system(
+                                        "proxy pool not attached",
+                                        NoticeLevel::Warning,
+                                    );
                                 }
                             }
-                            Err(_) => app.push_system("invalid UUID — usage: /proxy remove <id>", NoticeLevel::Warning),
+                            Err(_) => app.push_system(
+                                "invalid UUID — usage: /proxy remove <id>",
+                                NoticeLevel::Warning,
+                            ),
                         }
                     }
                 }
@@ -1300,7 +1323,10 @@ async fn dispatch_slash(
                 Some("disable") => {
                     if let Some(p) = pool {
                         p.set_proxy_enabled(false).await;
-                        app.push_system("proxy routing disabled — using direct connection", NoticeLevel::Success);
+                        app.push_system(
+                            "proxy routing disabled — using direct connection",
+                            NoticeLevel::Success,
+                        );
                     } else {
                         app.push_system("proxy pool not attached", NoticeLevel::Warning);
                     }
@@ -1312,7 +1338,10 @@ async fn dispatch_slash(
                                 &format!("rotated to {} — {}", ep.provider, ep.redacted_url()),
                                 NoticeLevel::Success,
                             ),
-                            None => app.push_system("no healthy endpoints to rotate to", NoticeLevel::Warning),
+                            None => app.push_system(
+                                "no healthy endpoints to rotate to",
+                                NoticeLevel::Warning,
+                            ),
                         }
                     } else {
                         app.push_system("proxy pool not attached", NoticeLevel::Warning);
@@ -1344,7 +1373,12 @@ async fn dispatch_slash(
                 Some("refresh") => {
                     if let Some(p) = pool {
                         let results = p.health_check_all().await;
-                        let ok = results.iter().filter(|(_, s, _)| matches!(s, requiem_networking::HealthStatus::Healthy)).count();
+                        let ok = results
+                            .iter()
+                            .filter(|(_, s, _)| {
+                                matches!(s, requiem_networking::HealthStatus::Healthy)
+                            })
+                            .count();
                         app.push_system(
                             &format!("refreshed health: {ok}/{} endpoints OK", results.len()),
                             NoticeLevel::Success,
@@ -1357,9 +1391,15 @@ async fn dispatch_slash(
                     let args: Vec<&str> = rest.split_whitespace().skip(1).collect();
                     if let Some(strategy_str) = args.first() {
                         let strategy = match strategy_str.to_lowercase().as_str() {
-                            "round-robin" | "roundrobin" => requiem_networking::SelectionStrategy::RoundRobin,
-                            "lowest-latency" | "lowest" => requiem_networking::SelectionStrategy::LowestLatency,
-                            "health" | "health-based" => requiem_networking::SelectionStrategy::HealthBased,
+                            "round-robin" | "roundrobin" => {
+                                requiem_networking::SelectionStrategy::RoundRobin
+                            }
+                            "lowest-latency" | "lowest" => {
+                                requiem_networking::SelectionStrategy::LowestLatency
+                            }
+                            "health" | "health-based" => {
+                                requiem_networking::SelectionStrategy::HealthBased
+                            }
                             "manual" => requiem_networking::SelectionStrategy::Manual,
                             _ => {
                                 app.push_system(
@@ -1371,14 +1411,20 @@ async fn dispatch_slash(
                         };
                         if let Some(p) = pool {
                             p.set_strategy(strategy).await;
-                            app.push_system(&format!("strategy → {strategy}"), NoticeLevel::Success);
+                            app.push_system(
+                                &format!("strategy → {strategy}"),
+                                NoticeLevel::Success,
+                            );
                         } else {
                             app.push_system("proxy pool not attached", NoticeLevel::Warning);
                         }
                     } else {
                         if let Some(p) = pool {
                             let cfg = p.config().await;
-                            app.push_system(&format!("strategy: {}", cfg.strategy), NoticeLevel::Info);
+                            app.push_system(
+                                &format!("strategy: {}", cfg.strategy),
+                                NoticeLevel::Info,
+                            );
                         } else {
                             app.push_system("proxy pool not attached", NoticeLevel::Warning);
                         }
@@ -1837,7 +1883,11 @@ async fn run_plain(
                     );
                 }
                 "project" => {
-                    match std::env::current_dir().ok().as_deref().and_then(requiem_project::detect) {
+                    match std::env::current_dir()
+                        .ok()
+                        .as_deref()
+                        .and_then(requiem_project::detect)
+                    {
                         Some(profile) => {
                             println!(
                                 "  project — ecosystem: {} · git: {} · languages: {}",

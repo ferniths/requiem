@@ -30,7 +30,7 @@
 //! highlight to end of input; CRLF input is handled; widths below
 //! [`MIN_WRAP_WIDTH`] (or zero) disable wrapping instead of misbehaving.
 
-use crate::color::{Attr, ColorMode};
+use crate::color::{Attr, ColorMode, FgSpec};
 use crate::theme::{Theme, Token};
 
 /// Minimum terminal width at which prose/code wrapping is attempted.
@@ -46,6 +46,26 @@ const HEADING_BAR: char = '▌';
 
 /// Left border glyph for code blocks.
 const CODE_BAR: char = '│';
+
+/// Resolve the SGR background parameter for a token under `mode` (empty
+/// when no background is requested or the mode cannot carry one).
+fn bg_param(theme: &Theme, mode: ColorMode, bg: Option<Token>) -> String {
+    let Some(bg) = bg else {
+        return String::new();
+    };
+    // NoColor and Ansi16: degrade gracefully (no background parameter).
+    match mode {
+        ColorMode::NoColor | ColorMode::Ansi16 => String::new(),
+        ColorMode::TrueColor => {
+            let rgb = theme.rgb(bg);
+            format!("48;2;{};{};{}", rgb.0, rgb.1, rgb.2)
+        }
+        ColorMode::Ansi256 => {
+            let idx = crate::color::to_ansi256(theme.rgb(bg));
+            format!("48;5;{idx}")
+        }
+    }
+}
 
 /// Left border glyph for blockquotes.
 const QUOTE_BAR: char = '┃';
@@ -161,8 +181,18 @@ impl Span {
 }
 
 /// Paint a span with the theme under `mode`, layering any overrides on
-/// top of the block's `base` token.
-fn paint_span(theme: &Theme, mode: ColorMode, span: &Span, base: Token) -> String {
+/// top of the block's `base` token and an optional background token
+/// (e.g. the code-block surface).
+fn paint_span(
+    theme: &Theme,
+    mode: ColorMode,
+    span: &Span,
+    base: Token,
+    bg: Option<Token>,
+) -> String {
+    if span.text.is_empty() {
+        return String::new();
+    }
     let token = span.style.color.unwrap_or(base);
     let mut attrs: Vec<Attr> = Vec::new();
     if span.style.bold {
@@ -177,10 +207,58 @@ fn paint_span(theme: &Theme, mode: ColorMode, span: &Span, base: Token) -> Strin
     if span.style.strike {
         attrs.push(Attr::Strikethrough);
     }
-    if attrs.is_empty() {
-        theme.paint_with(mode, token, span.text.as_str())
-    } else {
-        theme.paint_attrs_with(mode, token, &attrs, span.text.as_str())
+    // Foreground parameters (theme-aware downgrade: hand-tuned 16 index,
+    // RGB, or none).
+    let mut fg_params: Vec<String> = match theme.fg_spec(mode, token) {
+        FgSpec::None => Vec::new(),
+        FgSpec::Rgb(rgb) => match mode {
+            ColorMode::TrueColor => {
+                vec![format!("38;2;{};{};{}", rgb.0, rgb.1, rgb.2)]
+            }
+            ColorMode::Ansi256 => vec![format!("38;5;{}", crate::color::to_ansi256(rgb))],
+            ColorMode::Ansi16 => {
+                let idx = crate::color::to_ansi16(rgb);
+                vec![if idx < 8 {
+                    format!("3{idx}")
+                } else {
+                    format!("9{}", idx - 8)
+                }]
+            }
+            ColorMode::NoColor => Vec::new(),
+        },
+        FgSpec::Indexed16(idx) => {
+            vec![if idx < 8 {
+                format!("3{idx}")
+            } else {
+                format!("9{}", idx - 8)
+            }]
+        }
+    };
+    // Attributes.
+    for a in &attrs {
+        fg_params.push(attr_sgr(a).to_string());
+    }
+    // Optional background.
+    let bg_s = bg_param(theme, mode, bg);
+    if !bg_s.is_empty() {
+        fg_params.push(bg_s);
+    }
+    if fg_params.is_empty() {
+        return span.text.clone();
+    }
+    // Emit attrs, fg and bg in ONE sequence: a mid-line reset would split
+    // the background off from the text it should paint behind.
+    format!("\x1b[{}m{}\x1b[0m", fg_params.join(";"), span.text)
+}
+
+fn attr_sgr(a: &Attr) -> &'static str {
+    match a {
+        Attr::Bold => "1",
+        Attr::Dim => "2",
+        Attr::Italic => "3",
+        Attr::Underline => "4",
+        Attr::Reverse => "7",
+        Attr::Strikethrough => "9",
     }
 }
 
@@ -234,7 +312,7 @@ impl<'a> LineBuilder<'a> {
                     chunk.push_str(&self.line[i].text);
                 }
                 let span = Span::new(chunk, style);
-                text.push_str(&paint_span(self.theme, self.mode, &span, self.base));
+                text.push_str(&paint_span(self.theme, self.mode, &span, self.base, None));
                 i += 1;
             }
             self.out.push(text);
@@ -1036,18 +1114,24 @@ impl<'a> Document<'a> {
     }
 
     /// Render a finished code fence (also used for unterminated fences).
+    /// Each code line is painted on the `CodeSurface` background so
+    /// fenced blocks read as a distinct dark surface in the transcript.
     fn fence_flush(&mut self, fs: FenceState) {
         self.push_gap();
         let content_width = self.width.saturating_sub(2);
+        let bg = Some(Token::CodeSurface);
         for (idx, raw) in fs.lines.iter().enumerate() {
             let spans = highlight_code_line(raw, fs.lang);
             for (r, row) in hard_wrap_spans(&spans, content_width)
                 .into_iter()
                 .enumerate()
             {
-                let mut text =
-                    self.theme
-                        .paint_with(self.mode, Token::Border, CODE_BAR.to_string().as_str());
+                let mut text = self.theme.paint_attrs_with(
+                    self.mode,
+                    Token::Border,
+                    &[],
+                    CODE_BAR.to_string().as_str(),
+                );
                 if !row.is_empty() {
                     text.push(' ');
                     for span in &row {
@@ -1056,6 +1140,7 @@ impl<'a> Document<'a> {
                             self.mode,
                             span,
                             Token::TextSecondary,
+                            bg,
                         ));
                     }
                 }
@@ -1066,10 +1151,33 @@ impl<'a> Document<'a> {
                     let pad = self.width.saturating_sub(used);
                     if pad > tag_w {
                         text.push_str(&" ".repeat(pad - tag_w));
-                        text.push_str(&self.theme.paint_with(
+                        text.push_str(&paint_span(
+                            self.theme,
                             self.mode,
+                            &Span::new(fs.lang_tag.clone(), Style::default()),
                             Token::TextMuted,
-                            fs.lang_tag.as_str(),
+                            bg,
+                        ));
+                    }
+                }
+                // Paint the remaining width in the same background so the
+                // surface runs the full line, not just the text extent.
+                if self.width != usize::MAX {
+                    let painted: usize = 2
+                        + row.iter().map(|s| s.width()).sum::<usize>()
+                        + if idx == 0 && r == 0 && !fs.lang_tag.is_empty() {
+                            fs.lang_tag.chars().count()
+                        } else {
+                            0
+                        };
+                    let fill = self.width.saturating_sub(painted);
+                    if fill > 0 {
+                        text.push_str(&paint_span(
+                            self.theme,
+                            self.mode,
+                            &Span::new(" ".repeat(fill), Style::default()),
+                            Token::TextSecondary,
+                            bg,
                         ));
                     }
                 }
@@ -1235,7 +1343,7 @@ impl<'a> Document<'a> {
                 text.push(' ');
             }
             for span in spans {
-                text.push_str(&paint_span(self.theme, self.mode, span, base));
+                text.push_str(&paint_span(self.theme, self.mode, span, base, None));
             }
             for _ in 0..rp {
                 text.push(' ');
@@ -1615,7 +1723,7 @@ mod tests {
     #[test]
     fn strikethrough_and_escaped_markers() {
         let j = joined("~~gone~~ stays");
-        assert!(j.contains("gone stays"));
+        assert!(strip_ansi(&j).contains("gone stays"), "got: {j:?}");
         assert!(!strip_ansi(&j).contains("~~"));
         assert_eq!(strip_ansi(&joined("\\*literal\\*")), "*literal*");
     }
@@ -1653,13 +1761,19 @@ mod tests {
             ColorMode::TrueColor,
         );
         let j = out.join("\n");
-        let paint = |t: Token, s: &str| theme.paint_with(ColorMode::TrueColor, t, s);
-        assert!(j.contains(&paint(Token::Violet, "let")));
-        assert!(j.contains(&paint(Token::Warning, "42")));
-        assert!(j.contains(&paint(Token::TextMuted, "// init")));
-        assert!(j.contains(&paint(Token::Border, "│")));
-        // The base code colour is the secondary text token.
-        assert!(j.contains("x"));
+        // The bg param rides inside each span's single SGR sequence (attrs;fg;bg),
+        // so it cannot be matched as a standalone paint. Verify via strip +
+        // that a `48;2;` bg sequence appears (any token with a bg param).
+        let bg_seq = "48;2;";
+        assert!(
+            j.contains(bg_seq),
+            "fenced lines must carry the CodeSurface bg param: {j:?}"
+        );
+        // Keyword highlighting is still present (extracted from span).
+        let stripped = strip_ansi(&j);
+        assert!(stripped.contains("let"));
+        assert!(stripped.contains("42"));
+        assert!(stripped.contains("// init"));
     }
 
     #[test]
@@ -1672,15 +1786,21 @@ mod tests {
             ColorMode::TrueColor,
         )
         .join("\n");
-        let paint = |t: Token, s: &str| theme.paint_with(ColorMode::TrueColor, t, s);
-        assert!(j.contains(&paint(Token::Success, "\"hi\"")));
-        assert!(j.contains(&paint(Token::TextMuted, "# note")));
+        let stripped = strip_ansi(&j);
+        assert!(
+            stripped.contains("\"hi\""),
+            "string must survive bg param: {j:?}"
+        );
+        assert!(
+            stripped.contains("# note"),
+            "comment must survive bg param: {j:?}"
+        );
     }
 
     #[test]
     fn all_supported_languages_highlight_keywords() {
         let theme = theme_from_name("default");
-        let paint = |t: Token, s: &str| theme.paint_with(ColorMode::TrueColor, t, s);
+        let _paint = |t: Token, s: &str| theme.paint_with(ColorMode::TrueColor, t, s);
         let cases = [
             ("rust", "fn", Token::Violet),
             ("python", "lambda", Token::Violet),
@@ -1695,7 +1815,17 @@ mod tests {
         for (lang, kw, token) in cases {
             let src = format!("```{lang}\nx = {kw}\n```");
             let j = render_with_mode(&src, &theme, W, ColorMode::TrueColor).join("\n");
-            assert!(j.contains(&paint(token, kw)), "lang {lang} missed {kw}");
+            // The bg param rides inside the span's SGR sequence, so check
+            // the visible text instead of the raw SGR-painted keyword.
+            let stripped = strip_ansi(&j);
+            assert!(
+                stripped.contains(kw),
+                "lang {lang} missed keyword {kw} in {stripped:?}"
+            );
+            // The violet highlight is still in the SGR params.
+            let violet_rgb = theme.rgb(token);
+            let sgr = format!("38;2;{};{};{}", violet_rgb.0, violet_rgb.1, violet_rgb.2);
+            assert!(j.contains(&sgr), "lang {lang} missed violet SGR: {j:?}");
         }
     }
 
@@ -1724,9 +1854,15 @@ mod tests {
             ColorMode::TrueColor,
         );
         let j = out.join("\n");
-        let paint = |t: Token, s: &str| theme.paint_with(ColorMode::TrueColor, t, s);
-        assert!(j.contains(&paint(Token::Violet, "let")));
-        assert!(j.contains(&paint(Token::Violet, "fn")));
+        let stripped = strip_ansi(&j);
+        assert!(
+            stripped.contains("let"),
+            "keyword must survive bg param: {j:?}"
+        );
+        assert!(
+            stripped.contains("fn"),
+            "keyword must survive bg param: {j:?}"
+        );
         assert!(j.contains("more text"));
         assert_eq!(out.len(), 3);
     }

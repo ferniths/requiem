@@ -43,6 +43,8 @@ pub enum Token {
     Border,
     /// Focused/active borders.
     BorderActive,
+    /// Distinct dark surface for fenced code blocks in the transcript.
+    CodeSurface,
     /// Informational states (running, active, in-progress).
     Info,
     /// Success states (completed, verified, ok).
@@ -60,7 +62,7 @@ pub enum Token {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     name: &'static str,
-    colors: [(Token, Rgb); 16],
+    colors: [(Token, Rgb); 17],
 }
 
 impl Theme {
@@ -78,13 +80,14 @@ impl Theme {
                 (Token::Violet, Rgb(0x9D, 0x7B, 0xD8)),
                 (Token::Text, Rgb(0xF2, 0xE9, 0xEC)),
                 (Token::TextSecondary, Rgb(0xB9, 0xA6, 0xAE)),
-                (Token::TextMuted, Rgb(0x76, 0x63, 0x6C)),
+                (Token::TextMuted, Rgb(0x88, 0x76, 0x80)),
                 (Token::Border, Rgb(0x3A, 0x2C, 0x34)),
                 (Token::BorderActive, Rgb(0x6E, 0x41, 0x52)),
                 (Token::Info, Rgb(0x65, 0xC9, 0xD6)),
                 (Token::Success, Rgb(0x75, 0xD6, 0x9A)),
                 (Token::Warning, Rgb(0xE7, 0xB8, 0x6D)),
                 (Token::Error, Rgb(0xFF, 0x64, 0x7C)),
+                (Token::CodeSurface, Rgb(0x1C, 0x14, 0x1C)),
             ],
         )
     }
@@ -110,6 +113,7 @@ impl Theme {
                 (Token::Success, Rgb(0x8A, 0xE4, 0xAC)),
                 (Token::Warning, Rgb(0xF2, 0xC8, 0x82)),
                 (Token::Error, Rgb(0xFF, 0x7C, 0x90)),
+                (Token::CodeSurface, Rgb(0x2A, 0x1E, 0x28)),
             ],
         )
     }
@@ -135,11 +139,12 @@ impl Theme {
                 (Token::Success, Rgb(0x7F, 0xB8, 0x94)),
                 (Token::Warning, Rgb(0xC0, 0xA4, 0x76)),
                 (Token::Error, Rgb(0xD0, 0x6B, 0x7A)),
+                (Token::CodeSurface, Rgb(0x24, 0x1B, 0x23)),
             ],
         )
     }
 
-    const fn with_colors(name: &'static str, colors: [(Token, Rgb); 16]) -> Self {
+    const fn with_colors(name: &'static str, colors: [(Token, Rgb); 17]) -> Self {
         Self { name, colors }
     }
 
@@ -170,6 +175,7 @@ impl Theme {
             Token::Text => 15,                       // bright white
             Token::TextSecondary => 7,               // white
             Token::TextMuted | Token::Border => 8,   // bright black (grey)
+            Token::CodeSurface => 0,                 // black (code block bg)
             Token::BorderActive => 5,                // magenta
             Token::Info => 6,                        // cyan
             Token::Success => 2,                     // green
@@ -197,7 +203,7 @@ impl Theme {
 
     /// The foreground spec for a token under a mode: the hand-tuned 16-colour
     /// index on Ansi16 terminals, RGB otherwise.
-    fn fg_spec(&self, mode: ColorMode, token: Token) -> crate::color::FgSpec {
+    pub(crate) fn fg_spec(&self, mode: ColorMode, token: Token) -> crate::color::FgSpec {
         match mode {
             ColorMode::NoColor => crate::color::FgSpec::None,
             ColorMode::Ansi16 => crate::color::FgSpec::Indexed16(self.ansi16_index(token)),
@@ -391,6 +397,42 @@ impl Theme {
     /// consistent dark surface regardless of the user's terminal default.
     pub fn panel_style(&self) -> Style {
         Style::new().bg(self.ratatui_color(Token::Background))
+    }
+
+    /// A style combining the foreground of `fg` with the background of
+    /// `bg` and an optional modifier — used for the composer panel where
+    /// the dark surface must stay visible even when a line has coloured
+    /// spans or a border.
+    pub fn style_on_bg_with_mods(&self, fg: Token, bg: Token, mods: Modifier) -> Style {
+        let mut s = Style::new()
+            .fg(self.ratatui_color(fg))
+            .bg(self.ratatui_color(bg));
+        s = s.add_modifier(mods);
+        s
+    }
+
+    /// A style for a line of fenced code in the transcript: a distinct
+    /// dark surface (raised above the background) so code blocks read as
+    /// their own element.
+    pub fn code_surface_style(&self) -> Style {
+        Style::new().bg(self.ratatui_color(Token::CodeSurface))
+    }
+
+    /// A style for a panel body with a token foreground on the code
+    /// surface — used by the composer.
+    pub fn code_surface_fg(&self, fg: Token) -> Style {
+        Style::new()
+            .fg(self.ratatui_color(fg))
+            .bg(self.ratatui_color(Token::CodeSurface))
+    }
+
+    /// Fill a line with the background colour so blank transcript rows
+    /// paint the deep near-black surface consistently.
+    pub fn bg_fill_line(&self, width: usize) -> ratatui::text::Line<'static> {
+        ratatui::text::Line::from(ratatui::text::Span::styled(
+            " ".repeat(width.max(1)),
+            self.panel_style(),
+        ))
     }
 }
 
@@ -625,7 +667,7 @@ mod tests {
             (Token::Violet, Rgb(0x9D, 0x7B, 0xD8)),
             (Token::Text, Rgb(0xF2, 0xE9, 0xEC)),
             (Token::TextSecondary, Rgb(0xB9, 0xA6, 0xAE)),
-            (Token::TextMuted, Rgb(0x76, 0x63, 0x6C)),
+            (Token::TextMuted, Rgb(0x88, 0x76, 0x80)),
             (Token::Info, Rgb(0x65, 0xC9, 0xD6)),
             (Token::Success, Rgb(0x75, 0xD6, 0x9A)),
             (Token::Warning, Rgb(0xE7, 0xB8, 0x6D)),
