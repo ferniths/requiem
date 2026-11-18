@@ -446,19 +446,88 @@ pub enum DashPanel {
     Events,
 }
 
+/// Severity for a dashboard warning entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Neutral information.
+    Info,
+    /// Worth attention.
+    Warn,
+    /// Something failed.
+    Error,
+    /// Something critical failed.
+    Critical,
+}
+
+impl Severity {
+    /// Short label shown in the panel.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+            Self::Critical => "CRIT",
+        }
+    }
+}
+
+/// A structured warning entry in the Warnings panel.
+#[derive(Debug, Clone)]
+pub struct WarningEntry {
+    /// Relative seconds since session start.
+    pub rel_secs: u64,
+    /// Severity.
+    pub severity: Severity,
+    /// Source label, e.g. "provider", "agent", "tool", "system".
+    pub source: String,
+    /// Agent name, if applicable.
+    pub agent: Option<String>,
+    /// Task id, if applicable.
+    pub task_id: Option<String>,
+    /// Error classification (e.g. "model_unavailable", "gateway").
+    pub error_class: Option<String>,
+    /// Sanitized one-line description (no secrets).
+    pub description: String,
+    /// Retry information, e.g. "retry 2/3".
+    pub retry_info: Option<String>,
+    /// Optional correlation id (dedup key).
+    pub correlation_id: Option<String>,
+    /// Number of times this exact warning has been observed.
+    pub count: u32,
+}
+
+impl WarningEntry {
+    /// Build the display line for this entry.
+    pub fn display_line(&self, width: usize) -> String {
+        let mut s = format!(
+            "{} {} · {}",
+            self.severity.label(),
+            truncate_chars(&self.source, 12),
+            truncate_chars(&self.description, width.saturating_sub(32))
+        );
+        if self.count > 1 {
+            s.push_str(&format!("  (×{})", self.count));
+        }
+        if let Some(ref retry) = self.retry_info {
+            s.push_str(&format!("  [{retry}]"));
+        }
+        s
+    }
+}
+
 /// Which dashboard area currently receives keyboard input.
 ///
 /// `Tree` — the recursive agent hierarchy (primary view).
 /// `Inspector` — the selected-agent detail panel.
-/// `Timeline` — the task execution timeline.
-/// `Feed` — the bottom event feed.
+/// `Events` — the bottom-left events panel (informational activity).
+/// `Warnings` — the bottom-right warnings panel (operational problems).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DashFocus {
     #[default]
     Tree,
     Inspector,
-    Timeline,
-    Feed,
+    Events,
+    Warnings,
 }
 
 /// A read-only historical session entry shown in the idle dashboard.
@@ -483,13 +552,18 @@ pub struct LogEvent {
 pub struct DashState {
     pub agents: Vec<AgentRow>,
     pub tasks: Vec<TaskRow>,
+    /// Informational activity feed (agent spawns, tool calls, completions).
     pub events: Vec<LogEvent>,
+    /// Operational problems feed (failures, rate limits, provider errors).
+    pub warnings: Vec<WarningEntry>,
     pub open: bool,
     pub panel: DashPanel,
     /// Per-panel scroll-back (0 = follow).
-    pub scroll: [usize; 3],
+    /// Index 0: timeline (tasks), 1: tree (agents), 2: events, 3: warnings.
+    pub scroll: [usize; 4],
     /// Per-panel selected item index.
-    pub selected: [usize; 3],
+    /// Index 0: timeline (tasks), 1: tree (agents), 2: events, 3: warnings.
+    pub selected: [usize; 4],
     /// Session-wide input tokens (accumulated from Usage events).
     pub tokens_in_total: u32,
     /// Session-wide output tokens.
@@ -507,7 +581,7 @@ pub struct DashState {
     pub requests_completed: u32,
     /// Number of model requests that failed this session.
     pub requests_failed: u32,
-    /// Active filter string for the event feed (empty = no filter).
+    /// Active filter string for the events/warnings panels (empty = no filter).
     pub filter: String,
     /// Whether the filter input is currently active (user is typing).
     pub filter_active: bool,
@@ -855,10 +929,20 @@ impl App {
     }
 
     /// Consume one runtime event: updates the transcript, dashboard and
-    /// status counters.
+    /// status counters. Informational events go to `dash.events`;
+    /// operational problems go to `dash.warnings` with dedup.
     pub fn push_event(&mut self, event: &Event) {
+        let rel = self.started.elapsed().as_secs();
+        self.push_event_or_warning(event, rel);
+        if is_warning_event(event) {
+            self.push_warning(event, rel);
+        }
+    }
+
+    /// Route the event into the appropriate buffer and update all counters.
+    fn push_event_or_warning(&mut self, event: &Event, rel: u64) {
         self.dash.events.push(LogEvent {
-            rel_secs: self.started.elapsed().as_secs(),
+            rel_secs: rel,
             event: event.clone(),
         });
         if self.dash.events.len() > 200 {
@@ -1194,6 +1278,48 @@ impl App {
         }
     }
 
+    /// Push a structured warning into the warnings buffer, deduplicating
+    /// identical warnings by correlation key.
+    fn push_warning(&mut self, event: &Event, rel: u64) {
+        let (severity, source, agent, task_id, error_class, description, retry_info, corr_key) =
+            build_warning_from_event(event);
+
+        // Deduplicate: if the last warning in the buffer has the same
+        // correlation key, increment its count instead of adding a new
+        // entry. This prevents a flood of identical provider failures
+        // from filling the panel.
+        if let Some(last) = self.dash.warnings.last_mut() {
+            if last.correlation_id.as_deref() == corr_key.as_deref() {
+                last.count += 1;
+                last.rel_secs = rel;
+                // Keep the most severe level seen.
+                if severity > last.severity {
+                    last.severity = severity;
+                }
+                return;
+            }
+        }
+
+        let entry = WarningEntry {
+            rel_secs: rel,
+            severity,
+            source,
+            agent,
+            task_id,
+            error_class,
+            description,
+            retry_info,
+            correlation_id: corr_key,
+            count: 1,
+        };
+        self.dash.warnings.push(entry);
+        // Bounded buffer: keep at most 200 warnings.
+        if self.dash.warnings.len() > 200 {
+            let drop = self.dash.warnings.len() - 200;
+            self.dash.warnings.drain(0..drop);
+        }
+    }
+
     /// A snapshot of the live dashboard state (for persistence/summary).
     pub fn dashboard_snapshot(&self) -> &DashState {
         &self.dash
@@ -1220,7 +1346,7 @@ impl App {
     }
 
     fn handle_dashboard_key(&mut self, key: KeyEvent) -> UiAction {
-        // Filter input mode: capture characters for the event feed filter.
+        // Filter input mode: capture characters for the active panel filter.
         if self.dash.filter_active {
             match key.code {
                 KeyCode::Esc => {
@@ -1250,32 +1376,31 @@ impl App {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.dash.open = false;
             }
-            // '/' activates the event feed filter.
+            // '/' activates the filter for the active panel.
             KeyCode::Char('/') => {
                 self.dash.filter_active = true;
-                self.dash.focus = DashFocus::Feed;
             }
-            // Tab cycles focus between the four dashboard areas.
+            // Tab cycles focus: Tree → Inspector → Events → Warnings → Tree.
             KeyCode::Tab => {
                 self.dash.focus = match self.dash.focus {
                     DashFocus::Tree => DashFocus::Inspector,
-                    DashFocus::Inspector => DashFocus::Timeline,
-                    DashFocus::Timeline => DashFocus::Feed,
-                    DashFocus::Feed => DashFocus::Tree,
+                    DashFocus::Inspector => DashFocus::Events,
+                    DashFocus::Events => DashFocus::Warnings,
+                    DashFocus::Warnings => DashFocus::Tree,
                 };
             }
             // F-key shortcuts for direct focus.
             KeyCode::F(2) => self.dash.focus = DashFocus::Tree,
-            KeyCode::F(3) => self.dash.focus = DashFocus::Timeline,
-            KeyCode::F(4) => self.dash.focus = DashFocus::Inspector,
-            KeyCode::F(5) => self.dash.focus = DashFocus::Feed,
+            KeyCode::F(3) => self.dash.focus = DashFocus::Inspector,
+            KeyCode::F(5) => self.dash.focus = DashFocus::Events,
+            KeyCode::F(6) => self.dash.focus = DashFocus::Warnings,
             // PageUp/PageDown scroll the active area.
             KeyCode::PageUp => {
                 let p = match self.dash.focus {
                     DashFocus::Tree => 1,
                     DashFocus::Inspector => 1,
-                    DashFocus::Timeline => 0,
-                    DashFocus::Feed => 2,
+                    DashFocus::Events => 2,
+                    DashFocus::Warnings => 3,
                 };
                 self.dash.scroll[p] = self.dash.scroll[p].saturating_add(10);
             }
@@ -1283,18 +1408,18 @@ impl App {
                 let p = match self.dash.focus {
                     DashFocus::Tree => 1,
                     DashFocus::Inspector => 1,
-                    DashFocus::Timeline => 0,
-                    DashFocus::Feed => 2,
+                    DashFocus::Events => 2,
+                    DashFocus::Warnings => 3,
                 };
                 self.dash.scroll[p] = self.dash.scroll[p].saturating_sub(10);
             }
-            // Up/Down select in tree, inspector, timeline, or feed.
+            // Up/Down select/scroll in the active panel.
             KeyCode::Up => {
                 let p = match self.dash.focus {
                     DashFocus::Tree => 1,
                     DashFocus::Inspector => 1,
-                    DashFocus::Timeline => 0,
-                    DashFocus::Feed => 2,
+                    DashFocus::Events => 2,
+                    DashFocus::Warnings => 3,
                 };
                 self.dash.selected[p] = self.dash.selected[p].saturating_sub(1);
             }
@@ -1302,13 +1427,14 @@ impl App {
                 let p = match self.dash.focus {
                     DashFocus::Tree => 1,
                     DashFocus::Inspector => 1,
-                    DashFocus::Timeline => 0,
-                    DashFocus::Feed => 2,
+                    DashFocus::Events => 2,
+                    DashFocus::Warnings => 3,
                 };
                 let len = match p {
                     1 => self.dash.agents.len(),
-                    0 => self.dash.tasks.len(),
-                    _ => self.dash.events.len(),
+                    2 => self.dash.events.len(),
+                    3 => self.dash.warnings.len(),
+                    _ => 0,
                 };
                 if len > 0 {
                     self.dash.selected[p] = (self.dash.selected[p] + 1).min(len - 1);
@@ -1363,17 +1489,29 @@ impl App {
                     }
                 }
             }
-            // Enter: inspect (switch focus to inspector).
+            // Enter: inspect — switch focus to inspector.
             KeyCode::Enter => {
-                self.dash.focus = DashFocus::Inspector;
+                if self.dash.focus == DashFocus::Events || self.dash.focus == DashFocus::Warnings {
+                    // Show full details in the inspector.
+                    self.dash.focus = DashFocus::Inspector;
+                } else {
+                    self.dash.focus = DashFocus::Inspector;
+                }
+            }
+            // 'c': clear the visible history (events and warnings) when idle.
+            KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.is_running() {
+                    self.dash.events.clear();
+                    self.dash.warnings.clear();
+                }
             }
             // Home/End: first/last item.
             KeyCode::Home => {
                 let p = match self.dash.focus {
                     DashFocus::Tree => 1,
                     DashFocus::Inspector => 1,
-                    DashFocus::Timeline => 0,
-                    DashFocus::Feed => 2,
+                    DashFocus::Events => 2,
+                    DashFocus::Warnings => 3,
                 };
                 self.dash.selected[p] = 0;
                 self.dash.scroll[p] = 0;
@@ -1382,13 +1520,14 @@ impl App {
                 let p = match self.dash.focus {
                     DashFocus::Tree => 1,
                     DashFocus::Inspector => 1,
-                    DashFocus::Timeline => 0,
-                    DashFocus::Feed => 2,
+                    DashFocus::Events => 2,
+                    DashFocus::Warnings => 3,
                 };
                 let len = match p {
                     1 => self.dash.agents.len(),
-                    0 => self.dash.tasks.len(),
-                    _ => self.dash.events.len(),
+                    2 => self.dash.events.len(),
+                    3 => self.dash.warnings.len(),
+                    _ => 0,
                 };
                 if len > 0 {
                     self.dash.selected[p] = len - 1;
@@ -2212,13 +2351,14 @@ impl App {
         if area.width < 20 || area.height < 10 {
             return;
         }
-        // Adaptive layout: header(1) + metrics(1) + body(min) + event_feed(adaptive) + footer(1)
-        let feed_h = if area.height >= 30 { 4 } else { 3 };
-        let [header, metrics, body, feed, footer] = Layout::vertical([
+        // Bottom section: two panels side-by-side on wide terminals,
+        // stacked vertically on narrow ones.
+        let bottom_h = if area.height >= 30 { 8 } else { 6 };
+        let [header, metrics, body, bottom, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(feed_h),
+            Constraint::Length(bottom_h),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -2237,8 +2377,174 @@ impl App {
             self.render_dash_body(frame, body);
         }
 
-        self.render_event_feed(frame, feed);
+        // Bottom: two independent panels (Events | Warnings).
+        self.render_events_and_warnings(frame, bottom);
         self.render_dash_footer(frame, footer);
+    }
+
+    /// Render the two bottom panels: Events (informational) and Warnings
+    /// (operational problems), side-by-side on wide terminals.
+    fn render_events_and_warnings(&self, frame: &mut Frame, area: Rect) {
+        if area.width >= 80 {
+            // Side-by-side layout.
+            let [left, right] =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(area);
+            self.render_events_panel(frame, left);
+            self.render_warnings_panel(frame, right);
+        } else {
+            // Stacked vertically on narrow terminals.
+            let [top, bottom] =
+                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(area);
+            self.render_events_panel(frame, top);
+            self.render_warnings_panel(frame, bottom);
+        }
+    }
+
+    /// Render the Events panel (informational activity).
+    fn render_events_panel(&self, frame: &mut Frame, area: Rect) {
+        let t = &self.theme;
+        let focused = self.dash.focus == DashFocus::Events;
+        let title = format!(" EVENTS{} ", if focused { " ●" } else { "" });
+        let border_style = if focused {
+            t.style_bold(Token::Accent)
+        } else {
+            t.style(Token::Border)
+        };
+        let block = Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(border_style)
+            .title(title.clone());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let events = &self.dash.events;
+
+        // Apply filter if active.
+        let filtered: Vec<&LogEvent> = if self.dash.filter.is_empty() {
+            events.iter().collect()
+        } else {
+            let filter = self.dash.filter.to_lowercase();
+            events
+                .iter()
+                .filter(|le| le.event.summary().to_lowercase().contains(&filter))
+                .collect()
+        };
+
+        if filtered.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " no activity yet",
+                t.style(Token::TextMuted),
+            )));
+        } else {
+            let p = 2; // events panel scroll/selection index
+            let visible = filtered.as_slice();
+            let start = if self.dash.scroll[p] == 0 {
+                visible.len().saturating_sub(inner.height as usize)
+            } else {
+                (visible.len().saturating_sub(self.dash.scroll[p])).min(inner.height as usize)
+            };
+            for (i, le) in visible.iter().enumerate().skip(start) {
+                let summary = le.event.summary();
+                if summary.is_empty() {
+                    continue;
+                }
+                let tok = event_token(&le.event);
+                let sel = self.dash.selected[p] == i;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if sel { "▸" } else { " " },
+                        t.style_bold(Token::AccentBright),
+                    ),
+                    Span::styled(format!(" +{:>4}s ", le.rel_secs), t.style(Token::TextMuted)),
+                    Span::styled(
+                        truncate_chars(&summary, (inner.width as usize).saturating_sub(12)),
+                        t.style(if sel { Token::Text } else { tok }),
+                    ),
+                ]));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    /// Render the Warnings panel (operational problems).
+    fn render_warnings_panel(&self, frame: &mut Frame, area: Rect) {
+        let t = &self.theme;
+        let focused = self.dash.focus == DashFocus::Warnings;
+        let title = format!(" WARNINGS{} ", if focused { " ●" } else { "" });
+        let border_style = if focused {
+            t.style_bold(Token::Error)
+        } else {
+            t.style(Token::Border)
+        };
+        let block = Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(border_style)
+            .title(title.clone());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let warnings = &self.dash.warnings;
+
+        // Apply filter if active.
+        let filtered: Vec<&WarningEntry> = if self.dash.filter.is_empty() {
+            warnings.iter().collect()
+        } else {
+            let filter = self.dash.filter.to_lowercase();
+            warnings
+                .iter()
+                .filter(|w| w.description.to_lowercase().contains(&filter))
+                .collect()
+        };
+
+        if filtered.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " no warnings",
+                t.style(Token::TextMuted),
+            )));
+        } else {
+            let p = 3; // warnings panel scroll/selection index
+            let visible = filtered.as_slice();
+            let start = if self.dash.scroll[p] == 0 {
+                visible.len().saturating_sub(inner.height as usize)
+            } else {
+                (visible.len().saturating_sub(self.dash.scroll[p])).min(inner.height as usize)
+            };
+            for (i, w) in visible.iter().enumerate().skip(start) {
+                let sel = self.dash.selected[p] == i;
+                let sev_tok = match w.severity {
+                    Severity::Info => Token::TextMuted,
+                    Severity::Warn => Token::Warning,
+                    Severity::Error => Token::Error,
+                    Severity::Critical => Token::Error,
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if sel { "▸" } else { " " },
+                        t.style_bold(Token::AccentBright),
+                    ),
+                    Span::styled(format!(" +{:>4}s ", w.rel_secs), t.style(Token::TextMuted)),
+                    Span::styled(format!("{} ", w.severity.label()), t.style_bold(sev_tok)),
+                    Span::styled(
+                        truncate_chars(&w.description, (inner.width as usize).saturating_sub(32)),
+                        t.style(if sel {
+                            Token::Text
+                        } else {
+                            Token::TextSecondary
+                        }),
+                    ),
+                    if w.count > 1 {
+                        Span::styled(format!("  (×{})", w.count), t.style(Token::Warning))
+                    } else {
+                        Span::raw("")
+                    },
+                ]));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn render_dash_header(&self, frame: &mut Frame, area: Rect) {
@@ -2765,67 +3071,6 @@ impl App {
         );
     }
 
-    fn render_event_feed(&self, frame: &mut Frame, area: Rect) {
-        let t = &self.theme;
-        // Show the most recent events that fit. Auto-follow when scroll is 0.
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let events = &self.dash.events;
-        // Show filter indicator if active.
-        if !self.dash.filter.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!(" filter: {}", self.dash.filter),
-                t.style_bold(Token::Warning),
-            )));
-        }
-        if events.is_empty() {
-            lines.push(Line::from(Span::styled(
-                " events — no activity yet",
-                t.style(Token::TextMuted),
-            )));
-        } else {
-            let p = 2;
-            // Filter events if a filter is active.
-            let filtered: Vec<&LogEvent> = if self.dash.filter.is_empty() {
-                events.iter().collect()
-            } else {
-                let filter = self.dash.filter.to_lowercase();
-                events
-                    .iter()
-                    .filter(|le| {
-                        let summary = le.event.summary().to_lowercase();
-                        summary.contains(&filter)
-                    })
-                    .collect()
-            };
-            let visible = filtered.as_slice();
-            let start = if self.dash.scroll[p] == 0 {
-                visible.len().saturating_sub(area.height as usize)
-            } else {
-                (visible.len().saturating_sub(self.dash.scroll[p])).min(area.height as usize)
-            };
-            for (i, le) in visible.iter().enumerate().skip(start) {
-                let summary = le.event.summary();
-                if summary.is_empty() {
-                    continue;
-                }
-                let tok = event_token(&le.event);
-                let sel = self.dash.selected[p] == i;
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if sel { "▸" } else { " " },
-                        t.style_bold(Token::AccentBright),
-                    ),
-                    Span::styled(format!(" +{:>4}s ", le.rel_secs), t.style(Token::TextMuted)),
-                    Span::styled(
-                        truncate_chars(&summary, area.width as usize - 12),
-                        t.style(if sel { Token::Text } else { tok }),
-                    ),
-                ]));
-            }
-        }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-    }
-
     fn render_idle_monitor(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
         let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
@@ -2882,11 +3127,11 @@ impl App {
         let t = &self.theme;
         let hint = match self.dash.focus {
             DashFocus::Tree => {
-                "↑↓ select · ←→ expand/collapse · Enter inspect · Space toggle · Tab area"
+                "↑↓ select · ←→ expand/collapse · Enter inspect · Space toggle · Tab area · / filter · c clear"
             }
-            DashFocus::Inspector => "←↑↓→ navigate · Tab area · Esc back to tree",
-            DashFocus::Timeline => "↑↓ scroll · Tab area · Esc back to tree",
-            DashFocus::Feed => "↑↓ scroll · Tab area · Esc back to tree",
+            DashFocus::Inspector => "←↑↓→ navigate · Tab area · / filter · Esc back",
+            DashFocus::Events => "↑↓ scroll · / filter · Enter inspect · c clear · Tab area",
+            DashFocus::Warnings => "↑↓ scroll · / filter · Enter inspect · c clear · Tab area",
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(hint, t.style(Token::TextMuted))))
@@ -2943,6 +3188,162 @@ fn event_token(event: &Event) -> Token {
             }
         }
         _ => Token::TextSecondary,
+    }
+}
+
+/// Determine whether an event is a warning (operational problem) or an
+/// informational event (normal activity).
+fn is_warning_event(e: &Event) -> bool {
+    match e {
+        Event::RunFailed { .. } => true,
+        Event::RunCancelled { .. } => true,
+        Event::ProviderFailure { .. } => true,
+        Event::ToolCallFinished { ok: false, .. } => true,
+        Event::Notice {
+            level: NoticeLevel::Warning | NoticeLevel::Error,
+            ..
+        } => true,
+        Event::RetryStatus { status, .. } => status != "recovered",
+        _ => false,
+    }
+}
+
+/// A bundle of fields extracted from an event for the warnings panel.
+type WarningFields = (
+    Severity,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// Build the fields for a [`WarningEntry`] from a runtime event.
+fn build_warning_from_event(e: &Event) -> WarningFields {
+    use Event::*;
+    match e {
+        RunFailed {
+            agent,
+            task,
+            error,
+            error_class,
+            ..
+        } => {
+            let desc = format!("{agent} failed: {error}");
+            let corr = Some(format!("run_failed|{task}"));
+            let sev = if error_class == "circuit_open" {
+                Severity::Critical
+            } else {
+                Severity::Error
+            };
+            (
+                sev,
+                "agent".into(),
+                Some(agent.clone()),
+                Some(task.as_str().to_string()),
+                Some(error_class.clone()),
+                truncate_chars(&desc, 80),
+                None,
+                corr,
+            )
+        }
+        RunCancelled { agent, task } => (
+            Severity::Warn,
+            "agent".into(),
+            Some(agent.clone()),
+            Some(task.as_str().to_string()),
+            None,
+            format!("{agent} cancelled"),
+            None,
+            Some(format!("cancelled|{task}")),
+        ),
+        ProviderFailure {
+            error,
+            error_class,
+            status,
+            dedup_key,
+            ..
+        } => {
+            let http = status.map(|s| format!(" HTTP {s}")).unwrap_or_default();
+            let desc = format!("provider [{error_class}]{http}: {error}");
+            let sev = if error_class == "circuit_open" {
+                Severity::Critical
+            } else {
+                Severity::Error
+            };
+            (
+                sev,
+                "provider".into(),
+                None,
+                None,
+                Some(error_class.clone()),
+                truncate_chars(&desc, 80),
+                None,
+                Some(dedup_key.clone()),
+            )
+        }
+        ToolCallFinished {
+            agent,
+            tool,
+            summary,
+            duration_ms,
+            ..
+        } => (
+            Severity::Warn,
+            "tool".into(),
+            Some(agent.clone()),
+            None,
+            None,
+            format!("{tool} failed ({duration_ms}ms) {summary}"),
+            None,
+            Some(format!("tool|{agent}|{tool}")),
+        ),
+        Notice { text, level } => {
+            let sev = match level {
+                NoticeLevel::Warning => Severity::Warn,
+                NoticeLevel::Error => Severity::Error,
+                _ => Severity::Info,
+            };
+            (
+                sev,
+                "system".into(),
+                None,
+                None,
+                None,
+                truncate_chars(text, 80),
+                None,
+                Some(format!("notice|{text}")),
+            )
+        }
+        RetryStatus { status, text, .. } => {
+            let sev = match status.as_str() {
+                "stopped" => Severity::Error,
+                _ => Severity::Warn,
+            };
+            let retry = Some(status.clone());
+            (
+                sev,
+                "provider".into(),
+                None,
+                None,
+                None,
+                truncate_chars(text, 80),
+                retry,
+                Some(format!("retry|{status}")),
+            )
+        }
+        _ => (
+            Severity::Info,
+            "system".into(),
+            None,
+            None,
+            None,
+            e.summary(),
+            None,
+            None,
+        ),
     }
 }
 
@@ -3411,9 +3812,9 @@ fn hello() {
         app.handle_key(test_key(KeyCode::Tab));
         assert_eq!(app.dash.focus, DashFocus::Inspector);
         app.handle_key(test_key(KeyCode::Tab));
-        assert_eq!(app.dash.focus, DashFocus::Timeline);
+        assert_eq!(app.dash.focus, DashFocus::Events);
         app.handle_key(test_key(KeyCode::Tab));
-        assert_eq!(app.dash.focus, DashFocus::Feed);
+        assert_eq!(app.dash.focus, DashFocus::Warnings);
         app.handle_key(test_key(KeyCode::Tab));
         assert_eq!(app.dash.focus, DashFocus::Tree);
         // Agent selection.
@@ -4546,10 +4947,8 @@ fn hello() {
         assert_eq!(app.dash.filter, "read");
         // The feed should now only show events matching "read".
         let text = visible_text(&app, 120, 40);
-        assert!(
-            text.contains("filter: read"),
-            "filter indicator visible: {text}"
-        );
+        assert!(text.contains("EVENTS"), "events panel visible: {text}");
+        assert!(text.contains("WARNINGS"), "warnings panel visible: {text}");
         // Clear the filter with Esc.
         app.handle_key(test_key(KeyCode::Esc));
         assert!(!app.dash.filter_active);
@@ -4577,9 +4976,9 @@ fn hello() {
         app.handle_key(test_key(KeyCode::Tab));
         assert_eq!(app.dash.focus, DashFocus::Inspector);
         app.handle_key(test_key(KeyCode::Tab));
-        assert_eq!(app.dash.focus, DashFocus::Timeline);
+        assert_eq!(app.dash.focus, DashFocus::Events);
         app.handle_key(test_key(KeyCode::Tab));
-        assert_eq!(app.dash.focus, DashFocus::Feed);
+        assert_eq!(app.dash.focus, DashFocus::Warnings);
         app.handle_key(test_key(KeyCode::Tab));
         assert_eq!(app.dash.focus, DashFocus::Tree);
     }
@@ -4591,11 +4990,11 @@ fn hello() {
         app.handle_key(test_key(KeyCode::F(2)));
         assert_eq!(app.dash.focus, DashFocus::Tree);
         app.handle_key(test_key(KeyCode::F(3)));
-        assert_eq!(app.dash.focus, DashFocus::Timeline);
-        app.handle_key(test_key(KeyCode::F(4)));
         assert_eq!(app.dash.focus, DashFocus::Inspector);
         app.handle_key(test_key(KeyCode::F(5)));
-        assert_eq!(app.dash.focus, DashFocus::Feed);
+        assert_eq!(app.dash.focus, DashFocus::Events);
+        app.handle_key(test_key(KeyCode::F(6)));
+        assert_eq!(app.dash.focus, DashFocus::Warnings);
     }
 
     fn provider_failure(dedup_key: &str) -> Event {
