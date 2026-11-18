@@ -38,3 +38,6 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 arboard = { workspace = true }
 rpassword = "7"
+
+[dev-dependencies]
+tempfile = { workspace = true }
