@@ -43,6 +43,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         "show the permission rules for the current mode",
     ),
     CommandSpec::new("budget", "Config", "show token and task budget usage"),
+    CommandSpec::new("project", "Config", "detect and show the project's build ecosystem"),
     // ── Memory ──────────────────────────────────────────────────────
     CommandSpec::new("sessions", "Memory", "list past sessions"),
     CommandSpec::new("resume", "Memory", "resume a past session: /resume <id>")

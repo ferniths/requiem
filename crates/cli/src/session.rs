@@ -1057,6 +1057,39 @@ async fn dispatch_slash(
             );
             Directive::Continue
         }
+        "project" => {
+            let workdir = std::env::current_dir().ok();
+            match workdir.as_deref().and_then(requiem_project::detect) {
+                Some(profile) => {
+                    let mut out = format!(
+                        "project — ecosystem: {} · git: {}",
+                        profile.ecosystem,
+                        if profile.has_git { "yes" } else { "no" },
+                    );
+                    if !profile.languages.is_empty() {
+                        out.push_str(&format!(" · languages: {}", profile.languages.join(", ")));
+                    }
+                    if let Some(cmd) = &profile.build_command {
+                        out.push_str(&format!("\n  build:  {cmd}"));
+                    }
+                    if let Some(cmd) = &profile.test_command {
+                        out.push_str(&format!("\n  test:   {cmd}"));
+                    }
+                    if let Some(cmd) = &profile.lint_command {
+                        out.push_str(&format!("\n  lint:   {cmd}"));
+                    }
+                    out.push_str(&format!("\n  root:   {}", profile.root));
+                    app.push_system(&out, NoticeLevel::Info);
+                }
+                None => {
+                    app.push_system(
+                        "could not detect a project in the current directory",
+                        NoticeLevel::Warning,
+                    );
+                }
+            }
+            Directive::Continue
+        }
         "sessions" => {
             // Reads go through the store the driver owns; open a fresh
             // connection for the query to avoid crossing awaits.
@@ -1497,6 +1530,31 @@ async fn run_plain(
                         client.in_flight(),
                         client.max_context_tokens().unwrap_or(0)
                     );
+                }
+                "project" => {
+                    match std::env::current_dir().ok().as_deref().and_then(requiem_project::detect) {
+                        Some(profile) => {
+                            println!(
+                                "  project — ecosystem: {} · git: {} · languages: {}",
+                                profile.ecosystem,
+                                if profile.has_git { "yes" } else { "no" },
+                                profile.languages.join(", "),
+                            );
+                            if let Some(cmd) = &profile.build_command {
+                                println!("  build:  {cmd}");
+                            }
+                            if let Some(cmd) = &profile.test_command {
+                                println!("  test:   {cmd}");
+                            }
+                            if let Some(cmd) = &profile.lint_command {
+                                println!("  lint:   {cmd}");
+                            }
+                            println!("  root:   {}", profile.root);
+                        }
+                        None => {
+                            println!("  could not detect a project in the current directory");
+                        }
+                    }
                 }
                 other => {
                     println!("  /{other} needs a terminal UI — run `requiem session` in a TTY");
