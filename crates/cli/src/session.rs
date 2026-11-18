@@ -1224,6 +1224,11 @@ async fn register_subagent_tools(
             .filter_map(|n| bridge.tools.lock().unwrap().get(n).map(|t| t.tool_def()))
             .collect()
     };
+
+    // Build a concrete tool map so nested subagents can actually use
+    // file ops, git, search, and terminal tools — not just return text.
+    let spawn_map = requiem_tools::SpawnToolMap::new(child_tools.clone(), child_executor.clone());
+
     let sub_tool = requiem_tools::make_subagent_tool(
         client.clone(),
         child_executor.clone(),
@@ -1232,6 +1237,7 @@ async fn register_subagent_tools(
         child_tools.clone(),
     )
     .with_max_depth(max_depth)
+    .with_spawn_tool_map(spawn_map.clone())
     .with_events(event_tx.clone())
     .with_cancel(subagent_cancel.clone());
     bridge.add_tool(std::sync::Arc::new(sub_tool));
@@ -1244,6 +1250,7 @@ async fn register_subagent_tools(
         child_tools,
     )
     .with_max_depth(max_depth)
+    .with_spawn_tool_map(spawn_map)
     .with_events(event_tx.clone())
     .with_cancel(subagent_cancel.clone());
     bridge.add_tool(std::sync::Arc::new(parallel_tool));

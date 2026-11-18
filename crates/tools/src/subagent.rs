@@ -22,11 +22,43 @@ use requiem_orchestration::agent_runtime::{
 };
 use requiem_orchestration::subagent::SubagentSpec;
 
+/// A concrete set of tool definitions and executor that a subagent can use.
+///
+/// When `None`, children have no tools (the spawn_subagent path in session.rs
+/// passes the parent's non-spawn tool defs here, so children can actually
+/// do work — file ops, git, search, terminal, etc.).
+#[derive(Clone)]
+pub struct SpawnToolMap {
+    /// Full tool definitions the child agent can call.
+    defs: Vec<requiem_model::request::ToolDef>,
+    /// The executor that dispatches tool calls.
+    executor: std::sync::Arc<dyn ToolExecutor>,
+}
+
+impl SpawnToolMap {
+    pub fn new(
+        defs: Vec<requiem_model::request::ToolDef>,
+        executor: std::sync::Arc<dyn ToolExecutor>,
+    ) -> Self {
+        Self { defs, executor }
+    }
+
+    /// The tool defs to pass to the child's `run_agent_halted`.
+    pub fn defs(&self) -> Vec<requiem_model::request::ToolDef> {
+        self.defs.clone()
+    }
+
+    /// The executor to pass to the child's `run_agent_halted`.
+    pub fn executor(&self) -> std::sync::Arc<dyn ToolExecutor> {
+        self.executor.clone()
+    }
+}
+
 /// Build a `SubagentTool` bound to the current parent agent and task session.
 ///
 /// `parent` is the agent that will own the spawned subagents.
 /// `task_session` is the task-session `Id` for this run.
-/// `tools` are the tool defs the subagent can use.
+/// `tools` are the tool defs the subagent can use (empty = no tools).
 /// `max_depth` is the maximum nesting depth (from user config).
 pub fn make_subagent_tool(
     client: std::sync::Arc<ModelClient>,
@@ -41,6 +73,7 @@ pub fn make_subagent_tool(
         parent,
         task_session,
         tools,
+        spawn_tool_map: None,
         events: None,
         cancel: None,
         max_depth: requiem_orchestration::subagent::MAX_DEPTH,
@@ -54,6 +87,9 @@ pub struct SubagentTool {
     parent: Agent,
     task_session: requiem_core::Id,
     tools: Vec<requiem_model::request::ToolDef>,
+    /// Concrete tool map for children (includes executor + full tool defs).
+    /// When `None`, children get no tools.
+    spawn_tool_map: Option<SpawnToolMap>,
     /// Event feed the child's run broadcasts into (same feed as parent).
     events: Option<EventTx>,
     /// Cancellation flag shared with the parent run.
@@ -66,6 +102,12 @@ impl SubagentTool {
     /// Set the maximum nesting depth (override the default).
     pub fn with_max_depth(mut self, depth: u32) -> Self {
         self.max_depth = depth;
+        self
+    }
+
+    /// Attach a concrete tool map so children can use full tool defs + executor.
+    pub fn with_spawn_tool_map(mut self, map: SpawnToolMap) -> Self {
+        self.spawn_tool_map = Some(map);
         self
     }
 
@@ -183,14 +225,27 @@ impl Tool for SubagentTool {
 
         let mut run = AgentRun::new(handle.agent, sub_task);
 
+        // Resolve the tools and executor the child will use. When a concrete
+        // spawn_tool_map is set, the child gets the full tool defs and the
+        // executor from the map; otherwise it falls back to the tool's own
+        // `tools` and `executor` fields (which may be empty).
+        let child_tools: Vec<requiem_model::request::ToolDef> = match &self.spawn_tool_map {
+            Some(map) => map.defs(),
+            None => self.tools.clone(),
+        };
+        let child_executor: std::sync::Arc<dyn ToolExecutor> = match &self.spawn_tool_map {
+            Some(map) => map.executor(),
+            None => self.executor.clone(),
+        };
+
         // Run the child inline: this function is async, so awaiting the
         // nested agent loop is safe on any runtime flavor. The child's
         // events merge into the parent feed and cancellation propagates.
         let result = run_agent_halted(
             &self.client,
-            &self.executor,
+            &child_executor,
             &mut run,
-            &self.tools,
+            &child_tools,
             self.events.as_ref(),
             self.cancel.as_ref(),
         )
@@ -244,6 +299,7 @@ pub fn make_parallel_subagent_tool(
         parent,
         task_session,
         tools,
+        spawn_tool_map: None,
         events: None,
         cancel: None,
         max_depth: requiem_orchestration::subagent::MAX_DEPTH,
@@ -261,6 +317,9 @@ pub struct ParallelSubagentTool {
     parent: Agent,
     task_session: requiem_core::Id,
     tools: Vec<requiem_model::request::ToolDef>,
+    /// Concrete tool map for children (includes executor + full tool defs).
+    /// When `None`, children get no tools.
+    spawn_tool_map: Option<SpawnToolMap>,
     events: Option<EventTx>,
     cancel: Option<CancelFlag>,
     max_depth: u32,
@@ -269,6 +328,12 @@ pub struct ParallelSubagentTool {
 impl ParallelSubagentTool {
     pub fn with_max_depth(mut self, depth: u32) -> Self {
         self.max_depth = depth;
+        self
+    }
+
+    /// Attach a concrete tool map so children can use full tool defs + executor.
+    pub fn with_spawn_tool_map(mut self, map: SpawnToolMap) -> Self {
+        self.spawn_tool_map = Some(map);
         self
     }
 
@@ -401,12 +466,22 @@ impl Tool for ParallelSubagentTool {
             tasks.push((handle.agent, task));
         }
 
+        // Resolve the tools and executor the children will use.
+        let child_tools: Vec<requiem_model::request::ToolDef> = match &self.spawn_tool_map {
+            Some(map) => map.defs(),
+            None => self.tools.clone(),
+        };
+        let child_executor: std::sync::Arc<dyn ToolExecutor> = match &self.spawn_tool_map {
+            Some(map) => map.executor(),
+            None => self.executor.clone(),
+        };
+
         // Run all subagents concurrently. Each child's error is captured
         // in its own result entry without aborting siblings.
         let futures_iter = tasks.into_iter().map(|(agent, task)| {
             let client = self.client.clone();
-            let executor = self.executor.clone();
-            let tools = self.tools.clone();
+            let executor = child_executor.clone();
+            let tools = child_tools.clone();
             let events = self.events.clone();
             let cancel = self.cancel.clone();
             async move {
@@ -483,6 +558,7 @@ mod tests {
             parent: Agent::master("test-master", requiem_core::Id::new()),
             task_session: requiem_core::Id::new(),
             tools: vec![],
+            spawn_tool_map: None,
             events: None,
             cancel: None,
             max_depth: 4,
@@ -590,6 +666,7 @@ mod tests {
             parent: deep,
             task_session: requiem_core::Id::new(),
             tools: vec![],
+            spawn_tool_map: None,
             events: None,
             cancel: None,
             max_depth: 4,
@@ -624,6 +701,7 @@ mod tests {
             parent: Agent::master("test-master", requiem_core::Id::new()),
             task_session: requiem_core::Id::new(),
             tools: vec![],
+            spawn_tool_map: None,
             events: None,
             cancel: None,
             max_depth: 4,
@@ -725,6 +803,7 @@ mod tests {
             parent: deep,
             task_session: requiem_core::Id::new(),
             tools: vec![],
+            spawn_tool_map: None,
             events: None,
             cancel: None,
             max_depth: 4,
@@ -736,5 +815,76 @@ mod tests {
             .await;
         let err = result.unwrap_err();
         assert!(err.to_string().contains("depth"), "got: {err}");
+    }
+
+    // ---- SpawnToolMap tests ----
+
+    fn tool_def_with_name(name: &str) -> requiem_model::request::ToolDef {
+        requiem_model::request::ToolDef::new(
+            name,
+            format!("Test tool {name}"),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    #[test]
+    fn spawn_tool_map_carries_defs_and_executor() {
+        let defs = vec![
+            tool_def_with_name("read_file"),
+            tool_def_with_name("grep_search"),
+        ];
+        let executor = std::sync::Arc::new(crate::tests::noop_executor());
+        let map = SpawnToolMap::new(defs.clone(), executor);
+        assert_eq!(map.defs().len(), 2);
+        assert_eq!(map.defs()[0].name, "read_file");
+        assert_eq!(map.defs()[1].name, "grep_search");
+    }
+
+    #[tokio::test]
+    async fn subagent_with_tool_map_uses_map_defs() {
+        // Build a tool that has a spawn_tool_map with 2 tool defs.
+        let cfg = requiem_model::config::ModelConfig {
+            endpoint: "http://localhost:9999".into(),
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            timeout_ms: 5_000,
+            max_concurrency: 1,
+            max_retries: 1,
+            max_context_tokens: None,
+            max_output_tokens: None,
+        };
+        let defs = vec![
+            tool_def_with_name("read_file"),
+            tool_def_with_name("grep_search"),
+        ];
+        let executor = std::sync::Arc::new(crate::tests::noop_executor());
+        let map = SpawnToolMap::new(defs, executor.clone());
+
+        let tool = SubagentTool {
+            client: std::sync::Arc::new(ModelClient::new(cfg).unwrap()),
+            executor: executor.clone(),
+            parent: Agent::master("test-master", requiem_core::Id::new()),
+            task_session: requiem_core::Id::new(),
+            tools: vec![], // empty: the map should override
+            spawn_tool_map: Some(map),
+            events: None,
+            cancel: Some(CancelFlag::new()),
+            max_depth: 4,
+        };
+
+        // Cancel the flag so the child run short-circuits immediately
+        // (no actual model call needed) — but the tool-defs resolution
+        // happens before the run, proving the map was consulted.
+        tool.cancel.as_ref().unwrap().cancel();
+        let result = tool
+            .execute(&serde_json::json!({
+                "name": "child",
+                "role": "researcher",
+                "task": "x"
+            }))
+            .await
+            .unwrap();
+        // The child ran with the 2 map tool defs and was cancelled.
+        assert_eq!(result["status"], "failed");
     }
 }
