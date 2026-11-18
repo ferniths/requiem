@@ -418,9 +418,25 @@ pub async fn run_agent_halted(
                             },
                         );
                     }
+                    emit(
+                        events,
+                        Event::ModelRequestCompleted {
+                            agent: run.agent.name.clone(),
+                            duration_ms: client.last_request_ms(),
+                            ok: true,
+                        },
+                    );
                     resp
                 }
                 Err(e) => {
+                    emit(
+                        events,
+                        Event::ModelRequestCompleted {
+                            agent: run.agent.name.clone(),
+                            duration_ms: client.last_request_ms(),
+                            ok: false,
+                        },
+                    );
                     emit(
                         events,
                         Event::RunFailed {
@@ -452,8 +468,26 @@ pub async fn run_agent_halted(
                 client.chat(req).await
             };
             match chat_result {
-                Ok(r) => r,
+                Ok(r) => {
+                    emit(
+                        events,
+                        Event::ModelRequestCompleted {
+                            agent: run.agent.name.clone(),
+                            duration_ms: client.last_request_ms(),
+                            ok: true,
+                        },
+                    );
+                    r
+                }
                 Err(e) => {
+                    emit(
+                        events,
+                        Event::ModelRequestCompleted {
+                            agent: run.agent.name.clone(),
+                            duration_ms: client.last_request_ms(),
+                            ok: false,
+                        },
+                    );
                     emit(
                         events,
                         Event::RunFailed {

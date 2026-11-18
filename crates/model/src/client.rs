@@ -39,6 +39,9 @@ pub struct ModelClient {
     /// matching proxy. When `None` (default), all requests use `self.http`
     /// directly — zero behaviour change for existing setups.
     proxy_pool: Option<Arc<ProxyPool>>,
+    /// Wall-clock duration of the most recent model request in milliseconds.
+    /// Updated atomically so the dashboard can read it without a lock.
+    last_request_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ModelClient {
@@ -64,6 +67,7 @@ impl ModelClient {
             max_concurrency: config.max_concurrency,
             semaphore,
             proxy_pool: None,
+            last_request_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -96,6 +100,12 @@ impl ModelClient {
 
     pub fn in_flight(&self) -> u32 {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Wall-clock duration of the most recent model request in milliseconds.
+    /// Returns 0 if no request has completed yet.
+    pub fn last_request_ms(&self) -> u64 {
+        self.last_request_ms.load(Ordering::Relaxed)
     }
 
     pub fn can_admit(&self) -> bool {
@@ -152,7 +162,10 @@ impl ModelClient {
     /// 5. On proxy-specific failure, the endpoint's failure count is incremented.
     pub async fn chat(&self, req: ChatRequest) -> Result<ModelResponse, RequiemError> {
         let _guard = self.acquire_slot().await;
+        let start = std::time::Instant::now();
         let res = self.chat_inner(&req).await;
+        self.last_request_ms
+            .store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
         self.release_slot(_guard);
         res
     }
@@ -350,7 +363,10 @@ impl ModelClient {
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ModelResponse, RequiemError> {
         let _guard = self.acquire_slot().await;
+        let start = std::time::Instant::now();
         let result = self.chat_stream_inner(req, &tx).await;
+        self.last_request_ms
+            .store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
         self.release_slot(_guard);
         result
     }

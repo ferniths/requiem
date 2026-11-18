@@ -34,7 +34,7 @@ use requiem_orchestration::agent_runtime::{
 use requiem_orchestration::scheduler::{Scheduler, SchedulerConfig, SharedScheduler};
 use requiem_permissions::PermissionGate;
 use requiem_tools::{GrepSearchTool, ObsidianTool, Tool};
-use requiem_tui::app::{App, CommandHints, UiAction};
+use requiem_tui::app::{App, CommandHints, HistoryEntry, UiAction};
 use requiem_tui::theme::{theme_from_name, Theme, THEME_NAMES};
 
 use crate::history::InputHistory;
@@ -398,6 +398,25 @@ async fn run_fullscreen(
 
     let mut history = InputHistory::load();
     app.set_history(history.entries().to_vec());
+
+    // Load session history for the idle dashboard.
+    if let Ok(sessions) = store.list_sessions() {
+        let entries = sessions
+            .into_iter()
+            .map(|(id, count, last)| {
+                let tokens_in = 0u32; // Not stored per-session in list_sessions
+                let tokens_out = 0u32;
+                HistoryEntry {
+                    session_id: id.to_string(),
+                    task_count: count,
+                    last_activity: last,
+                    tokens_in,
+                    tokens_out,
+                }
+            })
+            .collect();
+        app.set_session_history(entries);
+    }
 
     // Last physical paste (content + time), used only to drop duplicate
     // events for the *same* clipboard delivery. Never used to suppress a

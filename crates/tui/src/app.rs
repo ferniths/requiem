@@ -22,7 +22,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
 use requiem_core::events::{Event, NoticeLevel};
@@ -380,7 +380,30 @@ pub enum DashPanel {
     Events,
 }
 
-const DASH_PANELS: [DashPanel; 3] = [DashPanel::Tasks, DashPanel::Agents, DashPanel::Events];
+/// Which dashboard area currently receives keyboard input.
+///
+/// `Tree` — the recursive agent hierarchy (primary view).
+/// `Inspector` — the selected-agent detail panel.
+/// `Timeline` — the task execution timeline.
+/// `Feed` — the bottom event feed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DashFocus {
+    #[default]
+    Tree,
+    Inspector,
+    Timeline,
+    Feed,
+}
+
+/// A read-only historical session entry shown in the idle dashboard.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub session_id: String,
+    pub task_count: usize,
+    pub last_activity: String,
+    pub tokens_in: u32,
+    pub tokens_out: u32,
+}
 
 /// An entry in the event log: relative seconds + the event.
 #[derive(Debug, Clone)]
@@ -405,6 +428,23 @@ pub struct DashState {
     pub tokens_in_total: u32,
     /// Session-wide output tokens.
     pub tokens_out_total: u32,
+    /// Agent ids whose subtree is collapsed in the recursive tree view.
+    pub collapsed: std::collections::HashSet<String>,
+    /// Which dashboard area currently receives keyboard input.
+    pub focus: DashFocus,
+    /// Read-only session history from the SQLite store (populated once at
+    /// startup; empty when no prior sessions exist).
+    pub history: Vec<HistoryEntry>,
+    /// Last model request duration in milliseconds (0 = not yet measured).
+    pub last_request_ms: u64,
+    /// Number of model requests that completed successfully this session.
+    pub requests_completed: u32,
+    /// Number of model requests that failed this session.
+    pub requests_failed: u32,
+    /// Active filter string for the event feed (empty = no filter).
+    pub filter: String,
+    /// Whether the filter input is currently active (user is typing).
+    pub filter_active: bool,
 }
 
 impl DashState {
@@ -429,6 +469,14 @@ impl DashState {
 
     pub fn total_tokens(&self) -> u32 {
         self.agents.iter().map(|a| a.tokens_in + a.tokens_out).sum()
+    }
+
+    /// Number of agents currently in the Running status.
+    pub fn running_count(&self) -> usize {
+        self.agents
+            .iter()
+            .filter(|a| a.status == AgentStatus::Running)
+            .count()
     }
 }
 
@@ -544,6 +592,11 @@ impl App {
     /// Change the displayed mode (after `/ask`, `/code`, …).
     pub fn set_mode(&mut self, mode: &str) {
         self.mode = mode.to_string();
+    }
+
+    /// Set the historical session entries shown in the idle dashboard.
+    pub fn set_session_history(&mut self, entries: Vec<HistoryEntry>) {
+        self.dash.history = entries;
     }
 
     /// Insert a full pasted text blob (bracketed-paste delivery) into the
@@ -751,10 +804,12 @@ impl App {
                 self.active_runs.insert(task.as_str().to_string());
                 self.turns = 0;
                 self.active_task = Some(description.clone());
+                let rel = self.started.elapsed().as_secs();
                 if self.dash.agent_index(agent).is_none() {
                     self.dash.agents.push(AgentRow {
                         agent_id: agent.clone(),
                         role: role.clone(),
+                        created_rel_secs: rel,
                         ..AgentRow::new(agent, role)
                     });
                 }
@@ -768,6 +823,7 @@ impl App {
                         description: description.clone(),
                         status: TaskStatus::Running,
                         assignee: Some(agent.clone()),
+                        started_rel_secs: rel,
                         ..TaskRow::default()
                     });
                 }
@@ -870,18 +926,19 @@ impl App {
                         let e = &mut self.entries[i];
                         e.glyph = glyph;
                         e.fg = fg;
-                        e.text = text;
+                        e.text = text.clone();
                         e.streaming = false;
                         e.tool = None;
                     }
                     None => {
-                        let mut e = TranscriptEntry::new(glyph, text, fg);
+                        let mut e = TranscriptEntry::new(glyph, text.clone(), fg);
                         e.indent = 4;
                         self.entries.push(e);
                     }
                 }
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Running;
+                    self.dash.agents[i].push_tool(text);
                 }
             }
             Event::AgentSpawned {
@@ -967,11 +1024,14 @@ impl App {
                 ..
             } => {
                 self.active_runs.remove(task.as_str());
+                let rel = self.started.elapsed().as_secs();
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Failed;
+                    self.dash.agents[i].last_error = format!("{error_class}: {error}");
                 }
                 if let Some(i) = self.dash.task_index(task.as_str()) {
                     self.dash.tasks[i].status = TaskStatus::Failed;
+                    self.dash.tasks[i].completed_rel_secs = rel;
                 }
                 // Render a structured error card in the transcript.
                 let card = format_error_card(error, error_class, &self.model);
@@ -997,6 +1057,16 @@ impl App {
                 ));
                 if self.active_runs.is_empty() {
                     self.active_task = None;
+                }
+            }
+            Event::ModelRequestCompleted {
+                duration_ms, ok, ..
+            } => {
+                self.dash.last_request_ms = *duration_ms;
+                if *ok {
+                    self.dash.requests_completed += 1;
+                } else {
+                    self.dash.requests_failed += 1;
                 }
             }
             Event::Notice { text, level } => self.push_system(text, *level),
@@ -1029,39 +1099,182 @@ impl App {
     }
 
     fn handle_dashboard_key(&mut self, key: KeyEvent) -> UiAction {
+        // Filter input mode: capture characters for the event feed filter.
+        if self.dash.filter_active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.dash.filter_active = false;
+                    self.dash.filter.clear();
+                }
+                KeyCode::Enter => {
+                    self.dash.filter_active = false;
+                }
+                KeyCode::Backspace => {
+                    self.dash.filter.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.dash.filter.push(c);
+                }
+                _ => {}
+            }
+            return UiAction::None;
+        }
         match key.code {
             KeyCode::Esc => {
+                self.dash.open = false;
+            }
+            KeyCode::Char('q') => {
                 self.dash.open = false;
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.dash.open = false;
             }
-            KeyCode::Tab => {
-                let i = DASH_PANELS
-                    .iter()
-                    .position(|p| *p == self.dash.panel)
-                    .unwrap_or(0);
-                self.dash.panel = DASH_PANELS[(i + 1) % DASH_PANELS.len()];
+            // '/' activates the event feed filter.
+            KeyCode::Char('/') => {
+                self.dash.filter_active = true;
+                self.dash.focus = DashFocus::Feed;
             }
+            // Tab cycles focus between the four dashboard areas.
+            KeyCode::Tab => {
+                self.dash.focus = match self.dash.focus {
+                    DashFocus::Tree => DashFocus::Inspector,
+                    DashFocus::Inspector => DashFocus::Timeline,
+                    DashFocus::Timeline => DashFocus::Feed,
+                    DashFocus::Feed => DashFocus::Tree,
+                };
+            }
+            // F-key shortcuts for direct focus.
+            KeyCode::F(2) => self.dash.focus = DashFocus::Tree,
+            KeyCode::F(3) => self.dash.focus = DashFocus::Timeline,
+            KeyCode::F(4) => self.dash.focus = DashFocus::Inspector,
+            KeyCode::F(5) => self.dash.focus = DashFocus::Feed,
+            // PageUp/PageDown scroll the active area.
             KeyCode::PageUp => {
-                let p = panel_index(self.dash.panel);
+                let p = match self.dash.focus {
+                    DashFocus::Tree => 1,
+                    DashFocus::Inspector => 1,
+                    DashFocus::Timeline => 0,
+                    DashFocus::Feed => 2,
+                };
                 self.dash.scroll[p] = self.dash.scroll[p].saturating_add(10);
             }
             KeyCode::PageDown => {
-                let p = panel_index(self.dash.panel);
+                let p = match self.dash.focus {
+                    DashFocus::Tree => 1,
+                    DashFocus::Inspector => 1,
+                    DashFocus::Timeline => 0,
+                    DashFocus::Feed => 2,
+                };
                 self.dash.scroll[p] = self.dash.scroll[p].saturating_sub(10);
             }
+            // Up/Down select in tree, inspector, timeline, or feed.
             KeyCode::Up => {
-                let p = panel_index(self.dash.panel);
+                let p = match self.dash.focus {
+                    DashFocus::Tree => 1,
+                    DashFocus::Inspector => 1,
+                    DashFocus::Timeline => 0,
+                    DashFocus::Feed => 2,
+                };
                 self.dash.selected[p] = self.dash.selected[p].saturating_sub(1);
             }
             KeyCode::Down => {
-                let p = panel_index(self.dash.panel);
-                let len = panel_len(&self.dash, p);
+                let p = match self.dash.focus {
+                    DashFocus::Tree => 1,
+                    DashFocus::Inspector => 1,
+                    DashFocus::Timeline => 0,
+                    DashFocus::Feed => 2,
+                };
+                let len = match p {
+                    1 => self.dash.agents.len(),
+                    0 => self.dash.tasks.len(),
+                    _ => self.dash.events.len(),
+                };
                 if len > 0 {
                     self.dash.selected[p] = (self.dash.selected[p] + 1).min(len - 1);
                 }
             }
+            // Left: collapse current branch or select parent.
+            KeyCode::Left => {
+                let p = 1;
+                let idx = self.dash.selected[p];
+                if let Some(agent) = self.dash.agents.get(idx) {
+                    if !self.dash.collapsed.contains(&agent.agent_id) {
+                        self.dash.collapsed.insert(agent.agent_id.clone());
+                    } else {
+                        // Select the parent agent.
+                        if let Some(parent_idx) = self
+                            .dash
+                            .agents
+                            .iter()
+                            .position(|a| a.agent_id == agent.parent)
+                        {
+                            self.dash.selected[p] = parent_idx;
+                        }
+                    }
+                }
+            }
+            // Right: expand branch or enter child.
+            KeyCode::Right => {
+                let p = 1;
+                let idx = self.dash.selected[p];
+                if let Some(agent) = self.dash.agents.get(idx) {
+                    if self.dash.collapsed.contains(&agent.agent_id) {
+                        self.dash.collapsed.remove(&agent.agent_id);
+                    } else if let Some(child_idx) = self
+                        .dash
+                        .agents
+                        .iter()
+                        .position(|a| a.parent == agent.agent_id)
+                    {
+                        self.dash.selected[p] = child_idx;
+                    }
+                }
+            }
+            // Space: expand/collapse the selected agent's subtree.
+            KeyCode::Char(' ') => {
+                let p = 1;
+                let idx = self.dash.selected[p];
+                if let Some(agent) = self.dash.agents.get(idx) {
+                    if self.dash.collapsed.remove(&agent.agent_id) {
+                        // was collapsed → now expanded
+                    } else {
+                        self.dash.collapsed.insert(agent.agent_id.clone());
+                    }
+                }
+            }
+            // Enter: inspect (switch focus to inspector).
+            KeyCode::Enter => {
+                self.dash.focus = DashFocus::Inspector;
+            }
+            // Home/End: first/last item.
+            KeyCode::Home => {
+                let p = match self.dash.focus {
+                    DashFocus::Tree => 1,
+                    DashFocus::Inspector => 1,
+                    DashFocus::Timeline => 0,
+                    DashFocus::Feed => 2,
+                };
+                self.dash.selected[p] = 0;
+                self.dash.scroll[p] = 0;
+            }
+            KeyCode::End => {
+                let p = match self.dash.focus {
+                    DashFocus::Tree => 1,
+                    DashFocus::Inspector => 1,
+                    DashFocus::Timeline => 0,
+                    DashFocus::Feed => 2,
+                };
+                let len = match p {
+                    1 => self.dash.agents.len(),
+                    0 => self.dash.tasks.len(),
+                    _ => self.dash.events.len(),
+                };
+                if len > 0 {
+                    self.dash.selected[p] = len - 1;
+                }
+            }
+            // F1: help (no-op placeholder).
+            KeyCode::F(1) => {}
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return if self.is_running() {
                     UiAction::CancelRun
@@ -1445,9 +1658,7 @@ impl App {
             0
         };
 
-        let block = Block::default()
-            .borders(Borders::NONE)
-            .style(t.panel_style());
+        let block = Block::default().style(t.panel_style());
         frame.render_widget(block, area);
         frame.render_widget(
             Paragraph::new(rendered.lines)
@@ -1877,142 +2088,539 @@ impl App {
     fn render_dashboard(&self, frame: &mut Frame) {
         let t = &self.theme;
         let area = frame.area();
-        let [header, body, footer] = Layout::vertical([
+        if area.width < 20 || area.height < 10 {
+            return;
+        }
+        // Adaptive layout: header(1) + metrics(1) + body(min) + event_feed(adaptive) + footer(1)
+        let feed_h = if area.height >= 30 { 4 } else { 3 };
+        let [header, metrics, body, feed, footer] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(feed_h),
             Constraint::Length(1),
         ])
         .areas(area);
 
-        // Compact single-row header matching the session screen.
+        // Fill background.
+        frame.render_widget(Block::default().style(t.panel_style()), area);
+
+        self.render_dash_header(frame, header);
+        self.render_dash_metrics(frame, metrics);
+
+        // Body: if idle (no agents, no tasks) show the system monitor;
+        // otherwise show the agent tree + inspector + timeline split.
+        if self.dash.agents.is_empty() && self.dash.tasks.is_empty() {
+            self.render_idle_monitor(frame, body);
+        } else {
+            self.render_dash_body(frame, body);
+        }
+
+        self.render_event_feed(frame, feed);
+        self.render_dash_footer(frame, footer);
+    }
+
+    fn render_dash_header(&self, frame: &mut Frame, area: Rect) {
+        let t = &self.theme;
         let (done, total) = self.dash.task_progress();
-        let header_line = Line::from(vec![
+        let running = self.dash.running_count();
+        let conn = if self.dash.requests_completed > 0 {
+            "●"
+        } else if self.network_label.is_empty() {
+            "○"
+        } else {
+            "●"
+        };
+        let conn_color = if self.dash.requests_failed > self.dash.requests_completed {
+            Token::Warning
+        } else {
+            Token::Success
+        };
+        let spans = vec![
             Span::styled("REQUIEM", t.style_bold(Token::Accent)),
             Span::styled("  ", Style::new()),
-            Span::styled("[dashboard]", t.style_bold(Token::AccentBright)),
+            Span::styled("dashboard", t.style_bold(Token::AccentBright)),
             Span::styled(
-                format!(
-                    "  tasks {done}/{total}  ·  agents {}  ·  tok {}",
-                    self.dash.agents.len(),
-                    fmt_tokens(self.dash.total_tokens())
-                ),
+                format!("  ·  {}", truncate_chars(&self.project, 20)),
                 t.style(Token::TextSecondary),
             ),
+            Span::styled(
+                format!("  ·  {}/{total} tasks  ·  {running} agents", done),
+                t.style(Token::TextSecondary),
+            ),
+            Span::styled(format!("  ·  /{}", self.mode), t.style(Token::TextMuted)),
+            Span::styled(format!("  ·  {}", self.model), t.style(Token::TextMuted)),
+            Span::styled(format!("  {conn}",), t.style(conn_color)),
             Span::styled("  Esc close", t.style(Token::TextMuted)),
-        ]);
+        ];
         frame.render_widget(
-            Paragraph::new(header_line).wrap(Wrap { trim: false }),
-            header,
+            Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+            area,
         );
+    }
 
-        // Progress gauge row on top of the body.
-        let ratio = if total == 0 {
-            0.0
+    fn render_dash_metrics(&self, frame: &mut Frame, area: Rect) {
+        let t = &self.theme;
+        let total_tok = self.dash.total_tokens();
+        let dur = self.started.elapsed();
+        let dur_s = dur.as_secs();
+        let dur_str = if dur_s < 60 {
+            format!("{dur_s}s")
+        } else if dur_s < 3600 {
+            format!("{}m {}s", dur_s / 60, dur_s % 60)
         } else {
-            done as f64 / total as f64
+            format!("{}h {}m", dur_s / 3600, (dur_s % 3600) / 60)
         };
-        let [gauge_row, panels] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
-        if area.width > 40 {
-            frame.render_widget(
-                Gauge::default()
-                    .ratio(ratio)
-                    .label(Span::styled(
-                        format!(" progress {done}/{total} "),
-                        t.style(Token::Text),
-                    ))
-                    .gauge_style(t.style(Token::Accent)),
-                gauge_row,
-            );
-        }
-
-        // Panels: side-by-side when wide, stacked when narrow.
-        if area.width >= 80 {
-            let [left, right] =
-                Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
-                    .areas(panels);
-            let [tasks, agents] =
-                Layout::vertical([Constraint::Percentage(48), Constraint::Percentage(52)])
-                    .areas(left);
-            self.render_tasks_panel(frame, tasks);
-            self.render_agents_panel(frame, agents);
-            self.render_events_panel(frame, right);
+        let latency = if self.dash.last_request_ms > 0 {
+            format!("{}ms", self.dash.last_request_ms)
         } else {
-            let [tasks, agents, events] = Layout::vertical([
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-            ])
-            .areas(panels);
-            self.render_tasks_panel(frame, tasks);
-            self.render_agents_panel(frame, agents);
-            self.render_events_panel(frame, events);
+            String::new()
+        };
+        let conc = self.dash.running_count();
+        let mut spans = vec![
+            Span::styled("agents ", t.style(Token::TextMuted)),
+            Span::styled(
+                format!("{}/{}", self.dash.running_count(), self.dash.agents.len()),
+                t.style_bold(Token::Text),
+            ),
+            Span::styled("  tasks ", t.style(Token::TextMuted)),
+            Span::styled(
+                format!(
+                    "{}/{}, {}",
+                    self.dash.task_progress().0,
+                    self.dash.tasks.len(),
+                    self.dash
+                        .tasks
+                        .iter()
+                        .filter(|t| matches!(t.status, TaskStatus::Blocked))
+                        .count()
+                ),
+                t.style_bold(Token::Text),
+            ),
+            Span::styled("  tokens ", t.style(Token::TextMuted)),
+            Span::styled(fmt_tokens(total_tok), t.style_bold(Token::AccentBright)),
+            Span::styled("  ", t.style(Token::TextMuted)),
+            Span::styled(dur_str, t.style(Token::TextSecondary)),
+        ];
+        if !latency.is_empty() {
+            spans.push(Span::styled(
+                format!("  lat {latency}"),
+                t.style(Token::TextSecondary),
+            ));
         }
-
-        // Footer: selection detail + hints.
-        let detail = self.selected_detail();
+        if conc > 0 {
+            spans.push(Span::styled(
+                format!("  {conc} running"),
+                t.style(Token::Info),
+            ));
+        }
         frame.render_widget(
-            Paragraph::new(Line::from(detail)).wrap(Wrap { trim: false }),
-            footer,
+            Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+            area,
         );
     }
 
-    fn panel_block(&self, title: &str, panel: DashPanel) -> Block<'static> {
+    fn render_dash_body(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
-        let selected = self.dash.panel == panel;
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(if selected {
-                BorderType::Double
-            } else {
-                BorderType::Plain
-            })
-            .border_style(t.style(if selected {
-                Token::BorderActive
-            } else {
-                Token::Border
-            }))
-            .title(Span::styled(
-                format!(" {title} "),
-                if selected {
-                    t.style_bold(Token::Accent)
-                } else {
-                    t.style(Token::TextMuted)
-                }
-                .add_modifier(Modifier::BOLD),
-            ))
+        if area.width >= 100 {
+            let [left, right] =
+                Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+                    .areas(area);
+            let [tree, timeline] =
+                Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
+                    .areas(left);
+            self.render_agent_tree(frame, tree);
+            self.render_task_timeline(frame, timeline);
+            self.render_inspector(frame, right);
+        } else {
+            let [tree, timeline, inspector] = Layout::vertical([
+                Constraint::Percentage(45),
+                Constraint::Percentage(25),
+                Constraint::Percentage(30),
+            ])
+            .areas(area);
+            self.render_agent_tree(frame, tree);
+            self.render_task_timeline(frame, timeline);
+            self.render_inspector(frame, inspector);
+        }
+        let _ = t;
     }
 
-    fn render_tasks_panel(&self, frame: &mut Frame, area: Rect) {
+    fn render_agent_tree(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
-        let block = self.panel_block("tasks", DashPanel::Tasks);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            " agents",
+            t.style_bold(Token::TextMuted),
+        ))];
+        // Build the tree recursively from root agents (empty parent).
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for agent in self.dash.agents.iter().filter(|a| a.is_master()) {
+            self.build_tree_lines(agent, "", &mut lines, &mut visited, t, false);
+        }
+        // Orphaned agents (parent not in list).
+        let known: std::collections::HashSet<&str> = self
+            .dash
+            .agents
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
+        for agent in self.dash.agents.iter() {
+            if !agent.is_master()
+                && !known.contains(agent.parent.as_str())
+                && visited.insert(agent.agent_id.clone())
+            {
+                self.build_tree_lines(
+                    agent,
+                    "",
+                    &mut lines,
+                    &mut std::collections::HashSet::new(),
+                    t,
+                    true,
+                );
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((self.dash.scroll[1] as u16, 0)),
+            area,
+        );
+    }
 
-        let width = inner.width.saturating_sub(2) as usize;
-        let mut lines: Vec<Line<'static>> = Vec::new();
+    fn build_tree_lines(
+        &self,
+        agent: &AgentRow,
+        prefix: &str,
+        lines: &mut Vec<Line<'static>>,
+        visited: &mut std::collections::HashSet<String>,
+        t: &Theme,
+        is_orphan: bool,
+    ) {
+        if !visited.insert(agent.agent_id.clone()) {
+            // Circular reference protection.
+            lines.push(Line::from(Span::styled(
+                format!("{}  [cycle: {}]", prefix, agent.agent_id),
+                t.style(Token::Warning),
+            )));
+            return;
+        }
+        let is_collapsed = self.dash.collapsed.contains(&agent.agent_id);
+        let children: Vec<&AgentRow> = self
+            .dash
+            .agents
+            .iter()
+            .filter(|c| c.parent == agent.agent_id)
+            .collect();
+
+        let has_children = !children.is_empty();
+        let connector = if is_orphan {
+            "?─ "
+        } else if has_children {
+            "├─ "
+        } else {
+            "└─ "
+        };
+        let child_prefix = if is_orphan {
+            String::new()
+        } else if has_children {
+            format!("{prefix}│  ")
+        } else {
+            format!("{prefix} ")
+        };
+
+        let status_token = t.status_token(&agent.status.to_string());
+        let name_style = if agent.is_master() {
+            t.style_bold(Token::Accent)
+        } else {
+            t.style_bold(Token::Text)
+        };
+        let sel = self.dash.selected[1]
+            == self
+                .dash
+                .agents
+                .iter()
+                .position(|a| a.agent_id == agent.agent_id)
+                .unwrap_or(0);
+        let mut spans = vec![Span::styled(
+            format!("{prefix}{connector}"),
+            t.style(Token::Border),
+        )];
+        if sel {
+            spans.push(Span::styled("▸ ", t.style_bold(Token::AccentBright)));
+        }
+        spans.push(Span::styled(
+            truncate_chars(&agent.agent_id, 16),
+            name_style,
+        ));
+        spans.push(Span::styled(
+            format!(" ({})", truncate_chars(&agent.role, 10)),
+            t.style(Token::TextMuted),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", agent.status),
+            t.style(status_token),
+        ));
+        if has_children && is_collapsed {
+            spans.push(Span::styled(
+                format!(" [+{}]", children.len()),
+                t.style(Token::TextMuted),
+            ));
+        }
+        let tok = agent.tokens_in + agent.tokens_out;
+        if tok > 0 {
+            spans.push(Span::styled(
+                format!("  tok {}", fmt_tokens(tok)),
+                t.style(Token::TextSecondary),
+            ));
+        }
+        lines.push(Line::from(spans));
+
+        if !is_collapsed {
+            for (i, child) in children.iter().enumerate() {
+                let is_last = i + 1 == children.len();
+                let c_conn = if is_last { "└─ " } else { "├─ " };
+                let c_prefix = if has_children && !is_last {
+                    child_prefix.to_string()
+                } else {
+                    format!("{prefix}   ")
+                };
+                // Rebuild with the correct child connector.
+                let c_prefix2 = if c_prefix.ends_with('│') {
+                    format!("{} ", c_prefix)
+                } else {
+                    c_prefix
+                };
+                self.build_tree_lines_with_connector(
+                    child, &c_prefix2, c_conn, lines, visited, t, false,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_tree_lines_with_connector(
+        &self,
+        agent: &AgentRow,
+        prefix: &str,
+        connector: &str,
+        lines: &mut Vec<Line<'static>>,
+        visited: &mut std::collections::HashSet<String>,
+        t: &Theme,
+        _is_orphan: bool,
+    ) {
+        if !visited.insert(agent.agent_id.clone()) {
+            lines.push(Line::from(Span::styled(
+                format!("{}{connector}  [cycle: {}]", prefix, agent.agent_id),
+                t.style(Token::Warning),
+            )));
+            return;
+        }
+        let is_collapsed = self.dash.collapsed.contains(&agent.agent_id);
+        let children: Vec<&AgentRow> = self
+            .dash
+            .agents
+            .iter()
+            .filter(|c| c.parent == agent.agent_id)
+            .collect();
+        let has_children = !children.is_empty();
+        let child_prefix = if has_children && !is_collapsed {
+            format!("{prefix}│ ")
+        } else {
+            format!("{prefix}  ")
+        };
+
+        let status_token = t.status_token(&agent.status.to_string());
+        let name_style = if agent.is_master() {
+            t.style_bold(Token::Accent)
+        } else {
+            t.style_bold(Token::Text)
+        };
+        let sel = self.dash.selected[1]
+            == self
+                .dash
+                .agents
+                .iter()
+                .position(|a| a.agent_id == agent.agent_id)
+                .unwrap_or(0);
+        let mut spans = vec![Span::styled(
+            format!("{prefix}{connector}"),
+            t.style(Token::Border),
+        )];
+        if sel {
+            spans.push(Span::styled("▸ ", t.style_bold(Token::AccentBright)));
+        }
+        spans.push(Span::styled(
+            truncate_chars(&agent.agent_id, 16),
+            name_style,
+        ));
+        spans.push(Span::styled(
+            format!(" ({})", truncate_chars(&agent.role, 10)),
+            t.style(Token::TextMuted),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", agent.status),
+            t.style(status_token),
+        ));
+        if has_children && is_collapsed {
+            spans.push(Span::styled(
+                format!(" [+{}]", children.len()),
+                t.style(Token::TextMuted),
+            ));
+        }
+        let tok = agent.tokens_in + agent.tokens_out;
+        if tok > 0 {
+            spans.push(Span::styled(
+                format!("  tok {}", fmt_tokens(tok)),
+                t.style(Token::TextSecondary),
+            ));
+        }
+        lines.push(Line::from(spans));
+
+        if !is_collapsed {
+            for (i, child) in children.iter().enumerate() {
+                let is_last = i + 1 == children.len();
+                let c_conn = if is_last { "└─ " } else { "├─ " };
+                let c_prefix = if !is_last {
+                    child_prefix.to_string()
+                } else {
+                    format!("{prefix}   ")
+                };
+                self.build_tree_lines_with_connector(
+                    child, &c_prefix, c_conn, lines, visited, t, false,
+                );
+            }
+        }
+    }
+
+    fn render_inspector(&self, frame: &mut Frame, area: Rect) {
+        let t = &self.theme;
+        let p = 1;
+        let idx = self.dash.selected[p];
+        let agent = self.dash.agents.get(idx);
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            " inspector",
+            t.style_bold(Token::TextMuted),
+        ))];
+        match agent {
+            Some(a) => {
+                lines.push(Line::from(vec![
+                    Span::styled(truncate_chars(&a.agent_id, 24), t.style_bold(Token::Text)),
+                    Span::styled(
+                        format!("  ({})", truncate_chars(&a.role, 12)),
+                        t.style(Token::TextMuted),
+                    ),
+                ]));
+                let st = t.status_token(&a.status.to_string());
+                lines.push(Line::from(vec![
+                    Span::styled(" status ", t.style(Token::TextMuted)),
+                    Span::styled(a.status.to_string(), t.style(st)),
+                ]));
+                if !a.parent.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(" parent ", t.style(Token::TextMuted)),
+                        Span::styled(truncate_chars(&a.parent, 24), t.style(Token::TextSecondary)),
+                    ]));
+                }
+                if !a.current_task.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(" task   ", t.style(Token::TextMuted)),
+                        Span::styled(truncate_chars(&a.current_task, 32), t.style(Token::Text)),
+                    ]));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(" tokens ", t.style(Token::TextMuted)),
+                    Span::styled(
+                        format!(
+                            "{} in / {} out / {}",
+                            fmt_tokens(a.tokens_in),
+                            fmt_tokens(a.tokens_out),
+                            fmt_tokens(a.tokens_in + a.tokens_out)
+                        ),
+                        t.style(Token::TextSecondary),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(" turns ", t.style(Token::TextMuted)),
+                    Span::styled(
+                        format!("{}/{}", a.turns_used, a.turns_max),
+                        t.style(Token::TextSecondary),
+                    ),
+                ]));
+                if !a.last_error.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(" error  ", t.style(Token::TextMuted)),
+                        Span::styled(truncate_chars(&a.last_error, 40), t.style(Token::Error)),
+                    ]));
+                }
+                if !a.recent_tools.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        " tools ",
+                        t.style(Token::TextMuted),
+                    )));
+                    for tool in a.recent_tools.iter().rev().take(3) {
+                        lines.push(Line::from(vec![
+                            Span::styled("  ", t.style(Token::TextMuted)),
+                            Span::styled(truncate_chars(tool, 36), t.style(Token::TextSecondary)),
+                        ]));
+                    }
+                }
+                if a.status == AgentStatus::Running {
+                    lines.push(Line::from(Span::styled(
+                        format!(" {} active", spinner_glyph(self.started)),
+                        t.style(Token::Info),
+                    )));
+                }
+            }
+            None => lines.push(Line::from(Span::styled(
+                "  no agent selected",
+                t.style(Token::TextMuted),
+            ))),
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    fn render_task_timeline(&self, frame: &mut Frame, area: Rect) {
+        let t = &self.theme;
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            " timeline",
+            t.style_bold(Token::TextMuted),
+        ))];
         if self.dash.tasks.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  no tasks yet — submit one in the session",
+                "  no tasks",
                 t.style(Token::TextMuted),
             )));
         }
-        let p = panel_index(DashPanel::Tasks);
-        for (i, task) in self.dash.tasks.iter().enumerate() {
-            let token = status_task_token(task.status);
-            let sel = self.dash.panel == DashPanel::Tasks && i == self.dash.selected[p];
-            let desc = truncate_chars(&task.description, width.saturating_sub(28).max(8));
+        // Sort tasks by started time (0 = not started), then by id.
+        let mut tasks: Vec<&TaskRow> = self.dash.tasks.iter().collect();
+        tasks.sort_by(|a, b| {
+            b.started_rel_secs
+                .cmp(&a.started_rel_secs)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        for task in tasks.iter() {
+            let tok = status_task_token(task.status);
+            let time_str = if task.started_rel_secs > 0 {
+                format!(" +{}s", task.started_rel_secs)
+            } else {
+                "  —  ".to_string()
+            };
+            let sel = self.dash.selected[0]
+                == self
+                    .dash
+                    .tasks
+                    .iter()
+                    .position(|t| t.id == task.id)
+                    .unwrap_or(0);
             let mut spans = vec![
                 Span::styled(
-                    if sel { " ▸ " } else { "   " },
+                    if sel { "▸ " } else { "  " },
                     t.style_bold(Token::AccentBright),
                 ),
-                Span::styled(truncate_chars(&task.id, 8), t.style(Token::TextMuted)),
-                Span::styled(" ", t.style(Token::TextMuted)),
-                Span::styled(task.status.label(), t.style(token)),
-                Span::styled("  ", t.style(Token::TextMuted)),
+                Span::styled(time_str, t.style(Token::TextMuted)),
+                Span::styled(task.status.label(), t.style(tok)),
                 Span::styled(
-                    desc,
+                    format!("  {}", truncate_chars(&task.description, 28)),
                     t.style(if sel {
                         Token::Text
                     } else {
@@ -2022,241 +2630,152 @@ impl App {
             ];
             if let Some(a) = &task.assignee {
                 spans.push(Span::styled(
-                    format!(" ← {}", truncate_chars(a, 12)),
+                    format!("  ← {}", truncate_chars(a, 10)),
                     t.style(Token::Violet),
                 ));
             }
             lines.push(Line::from(spans));
-            if !task.dependencies.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("     ⧗ {}", task.dependencies.join(", ")),
-                    t.style(Token::TextMuted),
-                )));
-            }
         }
-
-        let viewport = inner.height as usize;
-        let total = lines.len();
-        let offset = if total > viewport {
-            (total - viewport).saturating_sub(self.dash.scroll[p]) as u16
-        } else {
-            0
-        };
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .scroll((offset, 0)),
-            inner,
+                .scroll((self.dash.scroll[0] as u16, 0)),
+            area,
         );
     }
 
-    fn render_agents_panel(&self, frame: &mut Frame, area: Rect) {
+    fn render_event_feed(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
-        let block = self.panel_block("agents", DashPanel::Agents);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let width = inner.width.saturating_sub(2) as usize;
+        // Show the most recent events that fit. Auto-follow when scroll is 0.
         let mut lines: Vec<Line<'static>> = Vec::new();
-        if self.dash.agents.is_empty() {
+        let events = &self.dash.events;
+        // Show filter indicator if active.
+        if !self.dash.filter.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  no agents — run a task to see the hierarchy",
-                t.style(Token::TextMuted),
+                format!(" filter: {}", self.dash.filter),
+                t.style_bold(Token::Warning),
             )));
         }
-        let p = panel_index(DashPanel::Agents);
-        for (i, agent) in self.dash.agents.iter().enumerate() {
-            let token = t.status_token(&agent.status.to_string());
-            let sel = self.dash.panel == DashPanel::Agents && i == self.dash.selected[p];
-            let depth_prefix = if agent.parent.is_empty() {
-                String::new()
+        if events.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " events — no activity yet",
+                t.style(Token::TextMuted),
+            )));
+        } else {
+            let p = 2;
+            // Filter events if a filter is active.
+            let filtered: Vec<&LogEvent> = if self.dash.filter.is_empty() {
+                events.iter().collect()
             } else {
-                "  └─ ".to_string()
+                let filter = self.dash.filter.to_lowercase();
+                events
+                    .iter()
+                    .filter(|le| {
+                        let summary = le.event.summary().to_lowercase();
+                        summary.contains(&filter)
+                    })
+                    .collect()
             };
-            let name_width = width.saturating_sub(30).max(8);
-            let mut spans = vec![
-                Span::styled(
-                    if sel { " ▸ " } else { "   " },
-                    t.style_bold(Token::AccentBright),
-                ),
-                Span::styled(depth_prefix, t.style(Token::Border)),
-                Span::styled(
-                    truncate_chars(&agent.agent_id, name_width),
-                    t.style_bold(Token::Text),
-                ),
-                Span::styled(
-                    format!(" ({})", truncate_chars(&agent.role, 12)),
-                    t.style(Token::TextMuted),
-                ),
-                Span::styled(" ", t.style(Token::TextMuted)),
-                Span::styled(agent.status.to_string(), t.style(token)),
-                Span::styled(
-                    format!("  t{}/{}", agent.turns_used, agent.turns_max),
-                    t.style(Token::TextMuted),
-                ),
-                Span::styled(
-                    format!("  tok {}", fmt_tokens(agent.tokens_in + agent.tokens_out)),
-                    t.style(Token::TextSecondary),
-                ),
-            ];
-            if !agent.current_task.is_empty() {
-                spans.push(Span::styled(
-                    format!("  {}", truncate_chars(&agent.current_task, 32)),
-                    t.style(Token::TextSecondary),
-                ));
+            let visible = filtered.as_slice();
+            let start = if self.dash.scroll[p] == 0 {
+                visible.len().saturating_sub(area.height as usize)
+            } else {
+                (visible.len().saturating_sub(self.dash.scroll[p])).min(area.height as usize)
+            };
+            for (i, le) in visible.iter().enumerate().skip(start) {
+                let summary = le.event.summary();
+                if summary.is_empty() {
+                    continue;
+                }
+                let tok = event_token(&le.event);
+                let sel = self.dash.selected[p] == i;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if sel { "▸" } else { " " },
+                        t.style_bold(Token::AccentBright),
+                    ),
+                    Span::styled(format!(" +{:>4}s ", le.rel_secs), t.style(Token::TextMuted)),
+                    Span::styled(
+                        truncate_chars(&summary, area.width as usize - 12),
+                        t.style(if sel { Token::Text } else { tok }),
+                    ),
+                ]));
             }
-            lines.push(Line::from(spans));
         }
-
-        let viewport = inner.height as usize;
-        let total = lines.len();
-        let offset = if total > viewport {
-            (total - viewport).saturating_sub(self.dash.scroll[p]) as u16
-        } else {
-            0
-        };
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((offset, 0)),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
-    fn render_events_panel(&self, frame: &mut Frame, area: Rect) {
+    fn render_idle_monitor(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
-        let block = self.panel_block("events", DashPanel::Events);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let width = inner.width.saturating_sub(2) as usize;
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        if self.dash.events.is_empty() {
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            " system monitor",
+            t.style_bold(Token::TextMuted),
+        ))];
+        // Model section.
+        lines.push(Line::from(vec![
+            Span::styled(" model   ", t.style(Token::TextMuted)),
+            Span::styled(self.model.clone(), t.style_bold(Token::Text)),
+        ]));
+        if !self.network_label.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(" network ", t.style(Token::TextMuted)),
+                Span::styled(self.network_label.clone(), t.style(Token::TextSecondary)),
+            ]));
+        }
+        // History section.
+        if !self.dash.history.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  no events yet",
+                " recent sessions",
                 t.style(Token::TextMuted),
             )));
-        }
-        let p = panel_index(DashPanel::Events);
-        for (i, le) in self.dash.events.iter().enumerate().rev() {
-            let sel = self.dash.panel == DashPanel::Events && i == self.dash.selected[p];
-            let mut spans = vec![
-                Span::styled(
-                    if sel { " ▸" } else { "  " },
-                    t.style_bold(Token::AccentBright),
-                ),
-                Span::styled(format!(" +{:>4}s ", le.rel_secs), t.style(Token::TextMuted)),
-            ];
-            let summary = le.event.summary();
-            if summary.is_empty() {
-                continue; // deltas are rendered in the transcript, not the log
+            for h in self.dash.history.iter().take(5) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", truncate_chars(&h.session_id, 8)),
+                        t.style(Token::TextMuted),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} tasks · {} tok",
+                            h.task_count,
+                            fmt_tokens(h.tokens_in + h.tokens_out)
+                        ),
+                        t.style(Token::TextSecondary),
+                    ),
+                    Span::styled(
+                        format!(" · {}", truncate_chars(&h.last_activity, 20)),
+                        t.style(Token::TextMuted),
+                    ),
+                ]));
             }
-            let token = event_token(&le.event);
-            spans.push(Span::styled(
-                wrap_to_width(&summary, width.saturating_sub(10).max(8)).join(" "),
-                t.style(if sel { Token::Text } else { token }),
-            ));
-            lines.push(Line::from(spans));
         }
-
-        let viewport = inner.height as usize;
-        let total = lines.len();
-        let offset = if total > viewport {
-            (total - viewport).saturating_sub(self.dash.scroll[p]) as u16
-        } else {
-            0
-        };
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((offset, 0)),
-            inner,
-        );
+        // Quick hints.
+        lines.push(Line::from(Span::styled(
+            "  submit a task to begin · Tab for dashboard · Esc to return",
+            t.style(Token::TextMuted),
+        )));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
-    /// Detail line for the currently selected item.
-    fn selected_detail(&self) -> Vec<Span<'static>> {
+    fn render_dash_footer(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
-        let p = panel_index(self.dash.panel);
-        match self.dash.panel {
-            DashPanel::Tasks => {
-                let task = self.dash.tasks.get(self.dash.selected[p]);
-                match task {
-                    Some(task) => vec![Span::styled(
-                        format!(
-                            "  {} — {} — {} — prio {}",
-                            task.id,
-                            task.status.label(),
-                            task.description,
-                            task.priority
-                        ),
-                        t.style(Token::Text),
-                    )],
-                    None => vec![Span::styled(
-                        "  no task selected",
-                        t.style(Token::TextMuted),
-                    )],
-                }
+        let hint = match self.dash.focus {
+            DashFocus::Tree => {
+                "↑↓ select · ←→ expand/collapse · Enter inspect · Space toggle · Tab area"
             }
-            DashPanel::Agents => {
-                let agent = self.dash.agents.get(self.dash.selected[p]);
-                match agent {
-                    Some(a) => vec![Span::styled(
-                        format!(
-                            "  {} — {} — {} — task: {} — tok {}/{}",
-                            a.agent_id,
-                            a.role,
-                            a.status,
-                            if a.current_task.is_empty() {
-                                "-"
-                            } else {
-                                &a.current_task
-                            },
-                            a.tokens_in,
-                            a.tokens_out
-                        ),
-                        t.style(Token::Text),
-                    )],
-                    None => vec![Span::styled(
-                        "  no agent selected",
-                        t.style(Token::TextMuted),
-                    )],
-                }
-            }
-            DashPanel::Events => {
-                let le = self.dash.events.get(self.dash.selected[p]);
-                match le {
-                    Some(le) => vec![Span::styled(
-                        format!("  +{}s {}", le.rel_secs, le.event.summary()),
-                        t.style(Token::Text),
-                    )],
-                    None => vec![Span::styled(
-                        "  no event selected",
-                        t.style(Token::TextMuted),
-                    )],
-                }
-            }
-        }
+            DashFocus::Inspector => "←↑↓→ navigate · Tab area · Esc back to tree",
+            DashFocus::Timeline => "↑↓ scroll · Tab area · Esc back to tree",
+            DashFocus::Feed => "↑↓ scroll · Tab area · Esc back to tree",
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint, t.style(Token::TextMuted))))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
-
-fn panel_index(p: DashPanel) -> usize {
-    match p {
-        DashPanel::Tasks => 0,
-        DashPanel::Agents => 1,
-        DashPanel::Events => 2,
-    }
-}
-
-fn panel_len(dash: &DashState, p: usize) -> usize {
-    match p {
-        0 => dash.tasks.len(),
-        1 => dash.agents.len(),
-        _ => dash.events.len(),
-    }
-}
 
 fn status_task_token(status: TaskStatus) -> Token {
     match status {
@@ -2757,16 +3276,18 @@ fn hello() {
             output_tokens: 5,
         });
         app.dash.open = true;
-        assert_eq!(app.dash.panel, DashPanel::Tasks);
+        assert_eq!(app.dash.focus, DashFocus::Tree);
         app.handle_key(test_key(KeyCode::Tab));
-        assert_eq!(app.dash.panel, DashPanel::Agents);
+        assert_eq!(app.dash.focus, DashFocus::Inspector);
         app.handle_key(test_key(KeyCode::Tab));
-        assert_eq!(app.dash.panel, DashPanel::Events);
+        assert_eq!(app.dash.focus, DashFocus::Timeline);
         app.handle_key(test_key(KeyCode::Tab));
-        assert_eq!(app.dash.panel, DashPanel::Tasks);
-        // Task selection + detail.
+        assert_eq!(app.dash.focus, DashFocus::Feed);
+        app.handle_key(test_key(KeyCode::Tab));
+        assert_eq!(app.dash.focus, DashFocus::Tree);
+        // Agent selection.
         app.handle_key(test_key(KeyCode::Down));
-        assert_eq!(app.dash.selected[0], 0, "single task stays at 0");
+        assert_eq!(app.dash.selected[1], 0, "single agent stays at 0");
         // Esc closes.
         app.handle_key(test_key(KeyCode::Esc));
         assert!(!app.dash.open);
@@ -3839,5 +4360,110 @@ fn hello() {
         app.handle_key(key);
         assert_eq!(app.composer.text, "line1\n");
         assert!(app.composer.multiline);
+    }
+
+    // ── Dashboard tests ─────────────────────────────────────────────
+
+    #[test]
+    fn dashboard_shows_agent_tree_with_spawned_agents() {
+        let mut app = test_app();
+        // Spawn a master and two children.
+        app.push_event(&Event::AgentSpawned {
+            parent: "master".into(),
+            child: "worker-1".into(),
+            role: "implementer".into(),
+            description: "subtask 1".into(),
+        });
+        app.push_event(&Event::AgentSpawned {
+            parent: "master".into(),
+            child: "worker-2".into(),
+            role: "tester".into(),
+            description: "subtask 2".into(),
+        });
+        app.dash.open = true;
+        let text = visible_text(&app, 120, 40);
+        assert!(text.contains("worker-1"), "agent 1 visible: {text}");
+        assert!(text.contains("worker-2"), "agent 2 visible: {text}");
+        assert!(text.contains("REQUIEM"), "dashboard header");
+    }
+
+    #[test]
+    fn dashboard_filter_narrows_event_feed() {
+        let mut app = test_app();
+        // Add some events.
+        app.push_event(&Event::RunStarted {
+            agent: "master".into(),
+            role: "master".into(),
+            task: requiem_core::Id::new(),
+            description: "start task".into(),
+            mode: "code".into(),
+        });
+        app.push_event(&Event::ToolCallFinished {
+            agent: "master".into(),
+            tool: "read_file".into(),
+            ok: true,
+            summary: "ok".into(),
+            duration_ms: 10,
+        });
+        app.dash.open = true;
+        // Activate filter and type "read".
+        app.handle_key(test_key(KeyCode::Char('/')));
+        assert!(app.dash.filter_active);
+        for c in "read".chars() {
+            app.handle_key(test_key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.dash.filter, "read");
+        // The feed should now only show events matching "read".
+        let text = visible_text(&app, 120, 40);
+        assert!(
+            text.contains("filter: read"),
+            "filter indicator visible: {text}"
+        );
+        // Clear the filter with Esc.
+        app.handle_key(test_key(KeyCode::Esc));
+        assert!(!app.dash.filter_active);
+        assert_eq!(app.dash.filter, "");
+    }
+
+    #[test]
+    fn dashboard_idle_monitor_shows_model_info() {
+        let mut app = test_app();
+        // No agents or tasks — the idle monitor should show.
+        app.dash.open = true;
+        let text = visible_text(&app, 120, 40);
+        assert!(
+            text.contains("system monitor"),
+            "idle monitor visible: {text}"
+        );
+        assert!(text.contains("test-model"), "model name shown: {text}");
+    }
+
+    #[test]
+    fn dashboard_focus_cycles_with_tab() {
+        let mut app = test_app();
+        app.dash.open = true;
+        assert_eq!(app.dash.focus, DashFocus::Tree);
+        app.handle_key(test_key(KeyCode::Tab));
+        assert_eq!(app.dash.focus, DashFocus::Inspector);
+        app.handle_key(test_key(KeyCode::Tab));
+        assert_eq!(app.dash.focus, DashFocus::Timeline);
+        app.handle_key(test_key(KeyCode::Tab));
+        assert_eq!(app.dash.focus, DashFocus::Feed);
+        app.handle_key(test_key(KeyCode::Tab));
+        assert_eq!(app.dash.focus, DashFocus::Tree);
+    }
+
+    #[test]
+    fn dashboard_f_key_shortcuts_set_focus() {
+        let mut app = test_app();
+        app.dash.open = true;
+        app.handle_key(test_key(KeyCode::F(2)));
+        assert_eq!(app.dash.focus, DashFocus::Tree);
+        app.handle_key(test_key(KeyCode::F(3)));
+        assert_eq!(app.dash.focus, DashFocus::Timeline);
+        app.handle_key(test_key(KeyCode::F(4)));
+        assert_eq!(app.dash.focus, DashFocus::Inspector);
+        app.handle_key(test_key(KeyCode::F(5)));
+        assert_eq!(app.dash.focus, DashFocus::Feed);
     }
 }

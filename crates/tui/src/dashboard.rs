@@ -55,6 +55,15 @@ pub struct AgentRow {
     /// The parent agent ID, empty for top-level (master) agents.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub parent: String,
+    /// The last error string for this agent, if it failed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
+    /// Compact tool-call summaries, most recent last. Bounded to the last 5.
+    #[serde(default)]
+    pub recent_tools: Vec<String>,
+    /// Seconds since session start when the agent was first observed.
+    #[serde(default)]
+    pub created_rel_secs: u64,
 }
 
 impl AgentRow {
@@ -69,12 +78,23 @@ impl AgentRow {
             tokens_in: 0,
             tokens_out: 0,
             parent: String::new(),
+            last_error: String::new(),
+            recent_tools: Vec::new(),
+            created_rel_secs: 0,
         }
     }
 
     /// Whether this agent is a top-level (master) agent.
     pub fn is_master(&self) -> bool {
         self.parent.is_empty()
+    }
+
+    /// Push a tool summary, keeping only the last 5.
+    pub fn push_tool(&mut self, summary: String) {
+        self.recent_tools.push(summary);
+        if self.recent_tools.len() > 5 {
+            self.recent_tools.remove(0);
+        }
     }
 }
 
@@ -358,6 +378,16 @@ pub struct TaskRow {
     pub dependencies: Vec<String>,
     /// The agent currently assigned, if any.
     pub assignee: Option<String>,
+    /// The parent task id, empty for top-level tasks.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent_task: String,
+    /// Seconds since session start when the task was first observed.
+    #[serde(default)]
+    pub started_rel_secs: u64,
+    /// Seconds since session start when the task reached a terminal state,
+    /// or 0 if still in-flight.
+    #[serde(default)]
+    pub completed_rel_secs: u64,
 }
 
 /// The full task-dashboard state.
@@ -538,6 +568,9 @@ mod tests {
                     tokens_in: 100,
                     tokens_out: 50,
                     parent: String::new(),
+                    last_error: String::new(),
+                    recent_tools: Vec::new(),
+                    created_rel_secs: 0,
                 },
                 AgentRow {
                     agent_id: "agent-2".into(),
@@ -549,6 +582,9 @@ mod tests {
                     tokens_in: 200,
                     tokens_out: 100,
                     parent: "agent-1".into(),
+                    last_error: String::new(),
+                    recent_tools: vec!["read_file".to_string(), "edit".to_string()],
+                    created_rel_secs: 5,
                 },
             ],
             total_tasks: 4,
@@ -669,6 +705,9 @@ mod tests {
                     priority: 5,
                     dependencies: vec!["t0".into()],
                     assignee: Some("agent-1".into()),
+                    parent_task: String::new(),
+                    started_rel_secs: 0,
+                    completed_rel_secs: 0,
                 },
                 TaskRow {
                     id: "t0".into(),
@@ -677,6 +716,9 @@ mod tests {
                     priority: 9,
                     dependencies: vec![],
                     assignee: None,
+                    parent_task: String::new(),
+                    started_rel_secs: 0,
+                    completed_rel_secs: 10,
                 },
                 TaskRow {
                     id: "t2".into(),
@@ -685,6 +727,9 @@ mod tests {
                     priority: 1,
                     dependencies: vec!["t1".into()],
                     assignee: None,
+                    parent_task: String::new(),
+                    started_rel_secs: 0,
+                    completed_rel_secs: 0,
                 },
             ],
         };

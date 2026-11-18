@@ -12,7 +12,7 @@ pub mod dashboard;
 pub mod markdown;
 pub mod theme;
 
-pub use app::{fmt_tokens, App, CommandHints, DashState, UiAction};
+pub use app::{fmt_tokens, App, CommandHints, DashFocus, DashState, HistoryEntry, UiAction};
 pub use banner::{banner, render_banner, render_themed, BANNER};
 pub use color::ColorMode;
 pub use dashboard::{

@@ -79,6 +79,16 @@ pub enum Event {
         input_tokens: u32,
         output_tokens: u32,
     },
+    /// A model request finished (success or final failure) with its
+    /// wall-clock duration. Emitted by the model client after each
+    /// non-streaming or streaming request completes.
+    ModelRequestCompleted {
+        agent: String,
+        /// Wall-clock duration of the request in milliseconds.
+        duration_ms: u64,
+        /// Whether the request ultimately succeeded.
+        ok: bool,
+    },
     /// A run finished successfully.
     RunCompleted {
         agent: String,
@@ -175,6 +185,15 @@ impl Event {
                 ..
             } => {
                 format!("{agent} usage: {input_tokens} in / {output_tokens} out")
+            }
+            Event::ModelRequestCompleted {
+                agent,
+                duration_ms,
+                ok,
+                ..
+            } => {
+                let mark = if *ok { "✓" } else { "✗" };
+                format!("{agent} {mark} model request ({duration_ms}ms)")
             }
             Event::RunCompleted {
                 agent,
