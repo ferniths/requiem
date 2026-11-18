@@ -124,15 +124,22 @@ pub enum RequiemError {
 
 impl RequiemError {
     /// Whether this error class is worth retrying (transient).
+    ///
+    /// TLS/certificate failures, malformed requests, bad credentials and
+    /// invalid configuration are permanent: retrying them forever only
+    /// delays the actionable error. Only genuinely transient transport and
+    /// upstream conditions are retried (the retry policy additionally caps
+    /// the attempt count).
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Connection(_)
             | Self::Dns(_)
-            | Self::Tls(_)
             | Self::RateLimited { .. }
             | Self::Timeout(_)
-            | Self::GatewayFailure { .. }
-            | Self::StreamingFailure(_) => true,
+            | Self::GatewayFailure { .. } => true,
+            // A stream that failed after data was delivered cannot be
+            // transparently replayed without duplicating output.
+            Self::StreamingFailure(_) => false,
             Self::Model { status, .. } => status.is_some_and(|s| s >= 500 || s == 429),
             _ => false,
         }
@@ -171,5 +178,65 @@ impl RequiemError {
 impl From<serde_json::Error> for RequiemError {
     fn from(e: serde_json::Error) -> Self {
         Self::InvalidResponse(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_errors_are_retryable() {
+        assert!(RequiemError::Connection("x".into()).is_retryable());
+        assert!(RequiemError::Dns("x".into()).is_retryable());
+        assert!(RequiemError::Timeout(10).is_retryable());
+        assert!(RequiemError::RateLimited { retry_after_ms: 1 }.is_retryable());
+        assert!(RequiemError::GatewayFailure {
+            status: 502,
+            message: "x".into()
+        }
+        .is_retryable());
+        assert!(RequiemError::Model {
+            status: Some(503),
+            message: "x".into()
+        }
+        .is_retryable());
+    }
+
+    #[test]
+    fn permanent_errors_are_not_retryable() {
+        // A TLS certificate failure will not fix itself by retrying.
+        assert!(!RequiemError::Tls("certificate".into()).is_retryable());
+        assert!(!RequiemError::Auth("bad key".into()).is_retryable());
+        assert!(!RequiemError::MissingCredentials.is_retryable());
+        assert!(!RequiemError::Config("bad".into()).is_retryable());
+        assert!(!RequiemError::ModelUnavailable("m".into()).is_retryable());
+        assert!(!RequiemError::QuotaExhausted("q".into()).is_retryable());
+        assert!(!RequiemError::ToolCallingIncompatible("t".into()).is_retryable());
+        assert!(!RequiemError::InvalidResponse("r".into()).is_retryable());
+        assert!(!RequiemError::StreamingFailure("s".into()).is_retryable());
+        assert!(!RequiemError::ContextLength {
+            requested: 1,
+            limit: Some(1)
+        }
+        .is_retryable());
+    }
+
+    #[test]
+    fn classes_are_stable() {
+        assert_eq!(RequiemError::Dns("x".into()).class(), "dns");
+        assert_eq!(RequiemError::Tls("x".into()).class(), "tls");
+        assert_eq!(
+            RequiemError::GatewayFailure {
+                status: 502,
+                message: "x".into()
+            }
+            .class(),
+            "gateway"
+        );
+        assert_eq!(
+            RequiemError::StreamingFailure("x".into()).class(),
+            "streaming"
+        );
     }
 }

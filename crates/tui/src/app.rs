@@ -77,6 +77,13 @@ pub struct TranscriptEntry {
     pub streaming: bool,
     /// Render the text as markdown (headings, code fences, lists, etc.).
     pub markdown: bool,
+    /// Render as the brand banner: raw artwork, styled directly with the
+    /// `Accent` token (no ANSI round-trip).
+    pub banner: bool,
+    /// When set, this entry represents an in-flight tool call with this
+    /// name, so the matching `ToolCallFinished` can fold into it instead of
+    /// appending a second line.
+    pub tool: Option<String>,
 }
 
 impl TranscriptEntry {
@@ -89,6 +96,8 @@ impl TranscriptEntry {
             indent: 2,
             streaming: false,
             markdown: false,
+            banner: false,
+            tool: None,
         }
     }
 }
@@ -242,15 +251,70 @@ fn format_error_card(error: &str, error_class: &str, model: &str) -> String {
         "streaming" => ("Stream Error", "The SSE stream was interrupted mid-response. Retry the request."),
         "gateway" => ("Gateway", "An upstream gateway or proxy returned an error. The provider may be temporarily unavailable — retry in a moment."),
         "invalid_state" => ("State", "The internal task graph state is inconsistent. Try a new session."),
+        "internal" => ("Internal", "A worker task failed unexpectedly. Its partial state was discarded — retry the request."),
         _ => ("Unknown", "An unexpected error occurred. See the log for details."),
     };
-    format!(
-        "**PROVIDER ERROR**\n\n\
-         **Category:** {category}  \n\
-         **Model:** {model}  \n\
-         **Detail:** {error}\n\n\
-         **Suggested action:** {action}"
-    )
+    let status = extract_http_status(error);
+    // Only transport/provider classes describe an HTTP exchange.
+    let is_provider = matches!(
+        error_class,
+        "connection"
+            | "model"
+            | "invalid_response"
+            | "context_length"
+            | "rate_limited"
+            | "timeout"
+            | "auth"
+            | "missing_credentials"
+            | "dns"
+            | "tls"
+            | "model_unavailable"
+            | "quota_exhausted"
+            | "tool_calling"
+            | "streaming"
+            | "gateway"
+    );
+    // Retryability matches `RequiemError::is_retryable`: partial streams and
+    // permanent failures are never replayed automatically.
+    let retry_line = match error_class {
+        "rate_limited" => {
+            "**Retry:** transient — wait for the provider's backoff window, then `/retry`."
+        }
+        "connection" | "dns" | "timeout" | "gateway" => {
+            "**Retry:** transient — press `/retry` to re-run the last request."
+        }
+        "streaming" => {
+            "**Retry:** partial output kept — `/retry` starts a fresh attempt (the partial text is not replayed automatically)."
+        }
+        _ => "**Retry:** not automatic — fix the cause above, then press `/retry`.",
+    };
+    let mut card = format!(
+        "**{}**\n\n\
+         **Category:** {category}  ",
+        if is_provider {
+            "PROVIDER ERROR"
+        } else {
+            "ERROR"
+        }
+    );
+    if is_provider {
+        card.push_str(&format!("\n**Model:** {model}  "));
+    }
+    if let Some(status) = status {
+        card.push_str(&format!("\n**HTTP status:** {status}  "));
+    }
+    card.push_str(&format!(
+        "\n**Detail:** {error}\n\n{retry_line}\n\n**Suggested action:** {action}"
+    ));
+    card
+}
+
+/// Pull an HTTP status out of a formatted error (`... [429] ...` or
+/// `model error [500]: ...`), when present.
+fn extract_http_status(error: &str) -> Option<u16> {
+    let start = error.find('[')? + 1;
+    let end = error[start..].find(']')? + start;
+    error[start..end].trim().parse::<u16>().ok()
 }
 
 /// Walk up to `limit` files/dirs under `root` (skipping common noise
@@ -370,6 +434,8 @@ pub struct App {
     pub session_label: String,
     /// Configured model shown in the header.
     pub model: String,
+    /// Project directory/name shown in the header.
+    pub project: String,
     /// Current mode name (without slash).
     pub mode: String,
     /// Working directory for `@` file autocomplete.
@@ -384,13 +450,17 @@ pub struct App {
     history_idx: Option<usize>,
     history_draft: String,
     scroll_back: usize,
+    /// Whether a large paste is shown expanded instead of as a placeholder.
+    paste_expanded: bool,
 
     // Runtime-derived status
     started: Instant,
-    /// Number of active (non-terminal) runs. Replaces the old single `bool`
-    /// so that one task finishing does not incorrectly mark the app idle
-    /// while other tasks are still running.
-    active_runs: usize,
+    /// Task ids of active (non-terminal) runs. Keyed by task id rather than a
+    /// counter so that completion/cancellation events are idempotent and a
+    /// driver can reconcile the set exactly — a finished run can never leave
+    /// the UI stuck in a stale "running" state, and one task finishing cannot
+    /// mark the app idle while others are still in flight.
+    active_runs: std::collections::HashSet<String>,
     turns: u32,
     tokens_in: u32,
     tokens_out: u32,
@@ -410,6 +480,7 @@ impl App {
             hints,
             session_label,
             model,
+            project: String::new(),
             mode: "code".to_string(),
             workdir: None,
             entries: Vec::new(),
@@ -420,8 +491,9 @@ impl App {
             history_idx: None,
             history_draft: String::new(),
             scroll_back: 0,
+            paste_expanded: false,
             started: Instant::now(),
-            active_runs: 0,
+            active_runs: std::collections::HashSet::new(),
             turns: 0,
             tokens_in: 0,
             tokens_out: 0,
@@ -475,12 +547,15 @@ impl App {
             indent: 4,
             streaming: false,
             markdown: false,
+            banner: false,
+            tool: None,
         });
         self.history.insert(0, text.to_string());
         self.history.truncate(200);
         self.history_idx = None;
         self.scroll_back = 0;
         self.composer.clear();
+        self.paste_expanded = false;
     }
 
     /// Record a system notice in the transcript.
@@ -493,17 +568,22 @@ impl App {
         };
         self.entries
             .push(TranscriptEntry::new(glyph, text.to_string(), fg));
-        self.scroll_back = 0;
+        // Do not force a jump to the bottom: if the user is reading earlier
+        // output, their scroll position is preserved.
     }
 
     /// Seed the transcript with the branded welcome screen: the official
     /// REQUIEM ASCII banner, a description block, and command hints.
     /// Called once at session start when there is no prior conversation.
+    ///
+    /// The banner is stored as raw artwork and styled with the `Accent`
+    /// token at render time — no ANSI paint/parse round-trip, so terminal
+    /// colour detection can never turn the logo blue.
     pub fn push_welcome(&mut self, project_dir: &str) {
         use crate::banner;
-        let t = &self.theme;
-        // Top spacer for visual balance.
-        self.entries.push(TranscriptEntry {
+
+        self.set_project(project_dir);
+        let spacer = || TranscriptEntry {
             glyph: " ",
             text: String::new(),
             fg: Token::Text,
@@ -511,81 +591,85 @@ impl App {
             indent: 0,
             streaming: false,
             markdown: false,
-        });
-        // Banner lines, each painted in the accent token (crimson).
-        let banner_lines: Vec<String> = banner::BANNER
-            .lines()
-            .map(|l| t.paint(Token::Accent, l))
-            .collect();
-        let banner_text = banner_lines.join("\n");
+            banner: false,
+            tool: None,
+        };
+
+        self.entries.push(spacer());
         self.entries.push(TranscriptEntry {
             glyph: " ",
-            text: banner_text,
+            text: banner::BANNER.to_string(),
             fg: Token::Accent,
             bold: true,
             indent: 0,
             streaming: false,
             markdown: false,
+            banner: true,
+            tool: None,
         });
-        // Blank line separator.
-        self.entries.push(TranscriptEntry {
-            glyph: " ",
-            text: String::new(),
-            fg: Token::Text,
-            bold: false,
-            indent: 0,
-            streaming: false,
-            markdown: false,
-        });
-        // Description block with proper spacing.
+        self.entries.push(spacer());
+
+        let project = if self.project.is_empty() {
+            "—".to_string()
+        } else {
+            self.project.clone()
+        };
         let desc = format!(
-            "REQUIEM — MULTI-AGENT AI ENVIRONMENT\n\
+            "MULTI-AGENT AI ENVIRONMENT\n\
              Autonomous coding and knowledge orchestration\n\n\
-             Model: {}  ·  Project: {}  ·  Mode: /{}  ·  Status: connected\n\n\
+             Model  {model}   ·   Project  {project}   ·   Mode  /{mode}\n\n\
              Describe a task to begin, or use a command:\n\
              /help        Available commands\n\
              /dashboard   Live agent & task view\n\
              /model       Model configuration\n\
              /setup       Reconfigure API key & endpoint\n\
              /theme       Switch theme (default / high_contrast / muted)",
-            self.model, project_dir, self.mode
+            model = self.model,
+            project = project,
+            mode = self.mode,
         );
-        let desc_lines: Vec<String> = desc
-            .lines()
-            .map(|l| t.paint(Token::TextSecondary, l))
-            .collect();
         self.entries.push(TranscriptEntry {
             glyph: " ",
-            text: desc_lines.join("\n"),
+            text: desc,
             fg: Token::TextSecondary,
             bold: false,
             indent: 0,
             streaming: false,
             markdown: false,
+            banner: false,
+            tool: None,
         });
         self.scroll_back = 0;
     }
 
+    /// Derive and store a short project label from a directory path.
+    pub fn set_project(&mut self, project_dir: &str) {
+        let s = project_dir.trim_end_matches(['\\', '/']);
+        let name = s.rsplit(['\\', '/']).find(|p| !p.is_empty()).unwrap_or(s);
+        self.project = name.to_string();
+    }
+
     // ── Event consumption ────────────────────────────────────────
 
-    /// Mark whether a run is in flight (used when a run crashes without
-    /// emitting its completion event).
-    pub fn set_running(&mut self, running: bool) {
-        if running {
-            self.active_runs += 1;
-        } else {
-            self.active_runs = self.active_runs.saturating_sub(1);
-        }
+    /// Reconcile the set of active runs against the driver's authoritative
+    /// list of in-flight task ids.
+    ///
+    /// Idempotent and order-independent: a terminal event arriving after the
+    /// reconcile simply removes an id that is already gone, so a finished run
+    /// can never leave the UI stuck on "running".
+    pub fn sync_active_runs(&mut self, task_ids: &[String]) {
+        self.active_runs.clear();
+        self.active_runs.extend(task_ids.iter().cloned());
     }
 
     /// Whether any run is currently active.
     pub fn is_running(&self) -> bool {
-        self.active_runs > 0
+        !self.active_runs.is_empty()
     }
 
     /// Number of currently active runs.
     pub fn active_run_count(&self) -> usize {
-        self.active_runs
+        self.active_runs.len()
     }
 
     /// Consume one runtime event: updates the transcript, dashboard and
@@ -608,7 +692,7 @@ impl App {
                 description,
                 ..
             } => {
-                self.active_runs += 1;
+                self.active_runs.insert(task.as_str().to_string());
                 self.turns = 0;
                 self.active_task = Some(description.clone());
                 if self.dash.agent_index(agent).is_none() {
@@ -639,6 +723,8 @@ impl App {
                     indent: 4,
                     streaming: false,
                     markdown: false,
+                    banner: false,
+                    tool: None,
                 });
             }
             Event::TurnStarted { agent, turn } => {
@@ -660,6 +746,8 @@ impl App {
                             indent: 4,
                             streaming: true,
                             markdown: true,
+                            banner: false,
+                            tool: None,
                         });
                         let i = self.entries.len() - 1;
                         self.streaming.insert(agent.clone(), i);
@@ -687,11 +775,15 @@ impl App {
                 tool,
                 summary,
             } => {
-                self.entries.push(TranscriptEntry::new(
-                    "⚙",
-                    format!("{tool}  {summary}"),
-                    Token::TextSecondary,
-                ));
+                // One compact line per tool call. The matching
+                // `ToolCallFinished` folds duration/status into this entry
+                // instead of appending a second line.
+                let mut e =
+                    TranscriptEntry::new("⚙", format!("{tool}  {summary}"), Token::TextMuted);
+                e.indent = 4;
+                e.streaming = true;
+                e.tool = Some(tool.clone());
+                self.entries.push(e);
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Running;
                 }
@@ -708,11 +800,30 @@ impl App {
                 } else {
                     ("✗", Token::Error)
                 };
-                self.entries.push(TranscriptEntry::new(
-                    glyph,
-                    format!("{tool} ({duration_ms}ms)  {summary}"),
-                    fg,
-                ));
+                let text = if summary.is_empty() {
+                    format!("{tool}  {duration_ms}ms")
+                } else {
+                    format!("{tool}  {summary}  ·  {duration_ms}ms")
+                };
+                let pending = self
+                    .entries
+                    .iter()
+                    .rposition(|e| e.streaming && e.tool.as_deref() == Some(tool.as_str()));
+                match pending {
+                    Some(i) => {
+                        let e = &mut self.entries[i];
+                        e.glyph = glyph;
+                        e.fg = fg;
+                        e.text = text;
+                        e.streaming = false;
+                        e.tool = None;
+                    }
+                    None => {
+                        let mut e = TranscriptEntry::new(glyph, text, fg);
+                        e.indent = 4;
+                        self.entries.push(e);
+                    }
+                }
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Running;
                 }
@@ -770,7 +881,7 @@ impl App {
                 input_tokens,
                 output_tokens,
             } => {
-                self.active_runs = self.active_runs.saturating_sub(1);
+                self.active_runs.remove(task.as_str());
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Done;
                 }
@@ -788,7 +899,9 @@ impl App {
                         }
                     }
                 }
-                self.active_task = None;
+                if self.active_runs.is_empty() {
+                    self.active_task = None;
+                }
             }
             Event::RunFailed {
                 agent,
@@ -797,7 +910,7 @@ impl App {
                 error_class,
                 ..
             } => {
-                self.active_runs = self.active_runs.saturating_sub(1);
+                self.active_runs.remove(task.as_str());
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Failed;
                 }
@@ -809,10 +922,12 @@ impl App {
                 let mut e = TranscriptEntry::new("✗", card, Token::Error);
                 e.markdown = true;
                 self.entries.push(e);
-                self.active_task = None;
+                if self.active_runs.is_empty() {
+                    self.active_task = None;
+                }
             }
             Event::RunCancelled { agent, task } => {
-                self.active_runs = self.active_runs.saturating_sub(1);
+                self.active_runs.remove(task.as_str());
                 if let Some(i) = self.dash.agent_index(agent) {
                     self.dash.agents[i].status = AgentStatus::Waiting;
                 }
@@ -824,7 +939,9 @@ impl App {
                     "run cancelled — partial state kept in the transcript".to_string(),
                     Token::Warning,
                 ));
-                self.active_task = None;
+                if self.active_runs.is_empty() {
+                    self.active_task = None;
+                }
             }
             Event::Notice { text, level } => self.push_system(text, *level),
         }
@@ -833,11 +950,6 @@ impl App {
     /// A snapshot of the live dashboard state (for persistence/summary).
     pub fn dashboard_snapshot(&self) -> &DashState {
         &self.dash
-    }
-
-    /// Whether the composer text ends with `suffix` (for clipboard dedup).
-    pub fn composer_text_ends_with(&self, suffix: &str) -> bool {
-        self.composer.text.ends_with(suffix)
     }
 
     /// The current composer text (read-only access for the CLI driver).
@@ -940,7 +1052,14 @@ impl App {
                 }
             }
             KeyCode::Char('a') if ctrl => {
-                self.composer.move_end();
+                self.composer.move_home();
+            }
+            KeyCode::Char('e') if ctrl => {
+                // Toggle expanded view of a large paste. The full content
+                // was never truncated — this only changes presentation.
+                if self.composer.paste_placeholder().is_some() {
+                    self.paste_expanded = !self.paste_expanded;
+                }
             }
             KeyCode::Enter => {
                 // Newline shortcuts: Shift+Enter, Ctrl+Enter, Ctrl+J, Alt+Enter
@@ -952,22 +1071,17 @@ impl App {
                     self.refresh_suggestions();
                     return UiAction::None;
                 }
-                // Ctrl+J
-                if key.code == KeyCode::Char('j') && ctrl {
-                    self.composer.insert_newline();
-                    self.refresh_suggestions();
-                    return UiAction::None;
-                }
                 // Plain Enter: submit (preserves newlines in pasted
-                // multiline content).
-                let line = self.composer.text.trim().to_string();
-                if line.is_empty() {
+                // multiline content — the text is sent verbatim).
+                let text = self.composer.text.clone();
+                if text.trim().is_empty() {
                     return UiAction::None;
                 }
                 self.composer.clear();
+                self.paste_expanded = false;
                 self.suggestions.clear();
                 self.suggestion_idx = 0;
-                return UiAction::Submit(line);
+                return UiAction::Submit(text);
             }
             KeyCode::Char('j') if ctrl => {
                 self.composer.insert_newline();
@@ -1148,9 +1262,10 @@ impl App {
     fn render_session(&self, frame: &mut Frame) {
         let area = frame.area();
 
-        // Input area grows with multiline content (capped at 6 rows),
-        // so the transcript gets whatever is left.
-        let input_rows = self.composer_visible_rows();
+        // The composer grows with wrapped content (capped), so the
+        // transcript gets whatever is left. Height and rendering share the
+        // same width and the same wrapping algorithm.
+        let input_rows = self.composer_visible_rows(area.width);
         let [header, transcript, input, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
@@ -1165,66 +1280,79 @@ impl App {
         self.render_status(frame, footer);
     }
 
-    /// Number of rows the composer needs: visual rows (accounting for
-    /// soft-wrapping at ~80 cols) + 1 hint row, capped at 6 text rows.
-    fn composer_visible_rows(&self) -> usize {
-        let visual = crate::composer::total_visual_rows(&self.composer.text, 78);
-        let capped = visual.min(6);
-        capped + 1 // + hint row
+    /// Display columns available for composer text: terminal width minus
+    /// the two-cell `> ` prompt prefix.
+    fn composer_wrap_width(&self, term_width: u16) -> usize {
+        (term_width as usize).saturating_sub(2).max(8)
+    }
+
+    /// Number of terminal rows the composer needs at the real terminal
+    /// width: its visual rows (capped at 8) plus one hint row.
+    fn composer_visible_rows(&self, term_width: u16) -> usize {
+        let wrap = self.composer_wrap_width(term_width);
+        let visual = if self.composer.paste_placeholder().is_some() && !self.paste_expanded {
+            1
+        } else {
+            crate::composer::total_visual_rows(&self.composer.text, wrap)
+        };
+        visual.clamp(1, 8) + 1
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
+        use unicode_width::UnicodeWidthStr;
+
         let t = &self.theme;
         let width = area.width as usize;
 
-        // Left: wordmark + mode pill.
+        // Left: crimson REQUIEM wordmark + mode.
         let left_spans = vec![
-            Span::styled("requiem", t.style_bold(Token::Text)),
+            Span::styled("REQUIEM", t.style_bold(Token::Accent)),
             Span::styled("  ", Style::new()),
-            Span::styled(format!("[{:>4}]", self.mode), t.style_bold(Token::Accent)),
+            Span::styled(self.mode.clone(), t.style(Token::TextMuted)),
         ];
 
-        // Center: model name (only when wide enough).
+        // Center: model · project (dropped on narrow terminals).
         let mut center_spans = Vec::new();
-        if width >= 60 {
+        if width >= 56 {
             center_spans.push(Span::styled(
                 self.model.clone(),
                 t.style(Token::TextSecondary),
             ));
+            if !self.project.is_empty() {
+                center_spans.push(Span::styled("  ·  ", t.style(Token::TextMuted)));
+                center_spans.push(Span::styled(
+                    self.project.clone(),
+                    t.style(Token::TextSecondary),
+                ));
+            }
         }
 
-        // Right: token usage + running indicator.
-        let mut right_spans = vec![Span::styled(
-            format!(
-                " {} in / {} out",
-                fmt_tokens(self.tokens_in),
-                fmt_tokens(self.tokens_out)
-            ),
-            t.style(Token::TextMuted),
-        )];
+        // Right: connection status (kept distinct from the brand crimson).
+        let mut right_spans = Vec::new();
         if self.is_running() {
             right_spans.push(Span::styled(
-                format!("  {}", spinner_glyph(self.started)),
-                t.style_bold(Token::Info),
+                format!("{} running", spinner_glyph(self.started)),
+                t.style(Token::Info),
             ));
+        } else {
+            right_spans.push(Span::styled("●", t.style(Token::Success)));
+            right_spans.push(Span::styled(" ready", t.style(Token::TextMuted)));
         }
 
-        // Compose: left … center … right, filling gaps with spaces.
-        let left_text: String = left_spans.iter().map(|s| s.content.as_ref()).collect();
-        let center_text: String = center_spans.iter().map(|s| s.content.as_ref()).collect();
-        let right_text: String = right_spans.iter().map(|s| s.content.as_ref()).collect();
-
-        let left_len = left_text.chars().count();
-        let center_len = center_text.chars().count();
-        let right_len = right_text.chars().count();
-        let gap = width.saturating_sub(left_len + center_len + right_len + 2);
-        let gap_str = " ".repeat(gap);
-
         let mut spans = left_spans;
-        spans.push(Span::styled(gap_str.clone(), Style::new()));
-        spans.append(&mut center_spans);
-        spans.push(Span::styled(gap_str, Style::new()));
-        spans.append(&mut right_spans);
+        let left_w: usize = spans.iter().map(|s| s.content.width()).sum();
+        let center_w: usize = center_spans.iter().map(|s| s.content.width()).sum();
+        let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
+        let gap = width.saturating_sub(left_w + center_w + right_w + 2);
+        // Put half the slack before the centre block, the rest before the
+        // right block, so the header breathes on wide terminals.
+        let left_gap = if center_w > 0 { gap / 2 } else { gap };
+        let right_gap = gap.saturating_sub(left_gap);
+
+        spans.push(Span::styled(" ".repeat(left_gap), Style::new()));
+        spans.extend(center_spans);
+        spans.push(Span::styled(" ".repeat(right_gap), Style::new()));
+        spans.extend(right_spans);
 
         frame.render_widget(
             Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
@@ -1265,7 +1393,17 @@ impl App {
         for e in &self.entries {
             let text_width = width.saturating_sub(e.indent.min(width / 2) + 3);
 
-            if e.markdown {
+            if e.banner {
+                // The official artwork, rendered raw with the crimson accent.
+                // No ANSI round-trip, no re-wrapping and no prefix, so the
+                // glyphs stay exactly as authored.
+                for raw_line in e.text.lines() {
+                    lines.push(Line::from(Span::styled(
+                        raw_line.to_string(),
+                        t.style_bold(Token::Accent),
+                    )));
+                }
+            } else if e.markdown {
                 // Render markdown with the terminal's colour capability,
                 // then convert each ANSI line into ratatui Spans.
                 let ansi_lines =
@@ -1286,26 +1424,33 @@ impl App {
                 }
             } else {
                 // Pre-styled (ANSI) or alignment-sensitive multi-line text
-                // (banner, welcome block): emit each line verbatim, no wrap.
+                // (welcome block): emit each line verbatim, no re-wrap.
                 let is_prestyled = e.text.contains("\x1b[");
                 let is_align_sensitive = is_prestyled || (e.indent == 0 && e.text.contains('\n'));
                 if is_align_sensitive {
+                    let base_style = if e.bold {
+                        t.style_bold(e.fg)
+                    } else {
+                        t.style(e.fg)
+                    };
                     for (i, raw_line) in e.text.lines().enumerate() {
                         let mut spans: Vec<Span<'static>> = Vec::new();
                         if i == 0 {
                             spans.push(Span::styled(
                                 format!("{glyph}  ", glyph = e.glyph),
-                                if e.bold {
-                                    t.style_bold(e.fg)
-                                } else {
-                                    t.style(e.fg)
-                                },
+                                base_style,
                             ));
                         } else {
                             let pad = " ".repeat(e.glyph.chars().count() + 2);
                             spans.push(Span::styled(pad, Style::new()));
                         }
-                        spans.extend(parse_ansi_line(raw_line));
+                        if is_prestyled {
+                            spans.extend(parse_ansi_line(raw_line));
+                        } else {
+                            // Plain multi-line blocks must still use the
+                            // entry's token — parsing plain text would drop it.
+                            spans.push(Span::styled(raw_line.to_string(), base_style));
+                        }
                         lines.push(Line::from(spans));
                     }
                 } else {
@@ -1349,24 +1494,27 @@ impl App {
     fn render_input(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
         let text_rows = (area.height as usize).saturating_sub(1).max(1);
-        let wrap_width = (area.width as usize).saturating_sub(2).max(10); // 2 for "> " prefix
+        let wrap_width = self.composer_wrap_width(area.width);
 
         // Large-paste compact display: when the composer holds content that
         // is visually noisy (≥ 50 lines or ≥ 4 KB), show a single-line
-        // placeholder instead of the full text. The content remains intact
-        // in `composer.text` and is submitted exactly once.
-        if let Some(placeholder) = self.composer.paste_placeholder() {
-            let areas =
-                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
-            let text_area = areas[0];
-            let hint_area = areas[1];
+        // placeholder. The content remains intact in `composer.text` and is
+        // submitted exactly once. Ctrl+E expands the real text.
+        if let Some(placeholder) = self
+            .composer
+            .paste_placeholder()
+            .filter(|_| !self.paste_expanded)
+        {
+            let [text_area, hint_area] =
+                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
             let spans: Vec<Span<'static>> = vec![
                 Span::styled("> ", t.style_bold(Token::Accent)),
                 Span::styled(placeholder, t.style(Token::TextMuted)),
+                Span::styled("  Ctrl+E expand", t.style(Token::TextMuted)),
             ];
             frame.render_widget(
-                Paragraph::new(Line::from(spans.clone())).wrap(Wrap { trim: false }),
+                Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
                 text_area,
             );
 
@@ -1378,82 +1526,65 @@ impl App {
             return;
         }
 
-        // Build all visual rows by soft-wrapping each logical line.
+        // One canonical wrapping pass — the same one used for layout height.
         let text = &self.composer.text;
-        let cursor_char = self.composer.cursor;
-        let mut all_visual: Vec<(String, usize)> = Vec::new(); // (text, start_char_in_logical)
-        if text.is_empty() {
-            all_visual.push((String::new(), 0));
+        let rows = crate::composer::visual_rows(text, wrap_width);
+        let total = rows.len();
+        let (cursor_row, cursor_col) =
+            crate::composer::cursor_visual_position(text, self.composer.cursor, wrap_width);
+
+        // Keep the caret visible without extra state: once it passes the
+        // last text row, the view slides down by exactly the overflow.
+        let start = if cursor_row >= text_rows {
+            cursor_row + 1 - text_rows
         } else {
-            for logical in text.lines() {
-                for wl in crate::composer::soft_wrap_line(logical, wrap_width) {
-                    all_visual.push((wl.text, wl.start_char));
-                }
-            }
-        }
-        let total_visual = all_visual.len().max(1);
+            0
+        };
+        let end = (start + text_rows).min(total);
 
-        // Find which visual row the cursor maps to.
-        let (cursor_visual_row, cursor_col) =
-            crate::composer::cursor_visual_position(text, cursor_char, wrap_width);
-
-        // Scroll so the cursor row is visible.
-        let mut start = 0;
-        if total_visual > text_rows && cursor_visual_row >= start + text_rows {
-            start = cursor_visual_row - text_rows + 1;
-        }
-        let end = (start + text_rows).min(total_visual);
-
-        // Build the visible line spans.
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start + 1);
-        for (i, (row_text, _)) in all_visual[start..end].iter().enumerate() {
-            let row_idx = start + i;
-            let is_cursor_row = row_idx == cursor_visual_row;
-            let prefix = if row_idx == 0 {
+        let mut out: Vec<Line<'static>> = Vec::with_capacity(text_rows + 1);
+        for (idx, row) in rows.iter().enumerate().take(end).skip(start) {
+            let prefix = if idx == 0 {
                 Span::styled("> ", t.style_bold(Token::Accent))
             } else {
                 Span::styled("  ", Style::new())
             };
 
-            if is_cursor_row {
-                let before: String = row_text
-                    .chars()
-                    .take(cursor_col.min(row_text.chars().count()))
-                    .collect();
-                let at: String = row_text
-                    .chars()
-                    .nth(cursor_col.min(row_text.chars().count()))
-                    .map(|c| c.to_string())
-                    .unwrap_or_default();
-                let after: String = row_text.chars().skip(cursor_col + 1).collect();
-
-                let mut spans = vec![prefix];
-                if !at.is_empty() {
-                    spans.push(Span::styled(before, t.style(Token::Text)));
-                    spans.push(Span::styled(
-                        at,
-                        t.style(Token::Background)
-                            .bg(t.ratatui_color(Token::Accent)),
-                    ));
-                    spans.push(Span::styled(after, t.style(Token::Text)));
-                } else {
-                    spans.push(Span::styled(format!("{before} "), t.style(Token::Text)));
-                }
-                lines.push(Line::from(spans));
-            } else {
-                lines.push(Line::from(vec![
+            if idx == cursor_row {
+                let (before, at, after) =
+                    crate::composer::split_at_display_col(&row.text, cursor_col);
+                let cursor_style = t
+                    .style(Token::Background)
+                    .bg(t.ratatui_color(Token::Accent));
+                let mut spans = vec![
                     prefix,
-                    Span::styled(row_text.clone(), t.style(Token::Text)),
+                    Span::styled(before, t.style(Token::Text)),
+                    Span::styled(
+                        if at.is_empty() { " ".to_string() } else { at },
+                        cursor_style,
+                    ),
+                ];
+                if !after.is_empty() {
+                    spans.push(Span::styled(after, t.style(Token::Text)));
+                }
+                out.push(Line::from(spans));
+            } else {
+                out.push(Line::from(vec![
+                    prefix,
+                    Span::styled(row.text.clone(), t.style(Token::Text)),
                 ]));
             }
         }
+        // Fill unused rows so the composer panel keeps a stable background.
+        while out.len() < text_rows {
+            out.push(Line::from(""));
+        }
 
-        // Render text lines + hint row.
         let [text_area, hint_area] =
             Layout::vertical([Constraint::Length(text_rows as u16), Constraint::Length(1)])
                 .areas(area);
 
-        frame.render_widget(Paragraph::new(lines), text_area);
+        frame.render_widget(Paragraph::new(out), text_area);
 
         let hint = self.hint_line();
         frame.render_widget(
@@ -1494,12 +1625,12 @@ impl App {
             return spans;
         }
         // Minimal default hint — contextual, short.
-        let default_hint = if self.composer.should_show_placeholder() {
-            "  Enter send (full content) · Esc clear · Ctrl+C quit"
+        let default_hint = if self.composer.paste_placeholder().is_some() {
+            "  Enter send (full content) · Ctrl+E expand · Esc clear"
         } else if self.composer.multiline {
             "  Enter send · Shift+Enter newline · Esc clear · Ctrl+C quit"
         } else {
-            "  /help · /dashboard · @files · Enter send · Ctrl+C quit"
+            "  Enter send · Shift+Enter newline · /help · @files · Ctrl+C quit"
         };
         vec![Span::styled(default_hint, t.style(Token::TextMuted))]
     }
@@ -1519,15 +1650,57 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
+        use unicode_width::UnicodeWidthStr;
+
         let t = &self.theme;
         let width = area.width as usize;
 
-        // Left: mode pill + token usage.
-        let left_spans = vec![
-            Span::styled(format!("[{:>4}]", self.mode), t.style_bold(Token::Accent)),
+        // Left: relevant keyboard hints.
+        let left_spans = vec![Span::styled(
+            if self.is_running() {
+                "  Ctrl+C cancel · /stop stop all"
+            } else {
+                "  /help · /dashboard · @files · Shift+Enter newline"
+            },
+            t.style(Token::TextMuted),
+        )];
+
+        // Center: running agent/task status (compact, up to 3 agents).
+        let mut center_spans = Vec::new();
+        if self.is_running() {
+            let running_agents: Vec<&AgentRow> = self
+                .dash
+                .agents
+                .iter()
+                .filter(|a| a.status == AgentStatus::Running)
+                .take(3)
+                .collect();
+            if !running_agents.is_empty() {
+                for agent in &running_agents {
+                    let label = if agent.current_task.is_empty() {
+                        agent.role.as_str()
+                    } else {
+                        agent.current_task.as_str()
+                    };
+                    let short: String = label.chars().take(28).collect();
+                    center_spans.push(Span::styled(format!("● {short}  "), t.style(Token::Info)));
+                }
+            } else if let Some(task) = self.active_task.as_deref() {
+                let short: String = task.chars().take(40).collect();
+                center_spans.push(Span::styled(
+                    format!("{} ", spinner_glyph(self.started)),
+                    t.style_bold(Token::Info),
+                ));
+                center_spans.push(Span::styled(short, t.style(Token::TextSecondary)));
+            }
+        }
+
+        // Right: mode + token usage.
+        let right_spans = vec![
+            Span::styled(self.mode.clone(), t.style_bold(Token::Accent)),
             Span::styled(
                 format!(
-                    "  {} in / {} out",
+                    "  ↑{} ↓{}",
                     fmt_tokens(self.tokens_in),
                     fmt_tokens(self.tokens_out)
                 ),
@@ -1535,70 +1708,20 @@ impl App {
             ),
         ];
 
-        // Center: active agent tree (compact, up to 3 agents shown).
-        let mut center_spans = Vec::new();
-        if self.is_running() {
-            // Collect running agents from the dashboard.
-            let running_agents: Vec<(&AgentRow,)> = self
-                .dash
-                .agents
-                .iter()
-                .filter(|a| a.status == AgentStatus::Running)
-                .take(3)
-                .map(|a| (a,))
-                .collect();
-            if !running_agents.is_empty() {
-                for (agent,) in &running_agents {
-                    let glyph = "●";
-                    let label = if agent.current_task.is_empty() {
-                        agent.role.as_str()
-                    } else {
-                        agent.current_task.as_str()
-                    };
-                    let short: String = label.chars().take(32).collect();
-                    center_spans.push(Span::styled(
-                        format!("  {glyph} {short}"),
-                        t.style(Token::Info),
-                    ));
-                }
-            } else if let Some(task) = self.active_task.as_deref() {
-                let short: String = task
-                    .chars()
-                    .take(width.saturating_sub(50).max(10))
-                    .collect();
-                center_spans.push(Span::styled(
-                    format!("  {} ", spinner_glyph(self.started)),
-                    t.style_bold(Token::Info),
-                ));
-                center_spans.push(Span::styled(short, t.style(Token::TextSecondary)));
-            }
-        }
-
-        // Right: context hint.
-        let right_span = Span::styled(
-            format!(
-                "  Ctrl+C {}",
-                if self.is_running() { "cancel" } else { "quit" }
-            ),
-            t.style(Token::TextMuted),
-        );
-
-        // Compose: left … center … right.
-        let left_text: String = left_spans.iter().map(|s| s.content.as_ref()).collect();
-        let center_text: String = center_spans.iter().map(|s| s.content.as_ref()).collect();
-        let right_text: String = right_span.content.as_ref().to_string();
-
-        let left_len = left_text.chars().count();
-        let center_len = center_text.chars().count();
-        let right_len = right_text.chars().count();
-        let gap = width.saturating_sub(left_len + center_len + right_len + 2);
-        let gap_str = " ".repeat(gap);
+        // Compose: left … center … right, splitting the slack between the
+        // two gaps so the row can never overflow.
+        let left_w: usize = left_spans.iter().map(|s| s.content.width()).sum();
+        let center_w: usize = center_spans.iter().map(|s| s.content.width()).sum();
+        let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
+        let gap = width.saturating_sub(left_w + center_w + right_w + 2);
+        let left_gap = if center_w > 0 { gap / 2 } else { gap };
+        let right_gap = gap.saturating_sub(left_gap);
 
         let mut spans = left_spans;
-        spans.push(Span::styled(gap_str.clone(), Style::new()));
-        spans.append(&mut center_spans);
-        spans.push(Span::styled(gap_str, Style::new()));
-        spans.push(right_span);
+        spans.push(Span::styled(" ".repeat(left_gap), Style::new()));
+        spans.extend(center_spans);
+        spans.push(Span::styled(" ".repeat(right_gap), Style::new()));
+        spans.extend(right_spans);
 
         frame.render_widget(
             Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
@@ -1621,9 +1744,9 @@ impl App {
         // Compact single-row header matching the session screen.
         let (done, total) = self.dash.task_progress();
         let header_line = Line::from(vec![
-            Span::styled("requiem", t.style_bold(Token::Text)),
+            Span::styled("REQUIEM", t.style_bold(Token::Accent)),
             Span::styled("  ", Style::new()),
-            Span::styled("[dashboard]", t.style_bold(Token::Accent)),
+            Span::styled("[dashboard]", t.style_bold(Token::AccentBright)),
             Span::styled(
                 format!(
                     "  tasks {done}/{total}  ·  agents {}  ·  tok {}",
@@ -2120,10 +2243,10 @@ mod tests {
     fn session_screen_shows_header_and_prompt() {
         let app = test_app();
         let text = visible_text(&app, 100, 30);
-        assert!(text.contains("requiem"), "wordmark: {text}");
+        assert!(text.contains("REQUIEM"), "wordmark: {text}");
         assert!(text.contains("test-model"), "model in header");
         assert!(text.contains("> "), "input prompt present");
-        assert!(text.contains("[code]"), "mode pill present");
+        assert!(text.contains("code"), "mode shown: {text}");
     }
 
     #[test]
@@ -2136,8 +2259,8 @@ mod tests {
         // Model and project info.
         assert!(text.contains("test-model"), "model shown: {text}");
         assert!(
-            text.contains("/home/user/project"),
-            "project dir shown: {text}"
+            text.contains("Project") && text.contains("project"),
+            "project shown: {text}"
         );
         // Command suggestions.
         assert!(text.contains("/help"), "command hints: {text}");
@@ -2155,6 +2278,116 @@ mod tests {
             buf.lines().any(|l| l.contains("..")),
             "banner first-line fragment visible: {buf}"
         );
+    }
+
+    /// One terminal row as a string (avoids char/column drift from wide
+    /// glyphs in the flattened buffer).
+    fn row_text(app: &App, w: u16, h: u16, row: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let start = row as usize * w as usize;
+        let end = (start + w as usize).min(buffer.content.len());
+        buffer.content[start..end]
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn banner_is_raw_crimson_spans_without_ansi_round_trip() {
+        let mut app = test_app();
+        app.push_welcome("/home/user/project");
+        let banner = app.entries.iter().find(|e| e.banner).expect("banner entry");
+        assert_eq!(banner.fg, Token::Accent, "banner must use the accent token");
+        assert!(
+            !banner.text.contains('\x1b'),
+            "banner must be raw artwork, not ANSI-painted"
+        );
+        assert!(banner.text.contains("8888"), "official artwork preserved");
+        // Rendered art still present, and no blue is introduced by the
+        // banner path.
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let art: Vec<_> = buffer
+            .content
+            .iter()
+            .filter(|c| c.symbol() == "8")
+            .collect();
+        assert!(!art.is_empty(), "banner art not rendered");
+        assert!(
+            art.iter().all(|c| c.fg != Color::Blue),
+            "banner must never render blue"
+        );
+    }
+
+    #[test]
+    fn session_layout_is_responsive() {
+        let mut app = test_app();
+        app.push_welcome("/home/user/project");
+        for (w, h) in [(80u16, 24u16), (100, 30), (120, 40)] {
+            let header = row_text(&app, w, h, 0);
+            let footer = row_text(&app, w, h, h - 1);
+            assert!(header.contains("REQUIEM"), "{w}x{h} header: {header:?}");
+            assert!(
+                !footer.contains('─'),
+                "{w}x{h} footer has a border: {footer:?}"
+            );
+            assert!(
+                footer.contains("/help") || footer.contains("Shift+Enter"),
+                "{w}x{h} footer hints: {footer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_height_uses_real_terminal_width() {
+        let mut app = test_app();
+        app.composer.text = "x".repeat(200);
+        app.composer.cursor = 200;
+        let narrow = app.composer_visible_rows(40);
+        let wide = app.composer_visible_rows(120);
+        assert!(
+            narrow > wide,
+            "narrow terminal must need more rows ({narrow} vs {wide})"
+        );
+        assert!(narrow <= 9, "composer capped at 8 text rows + hint");
+        // Rendering at the small size must not panic or lose the caret.
+        let _ = row_text(&app, 40, 24, 22);
+    }
+
+    #[test]
+    fn wrapped_long_prompt_renders_tail_and_cursor() {
+        let mut app = test_app();
+        let long = "a".repeat(300);
+        app.composer.text = long.clone();
+        app.composer.cursor = long.chars().count();
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let flat: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        assert!(flat.contains("aaaa"), "prompt text must be visible");
+        // Cursor block is drawn with a non-default background somewhere in
+        // the input region.
+        let has_cursor = buffer
+            .content
+            .iter()
+            .any(|c| c.bg != Color::Reset && c.bg != Color::Black);
+        assert!(has_cursor, "visible cursor block missing");
+    }
+
+    #[test]
+    fn error_card_is_actionable_and_structured() {
+        let card = format_error_card("model error [429]: slow down", "rate_limited", "test-model");
+        assert!(card.contains("Rate Limit"), "{card}");
+        assert!(card.contains("429"), "status shown: {card}");
+        assert!(card.contains("test-model"), "model shown: {card}");
+        assert!(card.contains("/retry"), "recovery command: {card}");
+        assert!(card.contains("**Retry:**"), "retry state: {card}");
     }
 
     #[test]
@@ -2359,10 +2592,11 @@ fn hello() {
     #[test]
     fn ctrl_c_cancels_while_running_then_quits() {
         let mut app = test_app();
+        let task = requiem_core::Id::new();
         app.push_event(&Event::RunStarted {
             agent: "master".into(),
             role: "master".into(),
-            task: requiem_core::Id::new(),
+            task: task.clone(),
             description: "task".into(),
             mode: "code".into(),
         });
@@ -2370,9 +2604,67 @@ fn hello() {
         // Driver marks the run finished:
         app.push_event(&Event::RunCancelled {
             agent: "master".into(),
-            task: requiem_core::Id::new(),
+            task,
         });
         assert_eq!(app.handle_key(test_ctrl('c')), UiAction::Quit);
+    }
+
+    #[test]
+    fn one_run_finishing_keeps_app_running_while_another_is_active() {
+        let mut app = test_app();
+        let a = requiem_core::Id::new();
+        let b = requiem_core::Id::new();
+        for (task, desc) in [(&a, "first"), (&b, "second")] {
+            app.push_event(&Event::RunStarted {
+                agent: "master".into(),
+                role: "master".into(),
+                task: task.clone(),
+                description: desc.into(),
+                mode: "code".into(),
+            });
+        }
+        assert_eq!(app.active_run_count(), 2);
+        app.push_event(&Event::RunCompleted {
+            agent: "master".into(),
+            task: a.clone(),
+            response: None,
+            input_tokens: 0,
+            output_tokens: 0,
+        });
+        assert_eq!(app.active_run_count(), 1);
+        assert!(app.is_running(), "second run still in flight");
+        // A duplicate terminal event must be idempotent.
+        app.push_event(&Event::RunCancelled {
+            agent: "master".into(),
+            task: a,
+        });
+        assert_eq!(app.active_run_count(), 1);
+        app.push_event(&Event::RunFailed {
+            agent: "master".into(),
+            task: b.clone(),
+            error: "boom".into(),
+            error_class: "model".into(),
+        });
+        assert!(!app.is_running());
+        // Driver reconciliation can never resurrect a finished run.
+        app.sync_active_runs(&[]);
+        assert_eq!(app.active_run_count(), 0);
+    }
+
+    #[test]
+    fn sync_active_runs_drops_runs_that_died_without_events() {
+        let mut app = test_app();
+        app.push_event(&Event::RunStarted {
+            agent: "master".into(),
+            role: "master".into(),
+            task: requiem_core::Id::from("crashed"),
+            description: "x".into(),
+            mode: "code".into(),
+        });
+        assert!(app.is_running());
+        // The task panicked: no terminal event was ever emitted.
+        app.sync_active_runs(&[]);
+        assert!(!app.is_running(), "stale running state must be cleared");
     }
 
     #[test]
@@ -2816,14 +3108,14 @@ fn hello() {
             .get(0..100)
             .unwrap_or(&buf[..100.min(buf.len())])
             .to_string();
-        assert!(row0.contains("requiem"), "header row: {row0:?}");
+        assert!(row0.contains("REQUIEM"), "header row: {row0:?}");
         assert!(!row0.contains('─'), "border glyph on header row: {row0:?}");
-        // Row 29: footer — must contain Ctrl+C hint, no border glyph.
+        // Row 29: footer — must contain a keyboard hint, no border glyph.
         let footer_start = 29 * 100;
         let footer_end = (29 * 100 + 100).min(buf.len());
         let footer = buf.get(footer_start..footer_end).unwrap_or("").to_string();
         assert!(
-            footer.contains("Ctrl+C") || footer.contains("[code]"),
+            footer.contains("Shift+Enter") || footer.contains("/help"),
             "footer row: {footer:?}"
         );
         assert!(
@@ -2835,7 +3127,7 @@ fn hello() {
     #[test]
     fn status_shows_running_agents_compact_tree() {
         let mut app = test_app();
-        app.active_runs = 1;
+        app.active_runs.insert("t1".into());
         app.active_task = Some("fix login".into());
         let mut agent = AgentRow::new("a1", "worker");
         agent.status = AgentStatus::Running;
@@ -2857,7 +3149,7 @@ fn hello() {
             .get(0..80)
             .unwrap_or(&buf[..80.min(buf.len())])
             .to_string();
-        assert!(r0.contains("requiem"), "header: {r0:?}");
+        assert!(r0.contains("REQUIEM"), "header: {r0:?}");
         // Row 28 (chars 28*80..29*80): input prompt '>' (second-to-last row).
         let r28_start = 28 * 80;
         let r28_end = (29 * 80).min(buf.len());
@@ -2871,7 +3163,7 @@ fn hello() {
         let r29_end = (30 * 80).min(buf.len());
         let r29 = buf.get(r29_start..r29_end).unwrap_or("").to_string();
         assert!(
-            r29.contains("[code]") || r29.contains("Ctrl+C"),
+            r29.contains("/help") || r29.contains("Shift+Enter") || r29.contains("code"),
             "footer: {r29:?}"
         );
     }
@@ -3023,8 +3315,7 @@ fn hello() {
         // Submit must send the full content (newlines preserved).
         let action = app.handle_key(test_key(KeyCode::Enter));
         if let UiAction::Submit(line) = action {
-            let expected = large.trim().to_string();
-            assert_eq!(line, expected, "full content must be submitted");
+            assert_eq!(line, large, "full raw content must be submitted");
         } else {
             panic!("expected Submit");
         }

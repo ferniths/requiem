@@ -418,7 +418,7 @@ async fn chat_stream_delivers_and_reassembles() {
         request_id: None,
     };
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let resp = client.chat_stream(&req, tx).await.expect("stream");
     assert_eq!(
         resp.text(),
@@ -459,7 +459,7 @@ async fn chat_stream_merges_tool_call_deltas() {
         request_id: None,
     };
 
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
     let resp = client.chat_stream(&req, tx).await.expect("stream");
     assert_eq!(resp.message.tool_calls.len(), 1);
     let tc = &resp.message.tool_calls[0];
@@ -620,4 +620,244 @@ async fn outgoing_tools_use_nested_function_shape() {
         f.get("parameters").is_some(),
         "tools[0].function.parameters must be present"
     );
+}
+
+// ── Streaming correctness / error security ─────────────────────────────
+
+#[tokio::test]
+async fn stream_handles_multibyte_split_across_chunks() {
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"héllo 🌍!\"}}]}\ndata: [DONE]\n\n";
+    let bytes = body.as_bytes().to_vec();
+    let emoji = "🌍".as_bytes();
+    let pos = find_subsequence(&bytes, emoji).expect("emoji bytes");
+    let split_points = [pos + 1, pos + 2, pos + 3];
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let mut start = 0;
+            for &split in &split_points {
+                let _ = sock.write_all(&bytes[start..split]).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                start = split;
+            }
+            let _ = sock.write_all(&bytes[start..]).await;
+            let _ = sock.flush().await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let cfg = make_config(&format!("http://{addr}"), "mock-model");
+    let client = ModelClient::new(cfg).unwrap();
+    let req = ChatRequest {
+        model: "mock-model".into(),
+        messages: vec![ChatMessage::user("hi")],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        stream: true,
+        request_id: None,
+    };
+
+    let chunks = client.stream_drain(&req).await.expect("stream");
+    let text: String = chunks.iter().filter_map(|c| c.content.clone()).collect();
+    assert_eq!(text, "héllo 🌍!");
+    assert!(
+        !text.contains('\u{FFFD}'),
+        "no replacement characters: {text}"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_stream_is_a_non_retryable_streaming_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // Promise 4096 bytes, deliver far fewer, then hang up.
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n",
+                )
+                .await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let cfg = make_config(&format!("http://{addr}"), "mock-model");
+    let client = ModelClient::new(cfg).unwrap();
+    let req = ChatRequest {
+        model: "mock-model".into(),
+        messages: vec![ChatMessage::user("hi")],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        stream: true,
+        request_id: None,
+    };
+
+    let err = client.stream_drain(&req).await.unwrap_err();
+    assert!(
+        matches!(err, requiem_core::error::RequiemError::StreamingFailure(_)),
+        "got: {err:?}"
+    );
+    assert!(!err.is_retryable(), "partial output must not be replayed");
+}
+
+#[tokio::test]
+async fn invalid_response_body_is_sanitized_and_bounded() {
+    let body = format!("not json at all sk-supersecret123456 {}", "x".repeat(5000));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let cfg = make_config(&format!("http://{addr}"), "mock-model");
+    let client = ModelClient::new(cfg).unwrap();
+    let req = ChatRequest {
+        model: "mock-model".into(),
+        messages: vec![ChatMessage::user("hi")],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        request_id: None,
+    };
+
+    let err = client.chat(req).await.unwrap_err();
+    let text = err.to_string();
+    assert!(
+        matches!(err, requiem_core::error::RequiemError::InvalidResponse(_)),
+        "got: {err:?}"
+    );
+    assert!(!text.contains("supersecret123456"), "key leaked: {text}");
+    assert!(
+        text.chars().count() < 600,
+        "diagnostic not bounded: {} chars",
+        text.chars().count()
+    );
+    assert!(
+        text.contains("bytes"),
+        "response size diagnostic retained: {text}"
+    );
+}
+
+#[tokio::test]
+async fn retries_are_bounded_by_max_retries() {
+    let count = Arc::new(AtomicU32::new(0));
+    let counter = count.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut sock, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = "{\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}";
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let mut cfg = make_config(&format!("http://{addr}"), "mock-model");
+    cfg.max_retries = 1;
+    let client = ModelClient::new(cfg).unwrap();
+    let req = ChatRequest {
+        model: "mock-model".into(),
+        messages: vec![ChatMessage::user("hi")],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        request_id: None,
+    };
+
+    let err = client.chat(req).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            requiem_core::error::RequiemError::GatewayFailure { status: 503, .. }
+        ),
+        "got: {err:?}"
+    );
+    // One initial attempt + exactly one retry.
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn rate_limit_json_and_retry_after_are_surfaced() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = "{\"error\":{\"message\":\"slow down\",\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}}";
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let cfg = make_config(&format!("http://{addr}"), "mock-model");
+    let mut cfg = cfg;
+    cfg.max_retries = 0; // surface the first 429 instead of waiting 7s twice
+    let client = ModelClient::new(cfg).unwrap();
+    let req = ChatRequest {
+        model: "mock-model".into(),
+        messages: vec![ChatMessage::user("hi")],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        request_id: None,
+    };
+
+    match client.chat(req).await.unwrap_err() {
+        requiem_core::error::RequiemError::RateLimited { retry_after_ms } => {
+            assert_eq!(retry_after_ms, 7_000);
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
 }

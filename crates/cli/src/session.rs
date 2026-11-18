@@ -42,6 +42,10 @@ use crate::history::InputHistory;
 /// Poll interval for the full-screen UI loop.
 const UI_TICK: Duration = Duration::from_millis(50);
 
+/// Two paste events carrying identical text within this window are treated
+/// as one physical clipboard delivery (some terminals duplicate them).
+const PASTE_DEDUPE_WINDOW: Duration = Duration::from_millis(80);
+
 /// A registered tool bridge: shared tool map + shared permission gate.
 struct ToolBridge {
     tools: Arc<std::sync::Mutex<HashMap<String, Arc<dyn Tool>>>>,
@@ -281,7 +285,7 @@ fn session_db_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error + S
     Ok(dir.join("sessions.db"))
 }
 
-// ── Full-screen mode ─────────────────────────────────────────────────
+// ── Full-screen mode ────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 async fn run_fullscreen(
@@ -356,9 +360,16 @@ async fn run_fullscreen(
     let mut history = InputHistory::load();
     app.set_history(history.entries().to_vec());
 
+    // Last physical paste (content + time), used only to drop duplicate
+    // events for the *same* clipboard delivery. Never used to suppress a
+    // deliberate second paste.
+    let mut last_paste: Option<(String, std::time::Instant)> = None;
+
+    // Last real (non-slash) request, so `/retry` can re-run it.
+    let mut last_prompt: Option<String> = None;
+
     let mut tasks_total: usize = prior.len();
     let mut tasks_ok: usize = prior.iter().filter(|r| r.success).count();
-    let mut tasks_in_flight = false;
     // One shared flag for the spawn_subagent tool's children (registered
     // once below); /stop and Ctrl-C cancel every in-flight run via the
     // per-run flags stored in active_runs.
@@ -402,25 +413,55 @@ async fn run_fullscreen(
     }
 
     let result: Result<String, String> = loop {
-        // 1. Drain runtime events (never blocks the runtime).
-        while let Ok(ev) = event_rx.try_recv() {
-            app.push_event(&ev);
+        // 1. Drain runtime events (never blocks the runtime). On a lagged
+        //    broadcast, skip only the dropped events and keep draining —
+        //    stopping at the first error would leave the rest of the queue
+        //    unread until the next tick.
+        loop {
+            match event_rx.try_recv() {
+                Ok(ev) => app.push_event(&ev),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::warn!("UI lagged; dropped {n} runtime events");
+                }
+                Err(_) => break,
+            }
         }
 
         // 2. Reap completed runs. The JoinHandle catches panics; the done
         //    channel delivers the final AgentRun for persistence.
         if active_runs.iter().any(|(_, h, _)| h.is_finished()) {
             let mut still_active = Vec::new();
+            let mut aborted: Vec<(requiem_core::Id, bool)> = Vec::new();
             for entry in active_runs.drain(..) {
                 let (task_id, handle, flag) = entry;
                 if handle.is_finished() {
-                    // Reap — completion arrives via the done channel.
-                    let _ = handle.await;
+                    // Reap — completion arrives via the done channel. A join
+                    // error means the task panicked and therefore never sent
+                    // its AgentRun or terminal event; record that so the
+                    // scheduler and UI cannot keep a stale "running" state.
+                    let panicked = handle.await.is_err();
+                    aborted.push((task_id, panicked));
                 } else {
                     still_active.push((task_id, handle, flag));
                 }
             }
             active_runs = still_active;
+            for (task_id, panicked) in aborted {
+                if panicked {
+                    app.push_event(&Event::RunFailed {
+                        agent: "master".into(),
+                        task: task_id.clone(),
+                        error: "agent task panicked; its state was discarded".into(),
+                        error_class: "internal".into(),
+                    });
+                    let mut sched = scheduler.lock().unwrap();
+                    sched.fail_task(&task_id, "agent task panicked");
+                    if let Some(a) = sched.registry.agents.get_mut(&AgentId("master".into())) {
+                        a.fail();
+                    }
+                    let _ = store.save_task_graph(&session_id, &sched.graph);
+                }
+            }
         }
         while let Ok(run) = done_rx.try_recv() {
             let ok = run.final_response.is_some();
@@ -454,11 +495,17 @@ async fn run_fullscreen(
                 // resume multi-agent state, not just finished records.
                 let _ = store.save_task_graph(&session_id, &sched.graph);
             }
-            if active_runs.is_empty() {
-                tasks_in_flight = false;
-                app.set_running(false);
-            }
         }
+
+        // Reconcile the UI's notion of in-flight work with the authoritative
+        // list of running tasks. This is idempotent, so a terminal event that
+        // arrives a tick later cannot flip the status the wrong way, and a
+        // run that died without an event can never look permanently active.
+        let running_ids: Vec<String> = active_runs
+            .iter()
+            .map(|(id, _, _)| id.as_str().to_string())
+            .collect();
+        app.sync_active_runs(&running_ids);
 
         // 3. Draw.
         terminal
@@ -476,14 +523,24 @@ async fn run_fullscreen(
         // Bracketed paste: the terminal delivers clipboard content as one
         // event instead of a keypress flood. Insert it into the input
         // buffer without triggering submit or per-char validation.
+        //
+        // Some terminals emit the same physical paste as two closely spaced
+        // events. Deduplicate only exact repeats inside a very short window
+        // — never by comparing against the existing prompt text (a
+        // legitimate second paste of identical text must go through).
         if let Ok(CEvent::Paste(pasted)) = cev {
-            app.paste_input(&pasted);
+            let normalized = requiem_tui::composer::normalize_line_endings(&pasted);
+            let duplicate = last_paste.as_ref().is_some_and(|(text, at)| {
+                *text == normalized && at.elapsed() < PASTE_DEDUPE_WINDOW
+            });
+            if !duplicate {
+                app.paste_input(&normalized);
+            }
+            last_paste = Some((normalized, std::time::Instant::now()));
             continue;
         }
         // Native clipboard fallback: when bracketed paste is unavailable,
-        // Alt+V reads the OS clipboard directly. The last bracketed-paste
-        // content is remembered to prevent double-insertion when a terminal
-        // sends both a paste event and a key-press fallback.
+        // Alt+V reads the OS clipboard directly.
         if let Ok(CEvent::Key(key)) = cev {
             if key.kind == crossterm::event::KeyEventKind::Press
                 && key.code == crossterm::event::KeyCode::Char('v')
@@ -493,9 +550,13 @@ async fn run_fullscreen(
                 match clipboard::read_clipboard() {
                     Some(text) if !text.is_empty() => {
                         let normalized = requiem_tui::composer::normalize_line_endings(&text);
-                        if !normalized.is_empty() && !app.composer_text_ends_with(&normalized) {
+                        let duplicate = last_paste.as_ref().is_some_and(|(prev, at)| {
+                            *prev == normalized && at.elapsed() < PASTE_DEDUPE_WINDOW
+                        });
+                        if !duplicate {
                             app.paste_input(&normalized);
                         }
+                        last_paste = Some((normalized, std::time::Instant::now()));
                     }
                     _ => {
                         app.push_system("clipboard is empty or unavailable", NoticeLevel::Warning);
@@ -515,11 +576,11 @@ async fn run_fullscreen(
                 &event_tx,
                 &subagent_cancel,
                 &mut tasks_total,
-                &mut tasks_in_flight,
                 &mut active_runs,
                 &done_tx,
                 &mut history,
                 &scheduler,
+                &mut last_prompt,
             )
             .await;
             match directive {
@@ -588,11 +649,11 @@ async fn handle_action(
     event_tx: &EventTx,
     cancel: &CancelFlag,
     tasks_total: &mut usize,
-    tasks_in_flight: &mut bool,
     active_runs: &mut Vec<(requiem_core::Id, tokio::task::JoinHandle<()>, CancelFlag)>,
     done_tx: &tokio::sync::mpsc::UnboundedSender<AgentRun>,
     history: &mut InputHistory,
     scheduler: &SharedScheduler,
+    last_prompt: &mut Option<String>,
 ) -> Directive {
     match action {
         UiAction::None => Directive::Continue,
@@ -609,6 +670,39 @@ async fn handle_action(
             Directive::Continue
         }
         UiAction::Submit(line) => {
+            // `/retry` re-runs the last real request (not a slash command),
+            // so a transient provider failure is one keystroke from
+            // recovery.
+            if line.trim() == "/retry" {
+                match last_prompt.clone() {
+                    Some(prev) => {
+                        app.push_system("retrying previous request…", NoticeLevel::Info);
+                        let mode_str = app.mode.clone();
+                        start_task(
+                            app,
+                            &prev,
+                            config,
+                            client,
+                            bridge,
+                            session_id,
+                            event_tx,
+                            cancel,
+                            tasks_total,
+                            active_runs,
+                            done_tx,
+                            history,
+                            scheduler,
+                            &mode_str,
+                        )
+                        .await;
+                    }
+                    None => app.push_system(
+                        "nothing to retry — no previous request in this session",
+                        NoticeLevel::Warning,
+                    ),
+                }
+                return Directive::Continue;
+            }
             if line.starts_with('/') {
                 dispatch_slash(
                     app,
@@ -620,12 +714,12 @@ async fn handle_action(
                     session_id,
                     event_tx,
                     cancel,
-                    tasks_in_flight,
                     active_runs,
                 )
                 .await
             } else {
                 let mode_str = app.mode.clone();
+                *last_prompt = Some(line.clone());
                 start_task(
                     app,
                     &line,
@@ -636,7 +730,6 @@ async fn handle_action(
                     event_tx,
                     cancel,
                     tasks_total,
-                    tasks_in_flight,
                     active_runs,
                     done_tx,
                     history,
@@ -661,7 +754,6 @@ async fn dispatch_slash(
     session_id: Uuid,
     event_tx: &EventTx,
     cancel: &CancelFlag,
-    tasks_in_flight: &bool,
     active_runs: &[(requiem_core::Id, tokio::task::JoinHandle<()>, CancelFlag)],
 ) -> Directive {
     let trimmed = line.trim();
@@ -700,7 +792,7 @@ async fn dispatch_slash(
             Directive::Continue
         }
         "stop" => {
-            if *tasks_in_flight {
+            if !active_runs.is_empty() {
                 for (_, _, flag) in active_runs.iter() {
                     flag.cancel();
                 }
@@ -889,7 +981,11 @@ async fn dispatch_slash(
             if rest.is_empty() {
                 let mut out = String::from("themes (use /theme <name>):");
                 for name in THEME_NAMES {
-                    let mark = if *name == config.theme { " ✓" } else { "" };
+                    let mark = if *name == config.theme {
+                        " ✓"
+                    } else {
+                        ""
+                    };
                     out.push_str(&format!("\n  {name}{mark}"));
                 }
                 app.push_system(&out, NoticeLevel::Info);
@@ -1165,7 +1261,6 @@ async fn start_task(
     event_tx: &EventTx,
     _cancel: &CancelFlag,
     tasks_total: &mut usize,
-    tasks_in_flight: &mut bool,
     active_runs: &mut Vec<(requiem_core::Id, tokio::task::JoinHandle<()>, CancelFlag)>,
     done_tx: &tokio::sync::mpsc::UnboundedSender<AgentRun>,
     _history: &mut InputHistory,
@@ -1234,8 +1329,6 @@ async fn start_task(
     let flag_for_run = flag.clone();
     let done_tx_owned = done_tx.clone();
 
-    *tasks_in_flight = true;
-    app.set_running(true);
     let handle = tokio::spawn(async move {
         let _ = run_agent_halted(
             &client,
@@ -1271,8 +1364,9 @@ fn persist_run(store: &requiem_memory::session::Session, session_id: Uuid, run: 
         timestamp_rfc3339: chrono::Utc::now().to_rfc3339(),
     };
     if let Err(e) = store.insert_record(&rec) {
-        // Persistence is best-effort; the session must not die over it.
-        eprintln!("session record save failed: {e}");
+        // Persistence is best-effort; the session must not die over it. Log
+        // it — printing to stderr would corrupt the alternate screen.
+        tracing::warn!("session record save failed: {e}");
     }
 }
 
@@ -1294,7 +1388,7 @@ fn fmt_u32_tokens(n: u32) -> String {
     requiem_tui::app::fmt_tokens(n)
 }
 
-// ── Plain (non-TTY) mode ─────────────────────────────────────────────
+// ── Plain (non-TTY) mode ─────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::while_let_loop)]
@@ -1544,7 +1638,14 @@ async fn run_plain(
                             }
                             break;
                         }
-                        None => break,
+                        None => {
+                            // The worker vanished without reporting (panic):
+                            // never leave the scheduler task stuck in Running.
+                            let mut sched = scheduler.lock().unwrap();
+                            sched.fail_task(&task_id, "worker task panicked");
+                            println!("  ✗ failed: internal worker error");
+                            break;
+                        }
                     }
                 }
             }

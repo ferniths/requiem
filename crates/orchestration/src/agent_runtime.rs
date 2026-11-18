@@ -385,7 +385,8 @@ pub async fn run_agent_halted(
         // turn boundary.
         let watcher = CancelWatch::new(cancel);
         let resp: ModelResponse = if events.is_some() {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<requiem_model::response::StreamChunk>(64);
             // Consume deltas while the request is in flight.
             let mut delta_text = String::new();
             let stream_result = if cancel.is_some() {
@@ -585,7 +586,7 @@ pub async fn run_agent_halted(
 /// Returns the reassembled response when the stream completes.
 async fn drive_stream(
     streamed: impl std::future::Future<Output = Result<ModelResponse, RequiemError>>,
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<requiem_model::response::StreamChunk>,
+    rx: &mut tokio::sync::mpsc::Receiver<requiem_model::response::StreamChunk>,
     delta_text: &mut String,
     run: &AgentRun,
     events: Option<&EventTx>,

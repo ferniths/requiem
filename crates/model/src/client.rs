@@ -153,13 +153,20 @@ impl ModelClient {
     /// end, and returns the parsed chunks in arrival order. A mid-stream
     /// HTTP failure is returned as the `Err`.
     pub async fn stream_drain(&self, req: &ChatRequest) -> Result<Vec<StreamChunk>, RequiemError> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamChunk>();
-        let response = self.chat_stream(req, tx).await?;
-        let mut chunks = Vec::new();
-        while let Ok(chunk) = rx.try_recv() {
-            chunks.push(chunk);
-        }
-        let _ = response; // reassembled response; chunks carry the details
+        // Bounded channel: a slow consumer applies backpressure to the
+        // network read instead of buffering the whole response in memory.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
+        let collect = async move {
+            let mut chunks = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                chunks.push(chunk);
+            }
+            chunks
+        };
+        // Drive producer and collector together so the bounded channel can
+        // never deadlock (the old post-hoc `try_recv` drained nothing).
+        let (response, chunks) = tokio::join!(self.chat_stream(req, tx), collect);
+        response?;
         Ok(chunks)
     }
 
@@ -179,7 +186,7 @@ impl ModelClient {
 
         let resp = match http_req.await {
             Ok(r) => r,
-            Err(e) => return Err(RequiemError::Connection(e.to_string())),
+            Err(e) => return Err(classify_reqwest_error(&e, self.config.timeout_ms)),
         };
 
         let status = resp.status();
@@ -189,20 +196,32 @@ impl ModelClient {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+            let request_id = request_id_header(&resp);
             let text = resp.text().await.unwrap_or_default();
-            return Err(classify_http_error(
+            return Err(classify_http_error_with_id(
                 status.as_u16(),
                 &text,
                 retry_after.as_deref(),
+                request_id.as_deref(),
             ));
         }
 
+        let request_id = request_id_header(&resp);
         let text = resp
             .text()
             .await
-            .map_err(|e| RequiemError::Connection(e.to_string()))?;
+            .map_err(|e| classify_reqwest_error(&e, self.config.timeout_ms))?;
         parse_chat_response(&text).ok_or_else(|| {
-            RequiemError::InvalidResponse(format!("failed to parse model response: {text}"))
+            RequiemError::InvalidResponse(format!(
+                "unparseable response (HTTP {}, {} bytes{}){}",
+                status.as_u16(),
+                text.len(),
+                request_id
+                    .as_deref()
+                    .map(|id| format!(", request id {id}"))
+                    .unwrap_or_default(),
+                body_diagnostic(&text),
+            ))
         })
     }
 
@@ -228,7 +247,7 @@ impl ModelClient {
     pub async fn chat_stream(
         &self,
         req: &ChatRequest,
-        tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+        tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ModelResponse, RequiemError> {
         let _guard = self.acquire_slot().await;
         let result = self.chat_stream_inner(req, &tx).await;
@@ -239,7 +258,7 @@ impl ModelClient {
     async fn chat_stream_inner(
         &self,
         req: &ChatRequest,
-        tx: &tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+        tx: &tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ModelResponse, RequiemError> {
         let mut sreq = req.clone();
         sreq.stream = true;
@@ -259,73 +278,58 @@ impl ModelClient {
             }
         };
 
-        // Incremental SSE parse over the byte stream.
+        // Incremental SSE parse over the byte stream. Bytes are decoded
+        // through a stateful UTF-8 decoder so a multi-byte character split
+        // across two HTTP chunks is never replaced with U+FFFD.
         let mut stream = resp.bytes_stream();
+        let mut pending_bytes: Vec<u8> = Vec::new();
         let mut buffer = String::new();
+        let mut state = Reassembly::default();
+        let mut done = false;
 
-        // Reassembly state.
-        let mut content = String::new();
-        let mut tool_calls: std::collections::BTreeMap<u32, crate::request::ToolCall> =
-            std::collections::BTreeMap::new();
-        let mut finish_reason: Option<String> = None;
-        let mut usage: Option<TokenUsage> = None;
+        while !done {
+            let Some(chunk) = stream.next().await else {
+                break;
+            };
+            let bytes = chunk.map_err(|e| classify_stream_error(&e))?;
+            buffer.push_str(&decode_utf8_chunk(&mut pending_bytes, &bytes));
 
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|e| RequiemError::Connection(e.to_string()))?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
-            // SSE events are separated by newlines; a line may still be
-            // incomplete, so only consume whole lines.
+            // SSE events are newline-delimited; only consume whole lines.
             while let Some(pos) = buffer.find('\n') {
                 let line: String = buffer.drain(..=pos).collect();
-                let line = line.trim();
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
+                let (out, is_done) = state.feed(&line)?;
+                if let Some(chunk) = out {
+                    // Backpressure: wait for room instead of buffering
+                    // without bound. A closed receiver means the consumer
+                    // was cancelled — keep parsing for the final response,
+                    // but stop trying to deliver.
+                    if tx.send(chunk).await.is_err() {
+                        tracing::debug!("stream consumer dropped; reassembling silently");
+                    }
                 }
-                let data = line.strip_prefix("data:").unwrap_or(line).trim_start();
-                if data == "[DONE]" || data == "done" {
+                if is_done {
+                    done = true;
                     break;
-                }
-                if let Some(chunk) = parse_sse_chunk(data) {
-                    if let Some(c) = &chunk.content {
-                        content.push_str(c);
-                    }
-                    if let Some(delta) = &chunk.tool_call_delta {
-                        let entry = tool_calls.entry(delta.index).or_insert_with(|| {
-                            crate::request::ToolCall {
-                                id: String::new(),
-                                name: String::new(),
-                                arguments: serde_json::Value::String(String::new()),
-                            }
-                        });
-                        if let Some(id) = &delta.id {
-                            entry.id = id.clone();
-                        }
-                        if let Some(name) = &delta.name {
-                            entry.name = name.clone();
-                        }
-                        if let Some(args) = &delta.arguments {
-                            if let serde_json::Value::String(acc) = &mut entry.arguments {
-                                acc.push_str(args);
-                            } else {
-                                entry.arguments = serde_json::Value::String(args.clone());
-                            }
-                        }
-                    }
-                    if let Some(fr) = &chunk.finish_reason {
-                        finish_reason = Some(fr.clone());
-                    }
-                    if let Some(u) = chunk.usage {
-                        usage = Some(u);
-                    }
-                    // Deliver without requiring the consumer to keep up:
-                    // unbounded means the UI can never block the agent
-                    // runtime (a closed channel just drops the chunk).
-                    let _ = tx.send(chunk);
                 }
             }
         }
 
-        let calls: Vec<crate::request::ToolCall> = tool_calls
+        // Flush any incomplete tail: decode whatever UTF-8 is valid and
+        // consume a final SSE line that arrived without a trailing newline.
+        if !pending_bytes.is_empty() {
+            buffer.push_str(&String::from_utf8_lossy(&pending_bytes));
+            pending_bytes.clear();
+        }
+        if !done && !buffer.trim().is_empty() {
+            let line = std::mem::take(&mut buffer);
+            let (out, _) = state.feed(&line)?;
+            if let Some(chunk) = out {
+                let _ = tx.send(chunk).await;
+            }
+        }
+
+        let calls: Vec<crate::request::ToolCall> = state
+            .tool_calls
             .into_iter()
             .filter(|(_, tc)| !tc.name.is_empty())
             .map(|(idx, mut tc)| {
@@ -337,6 +341,7 @@ impl ModelClient {
             })
             .collect();
 
+        let content = state.content;
         Ok(ModelResponse {
             message: crate::request::ChatMessage {
                 role: crate::request::Role::Assistant,
@@ -348,8 +353,8 @@ impl ModelClient {
                 tool_call_id: None,
                 tool_calls: calls,
             },
-            finish_reason,
-            usage,
+            finish_reason: state.finish_reason,
+            usage: state.usage,
             model: Some(self.config.model.clone()),
         })
     }
@@ -367,7 +372,7 @@ impl ModelClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| RequiemError::Connection(e.to_string()))?;
+            .map_err(|e| classify_reqwest_error(&e, self.config.timeout_ms))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let retry_after: Option<String> = resp
@@ -375,51 +380,344 @@ impl ModelClient {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+            let request_id = request_id_header(&resp);
             let text = resp.text().await.unwrap_or_default();
-            return Err(classify_http_error(status, &text, retry_after.as_deref()));
+            return Err(classify_http_error_with_id(
+                status,
+                &text,
+                retry_after.as_deref(),
+                request_id.as_deref(),
+            ));
         }
         Ok(resp)
     }
 }
 
-fn classify_http_error(status: u16, body: &str, retry_after_header: Option<&str>) -> RequiemError {
-    let snippet: String = body.chars().take(300).collect();
-    match status {
-        400 => {
-            // Distinguish sub-types within 400.
-            if body.contains("model")
-                && (body.contains("not found")
-                    || body.contains("does not exist")
-                    || body.contains("unsupported"))
-            {
-                RequiemError::ModelUnavailable(snippet)
-            } else if body.contains("tool")
-                && (body.contains("schema")
-                    || body.contains("format")
-                    || body.contains("incompatible"))
-            {
-                RequiemError::ToolCallingIncompatible(snippet)
-            } else if body.contains("quota")
-                || body.contains("billing")
-                || body.contains("exceeded")
-            {
-                RequiemError::QuotaExhausted(snippet)
-            } else {
-                RequiemError::Model {
-                    status: Some(400),
-                    message: snippet,
+/// Capacity of the streaming channel. A slow UI consumer applies
+/// backpressure after this many buffered chunks instead of growing the
+/// queue without bound.
+const STREAM_CHANNEL_CAPACITY: usize = 64;
+
+/// Reassembles an OpenAI-compatible SSE stream while forwarding each parsed
+/// chunk to the UI.
+#[derive(Default)]
+struct Reassembly {
+    content: String,
+    tool_calls: std::collections::BTreeMap<u32, crate::request::ToolCall>,
+    finish_reason: Option<String>,
+    usage: Option<TokenUsage>,
+}
+
+impl Reassembly {
+    /// Feed one raw SSE line. Returns the chunk to forward (if any) and
+    /// whether the stream signalled `[DONE]`.
+    fn feed(&mut self, line: &str) -> Result<(Option<StreamChunk>, bool), RequiemError> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') {
+            return Ok((None, false));
+        }
+        let data = line.strip_prefix("data:").unwrap_or(line).trim_start();
+        if data == "[DONE]" || data == "done" {
+            return Ok((None, true));
+        }
+        // A provider can send an error object mid-stream instead of a
+        // completion chunk. Surface it instead of silently ending with an
+        // empty response.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+            if v.get("error").is_some() {
+                return Err(RequiemError::StreamingFailure(summarize_error(data)));
+            }
+        }
+        let Some(chunk) = parse_sse_chunk(data) else {
+            // Ignore keep-alives and provider noise rather than aborting a
+            // healthy stream.
+            return Ok((None, false));
+        };
+        if let Some(c) = &chunk.content {
+            self.content.push_str(c);
+        }
+        if let Some(delta) = &chunk.tool_call_delta {
+            let entry =
+                self.tool_calls
+                    .entry(delta.index)
+                    .or_insert_with(|| crate::request::ToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: serde_json::Value::String(String::new()),
+                    });
+            if let Some(id) = &delta.id {
+                entry.id = id.clone();
+            }
+            if let Some(name) = &delta.name {
+                entry.name = name.clone();
+            }
+            if let Some(args) = &delta.arguments {
+                if let serde_json::Value::String(acc) = &mut entry.arguments {
+                    acc.push_str(args);
+                } else {
+                    entry.arguments = serde_json::Value::String(args.clone());
                 }
             }
         }
-        401 => RequiemError::Auth(format!("invalid credentials: {snippet}")),
-        403 => RequiemError::Auth(format!("access forbidden: {snippet}")),
+        if let Some(fr) = &chunk.finish_reason {
+            self.finish_reason = Some(fr.clone());
+        }
+        if let Some(u) = chunk.usage {
+            self.usage = Some(u);
+        }
+        Ok((Some(chunk), false))
+    }
+}
+
+/// Append `new` bytes to `pending` and decode the longest valid UTF-8
+/// prefix. An incomplete trailing sequence stays buffered for the next
+/// network chunk; genuinely invalid bytes become a single U+FFFD.
+fn decode_utf8_chunk(pending: &mut Vec<u8>, new: &[u8]) -> String {
+    pending.extend_from_slice(new);
+    let mut out = String::with_capacity(pending.len());
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    out.push_str(std::str::from_utf8(&pending[..valid]).unwrap_or(""));
+                    pending.drain(..valid);
+                }
+                match e.error_len() {
+                    Some(n) => {
+                        // Definitely invalid: replace and skip.
+                        out.push('\u{FFFD}');
+                        pending.drain(..n);
+                    }
+                    // Incomplete tail: wait for the rest of the character.
+                    None => break,
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Redact credentials and bound a diagnostic string so provider errors can
+/// never leak keys or dump an entire body into the transcript.
+fn sanitize_text(input: &str, max: usize) -> String {
+    let mut s = input.to_string();
+    // Bearer / Authorization material.
+    for marker in ["Bearer ", "bearer ", "Basic ", "basic "] {
+        let mut search = 0;
+        while let Some(rel) = s[search..].find(marker) {
+            let pos = search + rel;
+            let start = pos + marker.len();
+            let end = s[start..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';'))
+                .map(|i| start + i)
+                .unwrap_or(s.len());
+            s.replace_range(start..end, "***");
+            search = start + 3;
+            if search >= s.len() {
+                break;
+            }
+        }
+    }
+    // Common key shapes.
+    for prefix in ["sk-", "sk_", "rq-", "rk-", "ghp_", "xoxb-"] {
+        let mut search = 0;
+        while let Some(rel) = s[search..].find(prefix) {
+            let start = search + rel;
+            let end = s[start..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '&'))
+                .map(|i| start + i)
+                .unwrap_or(s.len());
+            s.replace_range(start..end, "<redacted>");
+            search = start + "<redacted>".len();
+            if search >= s.len() {
+                break;
+            }
+        }
+    }
+    // URL userinfo: scheme://user:pass@host → scheme://***@host
+    if let Some(scheme) = s.find("://") {
+        let after = scheme + 3;
+        if let Some(at_rel) = s[after..].find('@') {
+            let at = after + at_rel;
+            let slash = s[after..at].find('/').map(|i| after + i);
+            if slash.is_none() {
+                s.replace_range(after..at, "***");
+            }
+        }
+    }
+    // API key query params.
+    for param in ["api_key=", "apikey=", "access_token=", "key="] {
+        let mut search = 0;
+        while let Some(rel) = s[search..].find(param) {
+            let pos = search + rel;
+            let start = pos + param.len();
+            let end = s[start..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ','))
+                .map(|i| start + i)
+                .unwrap_or(s.len());
+            s.replace_range(start..end, "***");
+            search = start + 3;
+            if search >= s.len() {
+                break;
+            }
+        }
+    }
+
+    if s.chars().count() > max {
+        let mut truncated: String = s.chars().take(max).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        s
+    }
+}
+
+/// Extract a bounded, sanitized description of an OpenAI-compatible error
+/// body.
+fn parse_error_body(body: &str) -> (String, Option<String>, Option<String>) {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        let err = v.get("error");
+        let message = err
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .or_else(|| err.and_then(|e| e.as_str()))
+            .or_else(|| v.get("message").and_then(|m| m.as_str()))
+            .or_else(|| v.get("detail").and_then(|m| m.as_str()))
+            .unwrap_or("");
+        let kind = err
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string());
+        let code = err.and_then(|e| e.get("code")).and_then(|c| {
+            c.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| c.as_u64().map(|n| n.to_string()))
+        });
+        if !message.is_empty() || kind.is_some() || code.is_some() {
+            return (
+                sanitize_text(message, 240),
+                kind.map(|s| sanitize_text(&s, 60)),
+                code.map(|s| sanitize_text(&s, 60)),
+            );
+        }
+        // Valid JSON but no known shape: never echo the whole object.
+        return (
+            format!(
+                "provider returned a JSON error object ({} bytes)",
+                body.len()
+            ),
+            None,
+            None,
+        );
+    }
+    // Non-JSON body: likely an HTML gateway page. Keep only a short,
+    // sanitized excerpt and never the whole document.
+    (sanitize_text(body.trim(), 200), None, None)
+}
+
+/// A one-line summary of an upstream error body, including provider type
+/// and code when present.
+fn summarize_error(body: &str) -> String {
+    let (message, kind, code) = parse_error_body(body);
+    let mut out = message;
+    if kind.is_some() || code.is_some() {
+        let mut meta = Vec::new();
+        if let Some(k) = kind {
+            meta.push(format!("type: {k}"));
+        }
+        if let Some(c) = code {
+            meta.push(format!("code: {c}"));
+        }
+        out.push_str(&format!(" ({})", meta.join(", ")));
+    }
+    sanitize_text(&out, 300)
+}
+
+/// Suffix for an invalid-response diagnostic: bounded and sanitized.
+fn body_diagnostic(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let summary = summarize_error(text);
+    if summary.is_empty() {
+        String::new()
+    } else {
+        format!(": {summary}")
+    }
+}
+
+/// Read the provider request id from response headers, if present.
+fn request_id_header(resp: &reqwest::Response) -> Option<String> {
+    for name in ["x-request-id", "request-id", "x-amzn-requestid"] {
+        if let Some(v) = resp.headers().get(name).and_then(|v| v.to_str().ok()) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(sanitize_text(v, 80));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn classify_http_error(status: u16, body: &str, retry_after_header: Option<&str>) -> RequiemError {
+    classify_http_error_with_id(status, body, retry_after_header, None)
+}
+
+fn classify_http_error_with_id(
+    status: u16,
+    body: &str,
+    retry_after_header: Option<&str>,
+    request_id: Option<&str>,
+) -> RequiemError {
+    let snippet = summarize_error(body);
+    let suffix = request_id
+        .map(|id| format!(" [request id: {id}]"))
+        .unwrap_or_default();
+    // Classification hints: provider type/code first, message as fallback.
+    let (_, kind, code) = parse_error_body(body);
+    let hints = format!(
+        "{} {} {}",
+        kind.as_deref().unwrap_or(""),
+        code.as_deref().unwrap_or(""),
+        snippet
+    )
+    .to_lowercase();
+    let has = |needle: &str| hints.contains(needle);
+
+    match status {
+        400 | 422 => {
+            if has("model") && (has("not found") || has("does not exist") || has("unsupported")) {
+                RequiemError::ModelUnavailable(snippet)
+            } else if has("tool")
+                && (has("schema") || has("format") || has("incompatible") || has("not supported"))
+            {
+                RequiemError::ToolCallingIncompatible(snippet)
+            } else if has("quota") || has("billing") || has("credit") || has("exceeded") {
+                RequiemError::QuotaExhausted(snippet)
+            } else {
+                RequiemError::Model {
+                    status: Some(status),
+                    message: format!("{snippet}{suffix}"),
+                }
+            }
+        }
+        401 => RequiemError::Auth(format!("invalid credentials: {snippet}{suffix}")),
+        402 => RequiemError::QuotaExhausted(snippet),
+        403 => RequiemError::Auth(format!("access forbidden: {snippet}{suffix}")),
         404 => {
-            if body.contains("model") || body.contains("not found") {
+            if has("model") || has("not found") {
                 RequiemError::ModelUnavailable(snippet)
             } else {
                 RequiemError::Model {
                     status: Some(404),
-                    message: snippet,
+                    message: format!("{snippet}{suffix}"),
                 }
             }
         }
@@ -435,17 +733,76 @@ fn classify_http_error(status: u16, body: &str, retry_after_header: Option<&str>
         409 => RequiemError::StreamingFailure(snippet),
         502..=504 => RequiemError::GatewayFailure {
             status,
-            message: snippet,
-        },
-        500..=599 => RequiemError::Model {
-            status: Some(status),
-            message: snippet,
+            message: format!("{snippet}{suffix}"),
         },
         _ => RequiemError::Model {
             status: Some(status),
-            message: snippet,
+            message: format!("{snippet}{suffix}"),
         },
     }
+}
+
+/// Walk an error's source chain and collect lowercase messages.
+fn source_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut cursor = err.source();
+    while let Some(cause) = cursor {
+        out.push_str(" | ");
+        out.push_str(&cause.to_string());
+        cursor = cause.source();
+    }
+    out.to_lowercase()
+}
+
+/// Classify a `reqwest` transport failure from structured error flags and
+/// the source chain — never from a guess about the top-level string.
+fn classify_reqwest_error(err: &reqwest::Error, timeout_ms: u64) -> RequiemError {
+    let chain = source_chain(err);
+    if err.is_timeout() {
+        return RequiemError::Timeout(timeout_ms);
+    }
+    if err.is_connect() {
+        if chain.contains("certificate")
+            || chain.contains("tls")
+            || chain.contains("ssl")
+            || chain.contains("handshake")
+            || chain.contains("unknown issuer")
+            || chain.contains("self-signed")
+        {
+            return RequiemError::Tls(sanitize_text(&chain, 240));
+        }
+        if chain.contains("dns")
+            || chain.contains("failed to lookup address")
+            || chain.contains("name or service not known")
+            || chain.contains("nodename nor servname")
+            || chain.contains("no such host")
+        {
+            return RequiemError::Dns(sanitize_text(&chain, 240));
+        }
+        return RequiemError::Connection(sanitize_text(&chain, 240));
+    }
+    if err.is_body() || err.is_decode() {
+        return RequiemError::StreamingFailure(format!(
+            "response interrupted: {}",
+            sanitize_text(&chain, 200)
+        ));
+    }
+    if err.is_builder() || err.is_request() {
+        // Malformed request or invalid configuration — permanent.
+        return RequiemError::Config(sanitize_text(&chain, 240));
+    }
+    RequiemError::Connection(sanitize_text(&chain, 240))
+}
+
+/// Classify a failure while reading the SSE body.
+fn classify_stream_error(err: &reqwest::Error) -> RequiemError {
+    if err.is_timeout() {
+        return RequiemError::Timeout(0);
+    }
+    RequiemError::StreamingFailure(format!(
+        "stream interrupted: {}",
+        sanitize_text(&source_chain(err), 200)
+    ))
 }
 
 /// Parse the `Retry-After` header value into milliseconds.
@@ -723,5 +1080,130 @@ mod tests {
     fn classify_400_quota() {
         let err = classify_http_error(400, "quota exceeded", None);
         assert!(matches!(err, RequiemError::QuotaExhausted(_)));
+    }
+
+    #[test]
+    fn classify_402_is_quota() {
+        let err = classify_http_error(402, "payment required", None);
+        assert!(matches!(err, RequiemError::QuotaExhausted(_)));
+    }
+
+    #[test]
+    fn classify_json_error_extracts_message_type_code() {
+        let body = r#"{"error":{"message":"model gpt-9 not found","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let err = classify_http_error(404, body, None);
+        match err {
+            RequiemError::ModelUnavailable(msg) => {
+                assert!(msg.contains("model gpt-9 not found"), "got: {msg}");
+                assert!(msg.contains("code: model_not_found"), "got: {msg}");
+            }
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_401_never_echoes_key() {
+        let body = r#"{"error":{"message":"Incorrect API key provided: sk-secret123456. Authorization: Bearer sk-secret123456"}}"#;
+        let err = classify_http_error(401, body, None);
+        let text = err.to_string();
+        assert!(!text.contains("secret123456"), "key leaked: {text}");
+        assert!(
+            text.contains("***") || text.contains("<redacted>"),
+            "redacted: {text}"
+        );
+    }
+
+    #[test]
+    fn sanitize_redacts_tokens_and_urls() {
+        let s = sanitize_text(
+            "Authorization: Bearer abcdef123456 at https://user:pw@example.com/x?api_key=topsecret",
+            300,
+        );
+        assert!(!s.contains("abcdef123456"), "{s}");
+        assert!(!s.contains("topsecret"), "{s}");
+        assert!(!s.contains("user:pw"), "{s}");
+    }
+
+    #[test]
+    fn sanitize_is_bounded() {
+        let s = sanitize_text(&"x".repeat(10_000), 120);
+        assert!(s.chars().count() <= 121, "len: {}", s.chars().count());
+    }
+
+    #[test]
+    fn summarize_non_json_is_bounded() {
+        let body = format!("<html>{}</html>", "noise ".repeat(1000));
+        let out = summarize_error(&body);
+        assert!(out.chars().count() <= 301);
+        assert!(!out.contains("</html>") || out.chars().count() <= 301);
+    }
+
+    #[test]
+    fn request_id_is_appended_to_gateway_errors() {
+        let err = classify_http_error_with_id(502, "bad gateway", None, Some("req-123"));
+        let text = err.to_string();
+        assert!(text.contains("req-123"), "got: {text}");
+    }
+
+    #[test]
+    fn decode_utf8_split_multibyte_character() {
+        // 🌍 = F0 9F 8C 8D, split across three network chunks.
+        let bytes = "a🌍b".as_bytes();
+        let mut pending = Vec::new();
+        let mut out = String::new();
+        for part in [&bytes[..2], &bytes[2..3], &bytes[3..]] {
+            out.push_str(&decode_utf8_chunk(&mut pending, part));
+        }
+        assert!(pending.is_empty());
+        assert_eq!(out, "a🌍b");
+        assert!(!out.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn decode_utf8_invalid_bytes_become_one_replacement() {
+        let mut pending = Vec::new();
+        let out = decode_utf8_chunk(&mut pending, &[0xFF, b'o', b'k']);
+        assert_eq!(out, "\u{FFFD}ok");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn reassembly_accumulates_content_and_tool_calls() {
+        let mut r = Reassembly::default();
+        let c1 = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}";
+        let c2 =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}";
+        let tc1 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"read_file\"}}]}}]}";
+        let tc2 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"p\\\":1}\"}}]}}]}";
+        for line in [c1, c2, tc1, tc2] {
+            r.feed(line).unwrap();
+        }
+        assert_eq!(r.content, "Hello");
+        assert_eq!(r.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(r.tool_calls.len(), 1);
+        let tc = r.tool_calls.get(&0).unwrap();
+        assert_eq!(tc.name, "read_file");
+        assert_eq!(tc.id, "call_a");
+        assert_eq!(
+            tc.arguments,
+            serde_json::Value::String("{\"p\":1}".to_string())
+        );
+    }
+
+    #[test]
+    fn reassembly_honours_done_marker() {
+        let mut r = Reassembly::default();
+        let (_, done) = r.feed("data: [DONE]").unwrap();
+        assert!(done);
+    }
+
+    #[test]
+    fn reassembly_mid_stream_error_is_reported() {
+        let mut r = Reassembly::default();
+        let err = r
+            .feed("data: {\"error\":{\"message\":\"upstream exploded\",\"type\":\"server_error\"}}")
+            .unwrap_err();
+        assert!(matches!(err, RequiemError::StreamingFailure(_)));
+        assert!(err.to_string().contains("upstream exploded"));
     }
 }

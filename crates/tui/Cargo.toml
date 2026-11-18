@@ -10,4 +10,5 @@ requiem-core = { path = "../core" }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 textwrap = { workspace = true }
+unicode-width = { workspace = true }
 serde = { workspace = true }

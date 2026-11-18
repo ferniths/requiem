@@ -1,96 +1,119 @@
 //! Native clipboard read fallback for terminals that lack bracketed-paste
 //! support.
 //!
-//! On Windows the user can press `Alt+V` to read the clipboard directly
-//! from the Win32 API. On other platforms bracketed paste is the primary
-//! mechanism; this module is a no-op.
+//! Bracketed paste is the primary path: terminals that support it deliver
+//! clipboard content as a single paste event. When it is unavailable the
+//! user can press `Alt+V` and this module reads the OS clipboard directly.
+//!
+//! The implementation uses [`arboard`], which talks to the platform
+//! clipboard natively:
+//!
+//! * Windows — Win32 (`OpenClipboard`/`GetClipboardData`), with the
+//!   clipboard handle and global memory held for exactly as long as the
+//!   text is being copied. (The previous hand-rolled Win32 code closed the
+//!   clipboard *before* reading the pointer, which was undefined behaviour.)
+//! * Linux — X11 and Wayland (via `wl-clipboard-rs`), without shelling out
+//!   to `xclip`/`wl-paste`.
+//! * macOS — `NSPasteboard`.
+//!
+//! Reads happen on a short-lived worker thread with a timeout so a hung
+//! clipboard owner can never freeze the TUI.
 
-/// Returns `true` when the platform supports a native clipboard read path.
-pub fn is_supported() -> bool {
-    cfg!(windows)
-}
+use std::sync::mpsc;
+use std::time::Duration;
 
-/// Read the text clipboard. Returns `None` when the clipboard is empty,
-/// contains no text, or the platform does not support native reads.
+/// How long to wait for the platform clipboard before giving up.
+const READ_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Returns `true` when a native clipboard read path exists on this platform.
 ///
-/// On Windows this calls `GetClipboardData(CF_UNICODETEXT)` via the
-/// Win32 API. The returned string is normalised to LF line endings.
-pub fn read_clipboard() -> Option<String> {
-    #[cfg(windows)]
-    {
-        windows_clipboard()
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
+/// `arboard` supports every desktop target REQUIEM builds for; availability
+/// of an actual clipboard owner still depends on the running session, which
+/// is why [`read_clipboard`] returns `None` instead of panicking.
+pub fn is_supported() -> bool {
+    cfg!(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd"
+    ))
 }
 
-// ── Windows implementation ───────────────────────────────────────────
-
-#[cfg(windows)]
-fn windows_clipboard() -> Option<String> {
-    use std::ffi::c_void;
-
-    extern "system" {
-        fn IsClipboardFormatAvailable(format: u32) -> i32;
-        fn GetClipboardData(uFormat: u32) -> *mut c_void;
-        fn GlobalLock(hMem: *mut c_void) -> *mut c_void;
-        fn GlobalUnlock(hMem: *mut c_void) -> i32;
-        fn OpenClipboard(hwnd: *mut c_void) -> i32;
-        fn CloseClipboard() -> i32;
+/// Read the text clipboard, normalized to LF line endings.
+///
+/// Returns `None` when the clipboard is empty, holds no text (e.g. an
+/// image), no clipboard owner is available, or the read times out.
+pub fn read_clipboard() -> Option<String> {
+    if !is_supported() {
+        return None;
     }
 
-    const CF_UNICODETEXT: u32 = 13;
+    // arboard can block while the owning application services the request
+    // (notably on X11/Wayland). Do the read off-thread with a timeout.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_native());
+    });
+    rx.recv_timeout(READ_TIMEOUT).ok().flatten()
+}
 
-    unsafe {
-        if OpenClipboard(std::ptr::null_mut()) == 0 {
-            return None;
-        }
-        let ok = IsClipboardFormatAvailable(CF_UNICODETEXT);
-        let handle = if ok != 0 {
-            GetClipboardData(CF_UNICODETEXT)
-        } else {
-            std::ptr::null_mut()
-        };
-        CloseClipboard();
-
-        let ptr = if handle.is_null() {
-            return None;
-        } else {
-            GlobalLock(handle)
-        };
-        if !ptr.is_null() {
-            GlobalUnlock(handle);
-        }
-
-        if ptr.is_null() {
-            return None;
-        }
-
-        let wide = ptr as *const u16;
-        let mut count = 0;
-        while *wide.add(count) != 0 {
-            count += 1;
-        }
-        let chars: Vec<u16> = std::slice::from_raw_parts(wide, count).to_vec();
-        let text = String::from_utf16_lossy(&chars);
-        Some(text.replace("\r\n", "\n").replace('\r', "\n"))
+fn read_native() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let text = clipboard.get_text().ok()?;
+    if text.is_empty() {
+        return None;
     }
+    Some(normalize_line_endings(&text))
+}
+
+/// Normalize CRLF and lone CR to LF. Bracketed paste and native clipboard
+/// text can arrive with platform line endings; the composer and transcript
+/// only understand LF.
+pub fn normalize_line_endings(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(windows))]
+    use super::*;
+
     #[test]
-    fn not_supported_off_windows() {
-        assert!(!super::is_supported());
-        assert!(super::read_clipboard().is_none());
+    fn normalizes_crlf() {
+        assert_eq!(normalize_line_endings("a\r\nb\r\n"), "a\nb\n");
     }
 
-    #[cfg(windows)]
     #[test]
-    fn supported_on_windows() {
-        assert!(super::is_supported());
+    fn normalizes_lone_cr() {
+        assert_eq!(normalize_line_endings("a\rb"), "a\nb");
+    }
+
+    #[test]
+    fn leaves_lf_untouched() {
+        assert_eq!(normalize_line_endings("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn preserves_unicode_and_indentation() {
+        let text = "  fn main() {\r\n\tprintln!(\"héllo 🌍\");\r\n}";
+        assert_eq!(
+            normalize_line_endings(text),
+            "  fn main() {\n\tprintln!(\"héllo 🌍\");\n}"
+        );
+    }
+
+    #[test]
+    fn supported_on_desktop_targets() {
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+        assert!(is_supported());
+    }
+
+    #[test]
+    fn read_never_panics() {
+        // May return None in headless CI; must never panic or hang the test
+        // (READ_TIMEOUT bounds the wait).
+        let _ = read_clipboard();
     }
 }

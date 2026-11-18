@@ -3,9 +3,18 @@
 //! Replaces the old single-line input with a proper multiline text editor
 //! that supports cursor movement, undo/redo, and correct paste handling.
 //! The composer is used by `App` for the input area of the session screen.
+//!
+//! Wrapping is display-width based (see [`unicode_width`]): CJK glyphs and
+//! emoji occupy two cells, combining marks zero, and tabs advance to the
+//! next 4-column stop. `visual_rows` is the single source of truth for
+//! both layout height and rendering, so they can never disagree.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+
+use unicode_width::UnicodeWidthChar;
+
+/// Tab stop width for display purposes.
+pub const TAB_STOP: usize = 4;
 
 /// A single-line text buffer with cursor tracking.
 #[derive(Debug, Clone, Default)]
@@ -16,8 +25,6 @@ pub struct Composer {
     pub cursor: usize,
     /// Whether the text contains newlines (i.e. is multiline).
     pub multiline: bool,
-    /// Timestamp of the last character insertion (for paste-flood detection).
-    pub last_char_at: Option<Instant>,
     /// Undo stack (newest last).
     pub undo_stack: VecDeque<(String, usize)>,
     /// Redo stack.
@@ -45,12 +52,17 @@ impl Composer {
 
     /// Insert a single character at the cursor.
     pub fn insert_char(&mut self, c: char) {
+        self.clamp_cursor();
         self.push_undo();
         let byte = self.cursor_byte();
         self.text.insert(byte, c);
         self.cursor += 1;
         self.multiline = self.text.contains('\n');
-        self.last_char_at = Some(Instant::now());
+    }
+
+    /// Keep the cursor inside the buffer (defensive against stale state).
+    fn clamp_cursor(&mut self) {
+        self.cursor = self.cursor.min(self.len());
     }
 
     /// Delete the character before the cursor.
@@ -181,6 +193,7 @@ impl Composer {
 
     /// Insert a newline at the cursor.
     pub fn insert_newline(&mut self) {
+        self.clamp_cursor();
         self.push_undo();
         let byte = self.cursor_byte();
         self.text.insert(byte, '\n');
@@ -228,12 +241,14 @@ impl Composer {
     pub fn insert_paste(&mut self, text: &str) {
         // Normalize line endings: CRLF → LF, CR → LF.
         let normalized = normalize_line_endings(text);
+        self.clamp_cursor();
         self.push_undo();
         let byte = self.cursor_byte();
         self.text.insert_str(byte, &normalized);
-        self.cursor = byte + normalized.chars().count();
+        // `cursor` is a char index, not a byte offset: advance by the
+        // number of characters inserted, never by `byte + len`.
+        self.cursor += normalized.chars().count();
         self.multiline = self.text.contains('\n');
-        self.last_char_at = Some(Instant::now());
     }
 
     /// Clear all text and reset cursor.
@@ -244,16 +259,6 @@ impl Composer {
         self.text.clear();
         self.cursor = 0;
         self.multiline = false;
-        self.last_char_at = None;
-    }
-
-    /// Whether a paste flood is detected (large text, recent insertion).
-    pub fn is_paste_flood(&self) -> bool {
-        self.text.chars().count() >= 20
-            && self
-                .last_char_at
-                .map(|t| t.elapsed() < std::time::Duration::from_millis(100))
-                .unwrap_or(false)
     }
 
     /// The trimmed text (for submission).
@@ -273,7 +278,7 @@ impl Composer {
     /// 4 KB). For large content, returns a single-line summary such as
     /// `"[Pasted text · 240 lines · 18.4 KB]"`.
     pub fn paste_placeholder(&self) -> Option<String> {
-        let line_count = self.text.lines().count();
+        let line_count = self.text.lines().count().max(1);
         let byte_len = self.text.len();
         if line_count < 50 && byte_len < 4096 {
             return None;
@@ -299,171 +304,260 @@ fn char_to_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
 }
 
-// ── Soft wrapping ─────────────────────────────────────────────────────
+// ── Display-width soft wrapping ──────────────────────────────────────
 
-/// A visual line produced by soft-wrapping a logical line of text to a
-/// given width. Carries the starting char index so the cursor can be
-/// mapped back to a (row, col) position.
-#[derive(Debug, Clone)]
-pub struct WrappedLine {
-    /// The visible text for this row.
+/// One visual row of the composer after display-width soft wrapping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisualRow {
+    /// The rendered text (tabs already expanded to spaces).
     pub text: String,
-    /// Char index in the original logical line where this visual row starts.
+    /// Char index in the whole composer text where this row starts.
     pub start_char: usize,
+    /// Char index in the whole composer text just past this row.
+    pub end_char: usize,
+    /// Display width of `text` in terminal cells.
+    pub width: usize,
 }
 
-/// Soft-wrap a single logical line (no embedded `\n`) to `width` columns.
-/// Long words are broken mid-word rather than overflowing.
-pub fn soft_wrap_line(line: &str, width: usize) -> Vec<WrappedLine> {
+/// A display cluster: a base character plus any zero-width followers
+/// (combining marks, variation selectors, ZWJ sequences).
+#[derive(Debug, Clone, Copy)]
+struct Cluster {
+    start: usize,
+    end: usize,
+    width: usize,
+    is_space: bool,
+}
+
+/// Whether a char is zero-width (combining mark, joiner, selector).
+fn is_zero_width(c: char) -> bool {
+    !c.is_control() && matches!(UnicodeWidthChar::width(c), Some(0) | None)
+}
+
+/// Whether `c` continues the cluster started by `prev`.
+fn is_joiner(prev: char, c: char) -> bool {
+    c == '\u{200D}' || prev == '\u{200D}' || c == '\u{FE0F}' || is_zero_width(c)
+}
+
+/// Width of one char when placed at display column `col`.
+pub fn char_width_at(c: char, col: usize) -> usize {
+    match c {
+        '\t' => TAB_STOP - (col % TAB_STOP),
+        _ => UnicodeWidthChar::width(c).unwrap_or(0),
+    }
+}
+
+/// Split a logical line into display clusters.
+fn clusters(chars: &[char]) -> Vec<Cluster> {
+    let mut out: Vec<Cluster> = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    let mut col = 0;
+    while i < chars.len() {
+        let start = i;
+        let c = chars[i];
+        let mut width = char_width_at(c, col);
+        i += 1;
+        // Attach combining marks and ZWJ sequences to the base glyph.
+        while i < chars.len() && is_joiner(chars[i - 1], chars[i]) {
+            let w = char_width_at(chars[i], col + width);
+            width = width.max(w);
+            i += 1;
+        }
+        col += width;
+        out.push(Cluster {
+            start,
+            end: i,
+            width,
+            is_space: c == ' ' || c == '\t',
+        });
+    }
+    out
+}
+
+/// Render a char range with tabs expanded to their cluster width.
+fn render_range(chars: &[char], start: usize, end: usize, cl: &[Cluster]) -> String {
+    let mut out = String::new();
+    for c in &cl[start..end] {
+        for &ch in &chars[c.start..c.end] {
+            if ch == '\t' {
+                out.push_str(&" ".repeat(c.width));
+            } else {
+                out.push(ch);
+            }
+        }
+    }
+    out
+}
+
+/// Split `text` into logical lines, preserving a trailing empty line so
+/// that a final newline produces a visible empty row.
+fn logical_lines(text: &str) -> Vec<(usize, Vec<char>)> {
+    let mut out: Vec<(usize, Vec<char>)> = Vec::new();
+    let mut current: Vec<char> = Vec::new();
+    let mut offset = 0usize;
+    for c in text.chars() {
+        if c == '\n' {
+            let line_len = current.len();
+            out.push((offset, std::mem::take(&mut current)));
+            offset += line_len + 1;
+        } else {
+            current.push(c);
+        }
+    }
+    out.push((offset, current));
+    out
+}
+
+/// Soft-wrap one logical line into display rows, preferring break points
+/// at spaces. Wide glyphs never split; the char ranges of consecutive
+/// rows cover the whole line with no gaps.
+fn wrap_line(chars: &[char], offset: usize, avail: usize) -> Vec<VisualRow> {
+    let cl = clusters(chars);
+    if cl.is_empty() {
+        return vec![VisualRow {
+            text: String::new(),
+            start_char: offset,
+            end_char: offset,
+            width: 0,
+        }];
+    }
+    let avail = avail.max(1);
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < cl.len() {
+        let mut end = start;
+        let mut w = 0usize;
+        let mut last_space: Option<usize> = None;
+        while end < cl.len() {
+            let cw = cl[end].width;
+            // Always admit the first cluster of a row (progress guarantee),
+            // even if a single wide glyph is wider than the available width.
+            if end > start && w + cw > avail {
+                break;
+            }
+            w += cw;
+            end += 1;
+            if cl[end - 1].is_space {
+                last_space = Some(end);
+            }
+            if w >= avail {
+                break;
+            }
+        }
+        let mut chosen = end;
+        if chosen < cl.len() {
+            if let Some(sp) = last_space {
+                if sp > start {
+                    chosen = sp;
+                }
+            }
+            if chosen == start {
+                chosen = end.max(start + 1);
+            }
+        }
+        let text = render_range(chars, start, chosen, &cl);
+        let width: usize = cl[start..chosen].iter().map(|c| c.width).sum();
+        rows.push(VisualRow {
+            text,
+            start_char: offset + cl[start].start,
+            end_char: offset + cl[chosen - 1].end,
+            width,
+        });
+        start = chosen;
+    }
+    rows
+}
+
+/// Wrap the whole composer text at `width` display columns.
+///
+/// This is the single canonical wrapping function: layout height and the
+/// rendered rows both come from it, so they can never disagree.
+pub fn visual_rows(text: &str, width: usize) -> Vec<VisualRow> {
     let width = width.max(1);
-    if line.is_empty() {
-        return vec![WrappedLine {
+    let mut rows: Vec<VisualRow> = Vec::new();
+    for (offset, chars) in logical_lines(text) {
+        rows.extend(wrap_line(&chars, offset, width));
+    }
+    if rows.is_empty() {
+        rows.push(VisualRow {
             text: String::new(),
             start_char: 0,
-        }];
-    }
-    let chars: Vec<char> = line.chars().collect();
-    let total = chars.len();
-    if total <= width {
-        return vec![WrappedLine {
-            text: line.to_string(),
-            start_char: 0,
-        }];
-    }
-
-    let mut result = Vec::new();
-    let mut pos = 0;
-    while pos < total {
-        // Find the last space within the window; break there if found.
-        let window_end = (pos + width).min(total);
-        let mut break_at = window_end;
-        for i in (pos + 1..window_end).rev() {
-            if chars[i].is_whitespace() {
-                break_at = i;
-                break;
-            }
-        }
-        // If no space found, hard-break at window_end.
-        let end = if break_at > pos + 1 {
-            break_at
-        } else {
-            window_end
-        };
-        let text: String = chars[pos..end].iter().collect();
-        result.push(WrappedLine {
-            text,
-            start_char: pos,
+            end_char: 0,
+            width: 0,
         });
-        pos = end;
     }
-    result
+    rows
 }
 
-/// Compute the visual row and column of the cursor for a given composer
-/// state and terminal width. Returns `(row, col)` where row is the index
-/// into the vector of all visual rows and col is the character position
-/// within that visual row's text.
-///
-/// The `all_visual_rows` is built by first splitting the text on `\n`
-/// (logical lines), then soft-wrapping each logical line.
-pub fn cursor_visual_position(text: &str, cursor_char: usize, width: usize) -> (usize, usize) {
-    let chars: Vec<char> = text.chars().collect();
-    let total = chars.len();
-    let cursor = cursor_char.min(total);
-
-    // Find which logical line the cursor is on.
-    let mut char_in_line = 0;
-    for (i, c) in chars.iter().enumerate() {
-        if i >= cursor {
-            break;
-        }
-        if *c == '\n' {
-            char_in_line = 0;
-        } else {
-            char_in_line += 1;
-        }
-    }
-
-    // Build visual rows for just this logical line.
-    let line_start = {
-        // Find the start of the current logical line.
-        let mut ls = 0;
-        for (i, c) in chars.iter().enumerate() {
-            if i >= cursor {
-                break;
-            }
-            if *c == '\n' {
-                ls = i + 1;
-            }
-        }
-        ls
-    };
-    let line_end = chars[line_start..]
-        .iter()
-        .position(|c| *c == '\n')
-        .map(|p| line_start + p)
-        .unwrap_or(total);
-    let logical_text: String = chars[line_start..line_end].iter().collect();
-    let wrapped = soft_wrap_line(&logical_text, width);
-
-    // Count total visual rows before this logical line.
-    let mut rows_before = 0;
-    for i in 0..line_start {
-        if chars[i] == '\n' {
-            let prev_start = {
-                let mut ps = 0;
-                for (j, c) in chars.iter().enumerate().take(i) {
-                    if *c == '\n' {
-                        ps = j + 1;
-                    }
-                }
-                ps
-            };
-            let prev_end = i;
-            let prev_text: String = chars[prev_start..prev_end].iter().collect();
-            rows_before += soft_wrap_line(&prev_text, width).len();
-        }
-    }
-
-    // Find which visual row within this logical line the cursor maps to.
-    let mut row_in_line = 0;
-    let mut col = char_in_line;
-    for wl in &wrapped {
-        if char_in_line < wl.start_char + wl.text.chars().count() {
-            row_in_line = wrapped
-                .iter()
-                .position(|w| std::ptr::eq(w, wl))
-                .unwrap_or(0);
-            col = char_in_line - wl.start_char;
-            break;
-        }
-        row_in_line += 1;
-        if row_in_line == wrapped.len() {
-            col = 0;
-            break;
-        }
-    }
-
-    (rows_before + row_in_line, col)
-}
-
-/// Number of visual rows the composer text will occupy at a given width.
+/// Number of visual rows the composer text occupies at `width` columns.
 pub fn total_visual_rows(text: &str, width: usize) -> usize {
-    if text.is_empty() {
-        return 1;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut rows = 0;
-    let mut line_start = 0;
-    for i in 0..=chars.len() {
-        let is_end = i == chars.len() || chars[i] == '\n';
-        if is_end {
-            let line_text: String = chars[line_start..i].iter().collect();
-            rows += soft_wrap_line(&line_text, width).len();
-            line_start = i + 1;
+    visual_rows(text, width).len()
+}
+
+/// Compute the `(row, display_column)` of the cursor.
+///
+/// `cursor_char` is a char index into `text`. The returned column is in
+/// terminal cells, so wide glyphs (CJK, emoji) and expanded tabs map
+/// correctly.
+pub fn cursor_visual_position(text: &str, cursor_char: usize, width: usize) -> (usize, usize) {
+    let rows = visual_rows(text, width);
+    let total_chars = text.chars().count();
+    let cursor = cursor_char.min(total_chars);
+
+    let mut row_idx = 0;
+    for (i, row) in rows.iter().enumerate() {
+        if cursor < row.end_char {
+            row_idx = i;
+            break;
         }
+        if cursor == row.end_char {
+            row_idx = if i + 1 < rows.len() && rows[i + 1].start_char == cursor {
+                i + 1
+            } else {
+                i
+            };
+            break;
+        }
+        row_idx = i;
     }
-    rows.max(1)
+
+    let row = &rows[row_idx];
+    let line: Vec<char> = text
+        .chars()
+        .skip(row.start_char)
+        .take(row.end_char - row.start_char)
+        .collect();
+    let target = cursor.saturating_sub(row.start_char);
+    let mut col = 0usize;
+    for c in clusters(&line) {
+        if c.start >= target {
+            break;
+        }
+        if target < c.end {
+            break;
+        }
+        col += c.width;
+    }
+    (row_idx, col)
+}
+
+/// Split a rendered row at display column `col` into
+/// `(before, cursor_cluster, after)`. The cursor cluster may be empty
+/// when the caret is at the end of the row.
+pub fn split_at_display_col(text: &str, col: usize) -> (String, String, String) {
+    let chars: Vec<char> = text.chars().collect();
+    let cl = clusters(&chars);
+    let mut w = 0usize;
+    for c in &cl {
+        if w + c.width > col {
+            let before: String = chars[..c.start].iter().collect();
+            let at: String = chars[c.start..c.end].iter().collect();
+            let after: String = chars[c.end..].iter().collect();
+            return (before, at, after);
+        }
+        w += c.width;
+    }
+    (text.to_string(), String::new(), String::new())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -598,15 +692,18 @@ mod tests {
     }
 
     #[test]
-    fn paste_flood_detection() {
+    fn paste_after_unicode_places_cursor_by_char_index() {
+        // The old bug did `byte + normalized.chars().count()`, mixing byte
+        // and char indices. Pasting after multibyte text exposed it.
         let mut c = Composer::new();
-        let large = "a".repeat(100);
-        c.insert_paste(&large);
-        assert!(c.is_paste_flood());
-        // After the 100ms window passes (simulated by clearing the timestamp),
-        // it should not be a flood.
-        c.last_char_at = None;
-        assert!(!c.is_paste_flood());
+        c.insert_paste("héllo 🌍 世界");
+        let typed_before = c.len();
+        c.insert_paste("X");
+        assert_eq!(c.text, "héllo 🌍 世界X");
+        assert_eq!(c.cursor, typed_before + 1);
+        // Cursor must be usable immediately: deleting removes the pasted X.
+        c.delete_before();
+        assert_eq!(c.text, "héllo 🌍 世界");
     }
 
     #[test]
@@ -715,40 +812,118 @@ mod tests {
     }
 
     #[test]
-    fn soft_wrap_short_line_unchanged() {
-        let wrapped = soft_wrap_line("hello", 80);
-        assert_eq!(wrapped.len(), 1);
-        assert_eq!(wrapped[0].text, "hello");
+    fn wrap_short_line_unchanged() {
+        let rows = visual_rows("hello", 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "hello");
+        assert_eq!(rows[0].width, 5);
     }
 
     #[test]
-    fn soft_wrap_long_word_breaks_mid_word() {
+    fn wrap_long_word_breaks_mid_word() {
         let long_word = "a".repeat(100);
-        let wrapped = soft_wrap_line(&long_word, 40);
-        assert!(wrapped.len() >= 3);
-        // Total chars preserved.
-        let total: usize = wrapped.iter().map(|w| w.text.chars().count()).sum();
+        let rows = visual_rows(&long_word, 40);
+        assert!(rows.len() >= 3);
+        let total: usize = rows.iter().map(|w| w.text.chars().count()).sum();
         assert_eq!(total, 100);
+        for row in &rows {
+            assert!(row.width <= 40, "row wider than limit: {}", row.width);
+        }
     }
 
     #[test]
-    fn soft_wrap_breaks_at_spaces() {
+    fn wrap_breaks_at_spaces_and_reconstructs() {
         let text = "word1 word2 word3 word4";
-        let wrapped = soft_wrap_line(text, 10);
-        // Each visual line should be at most 10 chars (including trailing space).
-        for wl in &wrapped {
-            assert!(
-                wl.text.chars().count() <= 10,
-                "line too long: {:?}",
-                wl.text
-            );
+        let rows = visual_rows(text, 10);
+        for row in &rows {
+            assert!(row.width <= 10, "row too wide: {:?}", row.text);
         }
-        // Concatenating all wrapped lines should reproduce the original text.
-        let reconstructed: String = wrapped.iter().map(|w| w.text.as_str()).collect();
-        assert_eq!(
-            reconstructed, text,
-            "wrapped lines must reconstruct the original"
-        );
+        let reconstructed: String = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(reconstructed, text, "rows must reconstruct the original");
+    }
+
+    #[test]
+    fn wrap_preserves_trailing_newline_as_empty_row() {
+        let rows = visual_rows("abc\n", 40);
+        assert_eq!(rows.len(), 2, "final newline must yield an empty row");
+        assert_eq!(rows[0].text, "abc");
+        assert_eq!(rows[1].text, "");
+        assert_eq!(total_visual_rows("abc\n", 40), 2);
+    }
+
+    #[test]
+    fn wrap_wide_glyphs_use_two_columns() {
+        // Four CJK glyphs = 8 display cells.
+        let rows = visual_rows("你好世界", 4);
+        assert_eq!(rows.len(), 2, "8 cells at width 4 → 2 rows");
+        assert_eq!(rows[0].text, "你好");
+        assert_eq!(rows[0].width, 4);
+        assert_eq!(rows[1].text, "世界");
+    }
+
+    #[test]
+    fn wrap_never_splits_wide_glyph() {
+        // An odd width must not split a 2-cell glyph.
+        let rows = visual_rows("你好世", 3);
+        assert_eq!(rows[0].text, "你");
+        assert_eq!(rows[1].text, "好");
+        assert_eq!(rows[2].text, "世");
+    }
+
+    #[test]
+    fn wrap_tabs_expand_to_stops() {
+        // Tab at column 0 expands to 4 spaces.
+        let rows = visual_rows("\tx", 40);
+        assert_eq!(rows[0].text, "    x");
+        assert_eq!(rows[0].width, 5);
+    }
+
+    #[test]
+    fn wrap_emoji_width() {
+        let rows = visual_rows("🌍🌍", 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "🌍");
+    }
+
+    #[test]
+    fn wrap_combining_marks_stay_with_base() {
+        // "e" + combining acute = one cluster, width 1.
+        let text = "e\u{0301}e\u{0301}e\u{0301}";
+        let rows = visual_rows(text, 2);
+        assert_eq!(rows.len(), 2, "3 clusters at width 2 → 2 rows");
+        assert_eq!(rows[0].text, "e\u{0301}e\u{0301}");
+        assert_eq!(rows[0].width, 2);
+    }
+
+    #[test]
+    fn cursor_maps_after_wide_glyphs() {
+        // Cursor after two CJK glyphs on row 0, then wraps.
+        let text = "你好世界";
+        let (row, col) = cursor_visual_position(text, 2, 4);
+        // At a soft-wrap boundary the caret moves to the start of the next
+        // visual row (it cannot sit past the last cell of a full row).
+        assert_eq!((row, col), (1, 0));
+        let (row, col) = cursor_visual_position(text, 3, 4);
+        assert_eq!((row, col), (1, 2));
+    }
+
+    #[test]
+    fn cursor_at_end_of_trailing_newline() {
+        let text = "ab\n";
+        let (row, col) = cursor_visual_position(text, 3, 40);
+        assert_eq!((row, col), (1, 0));
+    }
+
+    #[test]
+    fn split_at_display_col_handles_wide_glyphs() {
+        let (before, at, after) = split_at_display_col("你好", 2);
+        assert_eq!(before, "你");
+        assert_eq!(at, "好");
+        assert_eq!(after, "");
+        // Past the end → nothing to place the cursor on.
+        let (before, at, after) = split_at_display_col("ab", 5);
+        assert_eq!(before, "ab");
+        assert!(at.is_empty() && after.is_empty());
     }
 
     #[test]
