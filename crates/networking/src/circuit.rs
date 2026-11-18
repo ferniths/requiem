@@ -207,9 +207,7 @@ impl CircuitBreaker {
             return 0;
         }
         match g.opened_at {
-            Some(opened_at) => {
-                (self.config.cooldown - opened_at.elapsed()).as_millis() as u64
-            }
+            Some(opened_at) => (self.config.cooldown - opened_at.elapsed()).as_millis() as u64,
             None => self.config.cooldown.as_millis() as u64,
         }
     }

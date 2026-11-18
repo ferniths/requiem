@@ -331,6 +331,25 @@ fn session_db_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error + S
 
 // ── Full-screen mode ────────────────────────────────────────────────────────────────
 
+/// Persist the proxy pool's current `NetworkConfig` back to the user's
+/// TOML config file. Called after `/proxy add`, `/proxy remove`,
+/// `/proxy enable`, and `/proxy disable` so that runtime changes
+/// survive a session restart.
+async fn persist_pool_network(pool: &std::sync::Arc<requiem_networking::ProxyPool>) {
+    let mut config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not load config to persist proxy changes");
+            return;
+        }
+    };
+    let snapshot = pool.config_snapshot().await;
+    config.network = snapshot;
+    if let Err(e) = config.save() {
+        tracing::warn!(error = %e, "could not persist proxy config changes to TOML");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_fullscreen(
     config: &Config,
@@ -1328,6 +1347,7 @@ async fn dispatch_slash(
                         let display_url = ep.redacted_url();
                         if let Some(p) = pool {
                             p.add_endpoint(ep).await;
+                            persist_pool_network(p).await;
                             app.push_system(
                                 &format!(
                                     "added proxy {id} — {display_url} (run /proxy test to verify)"
@@ -1351,6 +1371,7 @@ async fn dispatch_slash(
                             Ok(id) => {
                                 if let Some(p) = pool {
                                     if p.remove_endpoint(&id).await {
+                                        persist_pool_network(p).await;
                                         app.push_system(
                                             &format!("removed proxy {id}"),
                                             NoticeLevel::Success,
@@ -1378,6 +1399,7 @@ async fn dispatch_slash(
                 Some("enable") => {
                     if let Some(p) = pool {
                         p.set_proxy_enabled(true).await;
+                        persist_pool_network(p).await;
                         app.push_system("proxy routing enabled", NoticeLevel::Success);
                     } else {
                         app.push_system("proxy pool not attached", NoticeLevel::Warning);
@@ -1386,6 +1408,7 @@ async fn dispatch_slash(
                 Some("disable") => {
                     if let Some(p) = pool {
                         p.set_proxy_enabled(false).await;
+                        persist_pool_network(p).await;
                         app.push_system(
                             "proxy routing disabled — using direct connection",
                             NoticeLevel::Success,

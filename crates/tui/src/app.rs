@@ -4669,7 +4669,10 @@ fn hello() {
         assert_eq!(app.entries.len(), 1);
         let card = &app.entries[0];
         assert!(card.glyph == "⚡");
-        assert!(card.text.contains("/retry"), "card offers a recovery action");
+        assert!(
+            card.text.contains("/retry"),
+            "card offers a recovery action"
+        );
         // Layout/selection is preserved when the card lands.
         assert_eq!(app.dash.focus, before, "error must not reset the selection");
     }

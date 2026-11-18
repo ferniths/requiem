@@ -292,6 +292,10 @@ requiem uninstall
 | `/budget` | Show token/task budgets and current usage |
 | `/events` | Recent runtime events |
 | `/stop` | Cancel the running task |
+| `/retry` | Force a provider recovery probe (re-runs the last request) |
+| `/diagnostics` | Show model client, circuit-breaker and log-directory state |
+| `/logs` | Show where REQUIEM writes its log files |
+| `/proxy [sub]` | Proxy pool status and management (see the Proxy pool section) |
 | `/help` | Show available commands (grouped by category) |
 | `/exit` | Leave the session |
 
@@ -340,6 +344,59 @@ Resume a previous session:
 ```bash
 requiem session --resume <session-uuid>
 ```
+
+---
+
+## Proxy pool
+
+REQUIEM has two distinct outbound proxy layers. Do not confuse them:
+
+| Layer | What it controls | Where configured |
+|-------|-----------------|-----------------|
+| **9router outbound proxy pool** | How 9router connects to *upstream* provider services (the pool of proxies 9router routes through). Managed entirely inside 9router's own dashboard; REQUIEM does not read or write it. | 9router dashboard |
+| **REQUIEM outbound proxy pool** | How REQUIEM connects to its *configured HTTP API endpoint* (often a local 9router server). If the endpoint is a local 9router, the normal path is: `REQUIEM → local 9router → 9router's outbound proxy pool → upstream provider`. | `~/.requiem/config.toml` `[network]` section |
+
+When using local 9router as the endpoint, you typically leave REQUIEM's own proxy pool disabled (`proxy_enabled = false`) and let 9router's dashboard manage its outbound routing. Enabling REQUIEM's proxy pool is only needed when REQUIEM must reach a *remote* API endpoint through an outbound proxy.
+
+### Config (`[network]` section in `~/.requiem/config.toml`)
+
+```toml
+[network]
+proxy_enabled = false
+strategy = "failover"      # failover | round-robin | health-aware | direct
+proxy_timeout_ms = 5000
+
+[[network.endpoints]]
+provider = "my-proxy"
+kind = "custom"
+url = "http://proxy:8080"   # or socks5://proxy:1080
+protocol = "http"            # http | socks5
+enabled = true
+```
+
+### In-session commands
+
+| Command | Description |
+|---------|-------------|
+| `/proxy` | Show pool status: strategy, endpoint count, per-endpoint health and latency |
+| `/proxy list` | List all endpoints with enable state and failure counts |
+| `/proxy test` | Run a live health probe on every endpoint (reports latency + status) |
+| `/proxy add <url> [provider]` | Add a new endpoint (auto-detects SOCKS5 vs HTTP from the URL scheme); persisted to TOML |
+| `/proxy remove <uuid>` | Remove an endpoint; persisted to TOML |
+| `/proxy enable` | Enable proxy routing; persisted to TOML |
+| `/proxy disable` | Disable proxy routing (fall back to direct); persisted to TOML |
+| `/proxy rotate` | Rotate to the next healthy endpoint in the pool |
+| `/proxy stats` | Show endpoint count, healthy count, last 429 retry-after, consecutive 429s |
+| `/proxy refresh` | Re-run health checks on all endpoints and report pass/fail |
+| `/proxy provider <strategy>` | Switch the selection strategy (failover / round-robin / health-aware / direct) |
+
+All mutation commands (`add`, `remove`, `enable`, `disable`) persist the updated pool state back to `~/.requiem/config.toml` so changes survive a session restart.
+
+### Provider recovery and circuit breaker
+
+When the configured provider (e.g. a MiMo route through 9router) returns a permanent upstream error, REQUIEM's shared circuit breaker trips: consecutive permanent failures open the breaker, pausing new requests for a cooldown window. While open, every agent in the session is shielded — they receive a single `CircuitOpen` error instead of each independently retrying the same doomed request. After the cooldown, a half-open probe is sent; if it succeeds, the breaker closes and queued work resumes automatically. Transient failures (502/503 that do *not* wrap a permanent upstream error, connection drops, 429 rate limits) reset the permanent-failure counter and use the existing retry policy with exponential backoff and jitter.
+
+See the `/diagnostics` command for the live breaker state and `/retry` to force a recovery probe.
 
 ---
 
