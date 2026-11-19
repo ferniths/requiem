@@ -98,6 +98,15 @@ pub struct Task {
     /// How many consecutive verification passes have failed (bounded loop).
     #[serde(default)]
     pub verification_attempts: u32,
+    /// When the task was claimed (for lease tracking). `None` when the
+    /// task is not in a claimed/running state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<Timestamp>,
+    /// The task's lease in milliseconds. A task in `Claimed`/`Running`
+    /// state that exceeds this window without a status update is
+    /// considered stalled and eligible for reassignment.
+    #[serde(default)]
+    pub lease_ms: u64,
     /// When the task was created.
     #[serde(default = "Timestamp::now")]
     pub created: Timestamp,
@@ -122,6 +131,8 @@ impl Task {
             result: None,
             failure: None,
             verification_attempts: 0,
+            claimed_at: None,
+            lease_ms: 0,
             created: Timestamp::now(),
             updated: None,
         }
@@ -270,7 +281,8 @@ impl TaskGraph {
     }
 
     /// Claim an available task for an agent. Returns the task id, or
-    /// `None` if it was not available.
+    /// `None` if it was not available. Sets `claimed_at` so the scheduler
+    /// can track lease expiration for stalled-agent detection.
     pub fn claim(&mut self, task: Id, agent: AgentId) -> Option<Id> {
         let t = self.tasks.get_mut(&task)?;
         if t.status != TaskStatus::Available {
@@ -278,6 +290,7 @@ impl TaskGraph {
         }
         t.status = TaskStatus::Claimed;
         t.owner = Some(agent);
+        t.claimed_at = Some(Timestamp::now());
         t.updated = Some(Timestamp::now());
         Some(task)
     }
@@ -373,6 +386,37 @@ impl TaskGraph {
             .filter(|t| t.status.is_terminal())
             .count();
         done as f32 / self.tasks.len() as f32
+    }
+
+    /// Tasks that are in `Claimed` or `Running` state and whose lease
+    /// has expired. A task with `lease_ms == 0` is never considered
+    /// stalled (infinite lease). Returns the ids of stalled tasks so the
+    /// scheduler can reassign them.
+    pub fn stalled_tasks(&self) -> Vec<Id> {
+        let now_ms = Timestamp::now().as_millis();
+        self.tasks
+            .values()
+            .filter(|t| {
+                matches!(t.status, TaskStatus::Claimed | TaskStatus::Running)
+                    && t.lease_ms > 0
+                    && t.claimed_at.as_ref().is_some_and(|claimed| {
+                        let claimed_ms = claimed.as_millis();
+                        now_ms.saturating_sub(claimed_ms) >= t.lease_ms
+                    })
+            })
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// Release a stalled task back to `Available` so it can be
+    /// re-dispatched. Preserves the task's description and dependencies.
+    pub fn release_stalled(&mut self, task: &Id) {
+        if let Some(t) = self.tasks.get_mut(task) {
+            t.status = TaskStatus::Available;
+            t.owner = None;
+            t.claimed_at = None;
+            t.updated = Some(Timestamp::now());
+        }
     }
 
     /// Topological order of task ids (for deterministic replay and session

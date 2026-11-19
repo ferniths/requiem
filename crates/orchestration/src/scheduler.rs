@@ -165,6 +165,20 @@ impl Scheduler {
         self.config.max_agents
     }
 
+    /// Reclaim tasks whose lease has expired (stalled workers).
+    ///
+    /// Returns the ids of tasks that were moved back to `Available` so
+    /// they can be re-dispatched. Tasks with `lease_ms == 0` (infinite
+    /// lease) are never reclaimed.
+    pub fn reclaim_stalled(&mut self) -> Vec<Id> {
+        let stalled = self.graph.stalled_tasks();
+        for id in &stalled {
+            self.graph.release_stalled(id);
+        }
+        let _ = self.graph.reevaluate();
+        stalled
+    }
+
     /// Fraction of tasks in a terminal state.
     pub fn progress(&self) -> f32 {
         self.graph.progress()
@@ -311,6 +325,55 @@ mod tests {
         );
         // The registry is rebuilt empty on restore.
         assert!(restored.registry.agents.is_empty());
+    }
+
+    /// Regression: a task claimed with a short lease must be reclaimed
+    /// when the lease expires, and the scheduler must offer it for
+    /// re-dispatch.
+    #[test]
+    fn reclaim_stalled_releases_lease_expired_tasks() {
+        let mut s = scheduler_with_tasks(1);
+        let id = s.poll_available()[0].clone();
+        let agent_id = AgentId("stalled-worker".into());
+        s.claim(&id, &agent_id).unwrap();
+        s.start_task(&id);
+        // Set a 1 ms lease and backdate the claim so it's already expired.
+        {
+            let t = s.graph.tasks.get_mut(&id).unwrap();
+            t.lease_ms = 1;
+            t.claimed_at = Some(requiem_core::Timestamp::now());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let reclaimed = s.reclaim_stalled();
+        assert_eq!(reclaimed.len(), 1, "stalled task must be reclaimed");
+        assert_eq!(reclaimed[0], id);
+        // The task is back in Available state and can be re-polled.
+        let polled = s.poll_available();
+        assert!(
+            polled.contains(&id),
+            "reclaimed task must be re-dispatchable"
+        );
+        assert_eq!(
+            s.graph.tasks.get(&id).unwrap().status,
+            TaskStatus::Available
+        );
+    }
+
+    /// A task with an infinite lease (lease_ms == 0) must never be
+    /// reclaimed, even if it's been running for a long time.
+    #[test]
+    fn infinite_lease_tasks_are_never_reclaimed() {
+        let mut s = scheduler_with_tasks(1);
+        let id = s.poll_available()[0].clone();
+        let agent_id = AgentId("long-runner".into());
+        s.claim(&id, &agent_id).unwrap();
+        s.start_task(&id);
+        // No lease set: lease_ms defaults to 0 (infinite).
+        let reclaimed = s.reclaim_stalled();
+        assert!(
+            reclaimed.is_empty(),
+            "infinite-lease tasks must not be reclaimed"
+        );
     }
 
     // -- helpers ------------------------------------------------------------
