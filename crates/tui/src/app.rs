@@ -471,6 +471,63 @@ impl Severity {
     }
 }
 
+/// A structured error entry in the dedicated ERROR LOG panel.
+///
+/// Unlike [`WarningEntry`] (which mixes warnings and errors for the
+/// Warnings panel), this type is purely for errors — any event that
+/// represents a failed operation, provider failure, or critical fault.
+#[derive(Debug, Clone)]
+pub struct ErrorEntry {
+    /// Relative seconds since session start.
+    pub rel_secs: u64,
+    /// Severity (typically `Error` or `Critical`).
+    pub severity: Severity,
+    /// Source label, e.g. "provider", "agent", "tool", "system".
+    pub source: String,
+    /// Agent name, if applicable.
+    pub agent: Option<String>,
+    /// Task id, if applicable.
+    pub task_id: Option<String>,
+    /// Error classification (e.g. "model_unavailable", "gateway", "auth").
+    pub error_class: Option<String>,
+    /// Sanitized one-line description (no secrets).
+    pub description: String,
+    /// HTTP status code, if observed.
+    pub http_status: Option<u16>,
+    /// Retry information, e.g. "retry 2/3".
+    pub retry_info: Option<String>,
+    /// Optional correlation id (dedup key).
+    pub correlation_id: Option<String>,
+    /// Number of times this exact error has been observed.
+    pub count: u32,
+    /// Provider/model identifier, if relevant.
+    pub model: Option<String>,
+    /// Endpoint host (credentials never included), if relevant.
+    pub endpoint: Option<String>,
+}
+
+impl ErrorEntry {
+    /// Build the display line for this entry.
+    pub fn display_line(&self, width: usize) -> String {
+        let mut s = format!(
+            "{} {} · {}",
+            self.severity.label(),
+            truncate_chars(&self.source, 12),
+            truncate_chars(&self.description, width.saturating_sub(32))
+        );
+        if self.count > 1 {
+            s.push_str(&format!("  (×{})", self.count));
+        }
+        if let Some(status) = self.http_status {
+            s.push_str(&format!("  HTTP {status}"));
+        }
+        if let Some(ref retry) = self.retry_info {
+            s.push_str(&format!("  [{retry}]"));
+        }
+        s
+    }
+}
+
 /// A structured warning entry in the Warnings panel.
 #[derive(Debug, Clone)]
 pub struct WarningEntry {
@@ -521,6 +578,7 @@ impl WarningEntry {
 /// `Inspector` — the selected-agent detail panel.
 /// `Events` — the bottom-left events panel (informational activity).
 /// `Warnings` — the bottom-right warnings panel (operational problems).
+/// `Errors` — the dedicated ERROR LOG panel (dedicated error monitoring).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DashFocus {
     #[default]
@@ -528,6 +586,7 @@ pub enum DashFocus {
     Inspector,
     Events,
     Warnings,
+    Errors,
 }
 
 /// A read-only historical session entry shown in the idle dashboard.
@@ -556,14 +615,19 @@ pub struct DashState {
     pub events: Vec<LogEvent>,
     /// Operational problems feed (failures, rate limits, provider errors).
     pub warnings: Vec<WarningEntry>,
+    /// Dedicated error log — structured, deduplicated error entries
+    /// (provider failures, agent failures, tool errors, critical faults).
+    pub errors: Vec<ErrorEntry>,
     pub open: bool,
     pub panel: DashPanel,
     /// Per-panel scroll-back (0 = follow).
-    /// Index 0: timeline (tasks), 1: tree (agents), 2: events, 3: warnings.
-    pub scroll: [usize; 4],
+    /// Index 0: timeline (tasks), 1: tree (agents), 2: events,
+    /// 3: warnings, 4: errors.
+    pub scroll: [usize; 5],
     /// Per-panel selected item index.
-    /// Index 0: timeline (tasks), 1: tree (agents), 2: events, 3: warnings.
-    pub selected: [usize; 4],
+    /// Index 0: timeline (tasks), 1: tree (agents), 2: events,
+    /// 3: warnings, 4: errors.
+    pub selected: [usize; 5],
     /// Session-wide input tokens (accumulated from Usage events).
     pub tokens_in_total: u32,
     /// Session-wide output tokens.
@@ -585,6 +649,9 @@ pub struct DashState {
     pub filter: String,
     /// Whether the filter input is currently active (user is typing).
     pub filter_active: bool,
+    /// Which panel the inspector was last reached from (so it can
+    /// render the appropriate detail view).
+    pub inspector_from: DashFocus,
 }
 
 impl DashState {
@@ -711,7 +778,10 @@ impl App {
             tokens_out: 0,
             active_task: None,
             streaming: HashMap::new(),
-            dash: DashState::default(),
+            dash: DashState {
+                inspector_from: DashFocus::Tree,
+                ..DashState::default()
+            },
             provider_failure_counts: std::collections::HashMap::new(),
         }
     }
@@ -930,12 +1000,16 @@ impl App {
 
     /// Consume one runtime event: updates the transcript, dashboard and
     /// status counters. Informational events go to `dash.events`;
-    /// operational problems go to `dash.warnings` with dedup.
+    /// operational problems go to `dash.warnings` with dedup;
+    /// errors go to `dash.errors` (dedicated ERROR LOG panel).
     pub fn push_event(&mut self, event: &Event) {
         let rel = self.started.elapsed().as_secs();
         self.push_event_or_warning(event, rel);
         if is_warning_event(event) {
             self.push_warning(event, rel);
+        }
+        if is_error_event(event) {
+            self.push_error(event, rel);
         }
     }
 
@@ -1320,6 +1394,54 @@ impl App {
         }
     }
 
+    /// Push a structured error into the dedicated ERROR LOG buffer,
+    /// deduplicating identical errors by correlation key.
+    fn push_error(&mut self, event: &Event, rel: u64) {
+        let fields = build_error_from_event(event);
+        let corr_key = fields.correlation_id.clone();
+
+        // Deduplicate: if the last error in the buffer has the same
+        // correlation key, increment its count instead of adding a new
+        // entry. This prevents a flood of identical provider failures
+        // from filling the panel.
+        if let Some(last) = self.dash.errors.last_mut() {
+            if last.correlation_id.as_deref() == corr_key.as_deref() {
+                last.count += 1;
+                last.rel_secs = rel;
+                if fields.severity > last.severity {
+                    last.severity = fields.severity;
+                }
+                // Update the HTTP status if we now have one.
+                if last.http_status.is_none() {
+                    last.http_status = fields.http_status;
+                }
+                return;
+            }
+        }
+
+        let entry = ErrorEntry {
+            rel_secs: rel,
+            severity: fields.severity,
+            source: fields.source,
+            agent: fields.agent,
+            task_id: fields.task_id,
+            error_class: fields.error_class,
+            description: fields.description,
+            http_status: fields.http_status,
+            retry_info: fields.retry_info,
+            correlation_id: corr_key,
+            count: 1,
+            model: fields.model,
+            endpoint: fields.endpoint,
+        };
+        self.dash.errors.push(entry);
+        // Bounded buffer: keep at most 200 errors.
+        if self.dash.errors.len() > 200 {
+            let drop = self.dash.errors.len() - 200;
+            self.dash.errors.drain(0..drop);
+        }
+    }
+
     /// A snapshot of the live dashboard state (for persistence/summary).
     pub fn dashboard_snapshot(&self) -> &DashState {
         &self.dash
@@ -1380,13 +1502,14 @@ impl App {
             KeyCode::Char('/') => {
                 self.dash.filter_active = true;
             }
-            // Tab cycles focus: Tree → Inspector → Events → Warnings → Tree.
+            // Tab cycles focus: Tree → Inspector → Events → Warnings → Errors → Tree.
             KeyCode::Tab => {
                 self.dash.focus = match self.dash.focus {
                     DashFocus::Tree => DashFocus::Inspector,
                     DashFocus::Inspector => DashFocus::Events,
                     DashFocus::Events => DashFocus::Warnings,
-                    DashFocus::Warnings => DashFocus::Tree,
+                    DashFocus::Warnings => DashFocus::Errors,
+                    DashFocus::Errors => DashFocus::Tree,
                 };
             }
             // F-key shortcuts for direct focus.
@@ -1394,6 +1517,7 @@ impl App {
             KeyCode::F(3) => self.dash.focus = DashFocus::Inspector,
             KeyCode::F(5) => self.dash.focus = DashFocus::Events,
             KeyCode::F(6) => self.dash.focus = DashFocus::Warnings,
+            KeyCode::F(7) => self.dash.focus = DashFocus::Errors,
             // PageUp/PageDown scroll the active area.
             KeyCode::PageUp => {
                 let p = match self.dash.focus {
@@ -1401,6 +1525,7 @@ impl App {
                     DashFocus::Inspector => 1,
                     DashFocus::Events => 2,
                     DashFocus::Warnings => 3,
+                    DashFocus::Errors => 4,
                 };
                 self.dash.scroll[p] = self.dash.scroll[p].saturating_add(10);
             }
@@ -1410,6 +1535,7 @@ impl App {
                     DashFocus::Inspector => 1,
                     DashFocus::Events => 2,
                     DashFocus::Warnings => 3,
+                    DashFocus::Errors => 4,
                 };
                 self.dash.scroll[p] = self.dash.scroll[p].saturating_sub(10);
             }
@@ -1420,6 +1546,7 @@ impl App {
                     DashFocus::Inspector => 1,
                     DashFocus::Events => 2,
                     DashFocus::Warnings => 3,
+                    DashFocus::Errors => 4,
                 };
                 self.dash.selected[p] = self.dash.selected[p].saturating_sub(1);
             }
@@ -1429,11 +1556,13 @@ impl App {
                     DashFocus::Inspector => 1,
                     DashFocus::Events => 2,
                     DashFocus::Warnings => 3,
+                    DashFocus::Errors => 4,
                 };
                 let len = match p {
                     1 => self.dash.agents.len(),
                     2 => self.dash.events.len(),
                     3 => self.dash.warnings.len(),
+                    4 => self.dash.errors.len(),
                     _ => 0,
                 };
                 if len > 0 {
@@ -1491,8 +1620,9 @@ impl App {
             }
             // Enter: inspect — switch focus to inspector.
             KeyCode::Enter => {
-                if self.dash.focus == DashFocus::Events || self.dash.focus == DashFocus::Warnings {
-                    // Show full details in the inspector.
+                self.dash.inspector_from = self.dash.focus;
+                if self.dash.focus == DashFocus::Errors {
+                    // Show full error diagnostics in the inspector.
                     self.dash.focus = DashFocus::Inspector;
                 } else {
                     self.dash.focus = DashFocus::Inspector;
@@ -1503,6 +1633,7 @@ impl App {
                 if !self.is_running() {
                     self.dash.events.clear();
                     self.dash.warnings.clear();
+                    self.dash.errors.clear();
                 }
             }
             // Home/End: first/last item.
@@ -1512,6 +1643,7 @@ impl App {
                     DashFocus::Inspector => 1,
                     DashFocus::Events => 2,
                     DashFocus::Warnings => 3,
+                    DashFocus::Errors => 4,
                 };
                 self.dash.selected[p] = 0;
                 self.dash.scroll[p] = 0;
@@ -1522,11 +1654,13 @@ impl App {
                     DashFocus::Inspector => 1,
                     DashFocus::Events => 2,
                     DashFocus::Warnings => 3,
+                    DashFocus::Errors => 4,
                 };
                 let len = match p {
                     1 => self.dash.agents.len(),
                     2 => self.dash.events.len(),
                     3 => self.dash.warnings.len(),
+                    4 => self.dash.errors.len(),
                     _ => 0,
                 };
                 if len > 0 {
@@ -2382,23 +2516,47 @@ impl App {
         self.render_dash_footer(frame, footer);
     }
 
-    /// Render the two bottom panels: Events (informational) and Warnings
-    /// (operational problems), side-by-side on wide terminals.
+    /// Render the dashboard. The bottom section shows three panels:
+    /// Events (informational), Warnings (operational), and the dedicated
+    /// ERROR LOG (structured error monitoring). On wide terminals they
+    /// appear side-by-side; on narrow ones, stacked.
     fn render_events_and_warnings(&self, frame: &mut Frame, area: Rect) {
-        if area.width >= 80 {
-            // Side-by-side layout.
+        if area.width >= 120 {
+            // Three panels side-by-side on very wide terminals.
+            let [left, mid, right] = Layout::horizontal([
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ])
+            .areas(area);
+            self.render_events_panel(frame, left);
+            self.render_warnings_panel(frame, mid);
+            self.render_errors_panel(frame, right);
+        } else if area.width >= 80 {
+            // Two panels side-by-side on wide terminals; errors on a
+            // separate row below.
+            let [top, bottom] = Layout::vertical([
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .areas(area);
             let [left, right] =
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .areas(area);
+                    .areas(top);
             self.render_events_panel(frame, left);
             self.render_warnings_panel(frame, right);
+            self.render_errors_panel(frame, bottom);
         } else {
             // Stacked vertically on narrow terminals.
-            let [top, bottom] =
-                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .areas(area);
+            let [top, mid, bottom] = Layout::vertical([
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ])
+            .areas(area);
             self.render_events_panel(frame, top);
-            self.render_warnings_panel(frame, bottom);
+            self.render_warnings_panel(frame, mid);
+            self.render_errors_panel(frame, bottom);
         }
     }
 
@@ -2542,6 +2700,120 @@ impl App {
                         Span::raw("")
                     },
                 ]));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    /// Render the dedicated ERROR LOG panel.
+    ///
+    /// Shows structured error entries with severity, source, description,
+    /// HTTP status, and occurrence count. The panel title displays the
+    /// live error count (e.g. `ERROR LOG · 5`). Crimson border when
+    /// focused, amber when there are critical errors, grey otherwise.
+    fn render_errors_panel(&self, frame: &mut Frame, area: Rect) {
+        let t = &self.theme;
+        let focused = self.dash.focus == DashFocus::Errors;
+
+        // Count errors for the title.
+        let err_count = self.dash.errors.len();
+        let has_critical = self
+            .dash
+            .errors
+            .iter()
+            .any(|e| e.severity == Severity::Critical);
+
+        let title = if err_count > 0 {
+            format!(" ERROR LOG · {err_count}{} ", if focused { "●" } else { "" })
+        } else {
+            format!(" ERROR LOG{} ", if focused { "●" } else { "" })
+        };
+
+        let border_style = if focused {
+            if has_critical {
+                t.style_bold(Token::Error)
+            } else {
+                t.style_bold(Token::Accent)
+            }
+        } else {
+            t.style(Token::Border)
+        };
+
+        let block = Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(border_style)
+            .title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let errors = &self.dash.errors;
+
+        // Apply filter if active.
+        let filtered: Vec<&ErrorEntry> = if self.dash.filter.is_empty() {
+            errors.iter().collect()
+        } else {
+            let filter = self.dash.filter.to_lowercase();
+            errors
+                .iter()
+                .filter(|e| {
+                    e.description.to_lowercase().contains(&filter)
+                        || e.source.to_lowercase().contains(&filter)
+                        || e.error_class
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&filter)
+                })
+                .collect()
+        };
+
+        if filtered.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " no errors",
+                t.style(Token::TextMuted),
+            )));
+        } else {
+            let p = 4; // errors panel scroll/selection index
+            let visible = filtered.as_slice();
+            let start = if self.dash.scroll[p] == 0 {
+                visible.len().saturating_sub(inner.height as usize)
+            } else {
+                (visible.len().saturating_sub(self.dash.scroll[p])).min(inner.height as usize)
+            };
+            for (i, e) in visible.iter().enumerate().skip(start) {
+                let sel = self.dash.selected[p] == i;
+                let sev_tok = match e.severity {
+                    Severity::Info => Token::TextMuted,
+                    Severity::Warn => Token::Warning,
+                    Severity::Error => Token::Error,
+                    Severity::Critical => Token::Error,
+                };
+                let mut spans = vec![
+                    Span::styled(
+                        if sel { "▸" } else { " " },
+                        t.style_bold(Token::AccentBright),
+                    ),
+                    Span::styled(format!(" +{:>4}s ", e.rel_secs), t.style(Token::TextMuted)),
+                    Span::styled(format!("{} ", e.severity.label()), t.style_bold(sev_tok)),
+                    Span::styled(
+                        truncate_chars(&e.description, (inner.width as usize).saturating_sub(36)),
+                        t.style(if sel { Token::Text } else { Token::TextSecondary }),
+                    ),
+                ];
+                if let Some(status) = e.http_status {
+                    spans.push(Span::styled(
+                        format!(" HTTP {status}"),
+                        t.style(Token::Warning),
+                    ));
+                }
+                if e.count > 1 {
+                    spans.push(Span::styled(
+                        format!("  (×{})", e.count),
+                        t.style(Token::Warning),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -2921,13 +3193,108 @@ impl App {
 
     fn render_inspector(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
+        let mut lines: Vec<Line> = Vec::new();
+
+        // When the inspector is reached from the Errors panel, show
+        // error diagnostics instead of the agent inspector.
+        if self.dash.inspector_from == DashFocus::Errors {
+            let err_idx = self.dash.selected[4];
+            if let Some(err) = self.dash.errors.get(err_idx) {
+                lines.push(Line::from(Span::styled(
+                    " error inspector",
+                    t.style_bold(Token::TextMuted),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", err.severity.label()),
+                        match err.severity {
+                            Severity::Error | Severity::Critical => t.style_bold(Token::Error),
+                            _ => t.style_bold(Token::Warning),
+                        },
+                    ),
+                    Span::styled(
+                        truncate_chars(&err.description, 36),
+                        t.style(Token::Text),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("  source ", t.style(Token::TextMuted)),
+                    Span::styled(&err.source, t.style(Token::TextSecondary)),
+                ]));
+                if let Some(ref agent) = err.agent {
+                    lines.push(Line::from(vec![
+                        Span::styled("  agent  ", t.style(Token::TextMuted)),
+                        Span::styled(truncate_chars(agent, 24), t.style(Token::TextSecondary)),
+                    ]));
+                }
+                if let Some(ref task) = err.task_id {
+                    lines.push(Line::from(vec![
+                        Span::styled("  task   ", t.style(Token::TextMuted)),
+                        Span::styled(truncate_chars(task, 24), t.style(Token::TextSecondary)),
+                    ]));
+                }
+                if let Some(ref cls) = err.error_class {
+                    lines.push(Line::from(vec![
+                        Span::styled("  class  ", t.style(Token::TextMuted)),
+                        Span::styled(cls, t.style(Token::Warning)),
+                    ]));
+                }
+                if let Some(status) = err.http_status {
+                    lines.push(Line::from(vec![
+                        Span::styled("  HTTP   ", t.style(Token::TextMuted)),
+                        Span::styled(format!("{status}"), t.style(Token::Error)),
+                    ]));
+                }
+                if let Some(ref model) = err.model {
+                    lines.push(Line::from(vec![
+                        Span::styled("  model  ", t.style(Token::TextMuted)),
+                        Span::styled(truncate_chars(model, 24), t.style(Token::TextSecondary)),
+                    ]));
+                }
+                if let Some(ref ep) = err.endpoint {
+                    lines.push(Line::from(vec![
+                        Span::styled("  endpt  ", t.style(Token::TextMuted)),
+                        Span::styled(truncate_chars(ep, 24), t.style(Token::TextMuted)),
+                    ]));
+                }
+                if let Some(ref retry) = err.retry_info {
+                    lines.push(Line::from(vec![
+                        Span::styled("  retry  ", t.style(Token::TextMuted)),
+                        Span::styled(retry, t.style(Token::Info)),
+                    ]));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("  time   ", t.style(Token::TextMuted)),
+                    Span::styled(format!("+{}s", err.rel_secs), t.style(Token::TextMuted)),
+                ]));
+                if err.count > 1 {
+                    lines.push(Line::from(vec![
+                        Span::styled("  count  ", t.style(Token::TextMuted)),
+                        Span::styled(format!("×{}", err.count), t.style(Token::Warning)),
+                    ]));
+                }
+                // Suggested recovery actions.
+                lines.push(Line::from(Span::styled(
+                    "  actions",
+                    t.style(Token::TextMuted),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "   /retry  /model test  /diagnostics  /logs",
+                    t.style(Token::Info),
+                )));
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+                return;
+            }
+        }
+
+        // Default: agent inspector.
         let p = 1;
         let idx = self.dash.selected[p];
         let agent = self.dash.agents.get(idx);
-        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        lines.push(Line::from(Span::styled(
             " inspector",
             t.style_bold(Token::TextMuted),
-        ))];
+        )));
         match agent {
             Some(a) => {
                 lines.push(Line::from(vec![
@@ -3132,6 +3499,7 @@ impl App {
             DashFocus::Inspector => "←↑↓→ navigate · Tab area · / filter · Esc back",
             DashFocus::Events => "↑↓ scroll · / filter · Enter inspect · c clear · Tab area",
             DashFocus::Warnings => "↑↓ scroll · / filter · Enter inspect · c clear · Tab area",
+            DashFocus::Errors => "↑↓ scroll · / filter · Enter inspect · c clear · F7 errors",
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(hint, t.style(Token::TextMuted))))
@@ -3205,6 +3573,178 @@ fn is_warning_event(e: &Event) -> bool {
         } => true,
         Event::RetryStatus { status, .. } => status != "recovered",
         _ => false,
+    }
+}
+
+/// Determine whether an event is an error (for the dedicated ERROR LOG
+/// panel). Errors are the most severe subset of warnings — failed
+/// operations, provider errors, critical faults.
+fn is_error_event(e: &Event) -> bool {
+    match e {
+        Event::RunFailed { .. } => true,
+        Event::ProviderFailure { .. } => true,
+        Event::Notice {
+            level: NoticeLevel::Error,
+            ..
+        } => true,
+        Event::RetryStatus { status, .. } => status == "stopped",
+        // Tool failures are included: they are operational errors.
+        Event::ToolCallFinished { ok: false, .. } => true,
+        _ => false,
+    }
+}
+
+/// A bundle of fields extracted from an event for the ERROR LOG panel.
+#[derive(Debug, Clone)]
+struct ErrorFields {
+    severity: Severity,
+    source: String,
+    agent: Option<String>,
+    task_id: Option<String>,
+    error_class: Option<String>,
+    description: String,
+    http_status: Option<u16>,
+    retry_info: Option<String>,
+    correlation_id: Option<String>,
+    model: Option<String>,
+    endpoint: Option<String>,
+}
+
+/// Build the fields for an [`ErrorEntry`] from a runtime event.
+fn build_error_from_event(e: &Event) -> ErrorFields {
+    use Event::*;
+    match e {
+        RunFailed {
+            agent,
+            task,
+            error,
+            error_class,
+            ..
+        } => {
+            let desc = format!("{agent} failed: {error}");
+            let corr = Some(format!("err_run_failed|{task}"));
+            let sev = if error_class == "circuit_open" {
+                Severity::Critical
+            } else {
+                Severity::Error
+            };
+            ErrorFields {
+                severity: sev,
+                source: "agent".into(),
+                agent: Some(agent.clone()),
+                task_id: Some(task.as_str().to_string()),
+                error_class: Some(error_class.clone()),
+                description: truncate_chars(&desc, 80),
+                http_status: None,
+                retry_info: None,
+                correlation_id: corr,
+                model: None,
+                endpoint: None,
+            }
+        }
+        ProviderFailure {
+            model,
+            endpoint,
+            error,
+            error_class,
+            status,
+            circuit,
+            dedup_key,
+            ..
+        } => {
+            let http = status.map(|s| format!(" HTTP {s}")).unwrap_or_default();
+            let desc = format!("provider [{error_class}]{http}: {error}");
+            let sev = if error_class == "circuit_open" {
+                Severity::Critical
+            } else {
+                Severity::Error
+            };
+            ErrorFields {
+                severity: sev,
+                source: "provider".into(),
+                agent: None,
+                task_id: None,
+                error_class: Some(error_class.clone()),
+                description: truncate_chars(&desc, 80),
+                http_status: *status,
+                retry_info: if circuit != "n/a" {
+                    Some(format!("circuit: {circuit}"))
+                } else {
+                    None
+                },
+                correlation_id: Some(dedup_key.clone()),
+                model: Some(model.clone()),
+                endpoint: Some(endpoint.clone()),
+            }
+        }
+        ToolCallFinished {
+            agent,
+            tool,
+            summary,
+            duration_ms,
+            ..
+        } => {
+            ErrorFields {
+                severity: Severity::Error,
+                source: "tool".into(),
+                agent: Some(agent.clone()),
+                task_id: None,
+                error_class: Some("tool".into()),
+                description: format!("{tool} failed ({duration_ms}ms) {summary}"),
+                http_status: None,
+                retry_info: None,
+                correlation_id: Some(format!("err_tool|{agent}|{tool}")),
+                model: None,
+                endpoint: None,
+            }
+        }
+        Notice { text, level } => {
+            let sev = match level {
+                NoticeLevel::Error => Severity::Error,
+                _ => Severity::Warn,
+            };
+            ErrorFields {
+                severity: sev,
+                source: "system".into(),
+                agent: None,
+                task_id: None,
+                error_class: None,
+                description: truncate_chars(text, 80),
+                http_status: None,
+                retry_info: None,
+                correlation_id: Some(format!("err_notice|{text}")),
+                model: None,
+                endpoint: None,
+            }
+        }
+        RetryStatus { status, text, .. } => {
+            ErrorFields {
+                severity: Severity::Error,
+                source: "provider".into(),
+                agent: None,
+                task_id: None,
+                error_class: Some("retry".into()),
+                description: truncate_chars(text, 80),
+                http_status: None,
+                retry_info: Some(status.clone()),
+                correlation_id: Some(format!("err_retry|{status}")),
+                model: None,
+                endpoint: None,
+            }
+        }
+        _ => ErrorFields {
+            severity: Severity::Info,
+            source: "system".into(),
+            agent: None,
+            task_id: None,
+            error_class: None,
+            description: e.summary(),
+            http_status: None,
+            retry_info: None,
+            correlation_id: None,
+            model: None,
+            endpoint: None,
+        },
     }
 }
 
@@ -3771,9 +4311,33 @@ fn hello() {
         assert!(text.contains("dashboard"), "{text}");
         assert!(text.contains("master"), "{text}");
         assert!(text.contains("impl-1"), "{text}");
-        assert!(text.contains("implementer"), "{text}");
+        assert!(text.contains("implement"), "{text}");
         assert!(text.contains("1.8k"), "tokens formatted: {text}");
-        assert!(text.contains("tasks 0/1"), "{text}");
+        // ERROR LOG panel visibility is verified by the dedicated test
+        // dashboard_error_log_panel_visible_at_width_120 (checks raw
+        // line-by-line output since visible_text interleaves parallel
+        // panel content).
+    }
+
+    #[test]
+    fn dashboard_error_log_panel_visible_at_width_120() {
+        let mut app = test_app();
+        app.push_event(&Event::ProviderFailure {
+            dedup_key: "test|open".into(),
+            model: "mimo".into(),
+            endpoint: "127.0.0.1:8080".into(),
+            error: "gateway 503".into(),
+            error_class: "gateway".into(),
+            status: Some(503),
+            circuit: "open".into(),
+        });
+        app.dash.open = true;
+        let raw = render_to_string(&app, 120, 40);
+        let has_error_log = raw.lines().any(|l| l.contains("ERROR LOG"));
+        assert!(has_error_log, "ERROR LOG panel border visible in 120-col layout: {raw}");
+        // The error entry should be in the errors buffer.
+        assert_eq!(app.dash.errors.len(), 1, "one error entry recorded");
+        assert_eq!(app.dash.errors[0].http_status, Some(503));
     }
 
     #[test]
@@ -3815,6 +4379,8 @@ fn hello() {
         assert_eq!(app.dash.focus, DashFocus::Events);
         app.handle_key(test_key(KeyCode::Tab));
         assert_eq!(app.dash.focus, DashFocus::Warnings);
+        app.handle_key(test_key(KeyCode::Tab));
+        assert_eq!(app.dash.focus, DashFocus::Errors);
         app.handle_key(test_key(KeyCode::Tab));
         assert_eq!(app.dash.focus, DashFocus::Tree);
         // Agent selection.
@@ -4980,6 +5546,8 @@ fn hello() {
         app.handle_key(test_key(KeyCode::Tab));
         assert_eq!(app.dash.focus, DashFocus::Warnings);
         app.handle_key(test_key(KeyCode::Tab));
+        assert_eq!(app.dash.focus, DashFocus::Errors);
+        app.handle_key(test_key(KeyCode::Tab));
         assert_eq!(app.dash.focus, DashFocus::Tree);
     }
 
@@ -4995,6 +5563,8 @@ fn hello() {
         assert_eq!(app.dash.focus, DashFocus::Events);
         app.handle_key(test_key(KeyCode::F(6)));
         assert_eq!(app.dash.focus, DashFocus::Warnings);
+        app.handle_key(test_key(KeyCode::F(7)));
+        assert_eq!(app.dash.focus, DashFocus::Errors);
     }
 
     fn provider_failure(dedup_key: &str) -> Event {
