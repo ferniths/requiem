@@ -1739,6 +1739,7 @@ dependencies = [
  "requiem-model",
  "requiem-networking",
  "requiem-permissions",
+ "requiem-project",
  "requiem-tools",
  "reqwest",
  "serde",
