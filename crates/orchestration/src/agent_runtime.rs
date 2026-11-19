@@ -1028,8 +1028,14 @@ mod tests {
             .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        assert!(sys.contains("PROJECT CONTEXT"), "project context must be in system prompt");
+        assert!(
+            sys.contains("PROJECT CONTEXT"),
+            "project context must be in system prompt"
+        );
         assert!(sys.contains("cargo build"), "build command must be present");
-        assert!(sys.contains("Mode: CODE"), "mode prompt must coexist with project context");
+        assert!(
+            sys.contains("Mode: CODE"),
+            "mode prompt must coexist with project context"
+        );
     }
 }

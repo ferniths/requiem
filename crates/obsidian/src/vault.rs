@@ -219,22 +219,28 @@ impl Vault {
     /// content. Returns matching notes with the matched line and a short
     /// snippet. Results are capped at `max_results`.
     pub fn search(&self, query: &str, max_results: usize) -> Vec<SearchHit> {
+        self.search_ranked(query, max_results)
+    }
+
+    /// Relevance-ranked search (§3.4): scores each note by the number of
+    /// matching lines (content) plus a filename-match bonus, then returns
+    /// the top `max_results` notes with up to 3 matching-line excerpts
+    /// each. Ties are broken by path for determinism.
+    pub fn search_ranked(&self, query: &str, max_results: usize) -> Vec<SearchHit> {
         let q = query.to_lowercase();
         let notes = self.list_notes();
         let root = self.root().to_path_buf();
-        let mut hits: Vec<SearchHit> = Vec::new();
+
+        // Score each note: (score, path, matched_in_filename, excerpts).
+        let mut scored: Vec<(u32, String, bool, Vec<String>)> = Vec::new();
 
         for note_path in &notes {
-            if hits.len() >= max_results {
-                break;
-            }
             let rel = note_path
                 .strip_prefix(&root)
                 .ok()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            // Filename match
             let file_stem = note_path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -242,29 +248,47 @@ impl Vault {
                 .to_lowercase();
             let filename_match = file_stem.contains(&q);
 
-            // Content match — first matching line only
             let content = std::fs::read_to_string(note_path).unwrap_or_default();
-            let mut content_match: Option<String> = None;
-            if !filename_match {
-                for line in content.lines() {
-                    if line.to_lowercase().contains(&q) {
-                        let snippet: String = line.chars().take(120).collect();
-                        content_match = Some(snippet);
-                        break;
+            let mut excerpts: Vec<String> = Vec::new();
+            let mut match_count: u32 = 0;
+
+            for line in content.lines() {
+                if line.to_lowercase().contains(&q) {
+                    match_count += 1;
+                    if excerpts.len() < 3 {
+                        let snippet: String = line.trim().chars().take(120).collect();
+                        excerpts.push(snippet);
                     }
                 }
             }
 
-            if filename_match || content_match.is_some() {
-                hits.push(SearchHit {
-                    path: rel,
-                    matched_in_filename: filename_match,
-                    snippet: content_match.unwrap_or_default(),
-                });
+            // Filename match is worth more than a single content match.
+            let score = if filename_match {
+                10 + match_count
+            } else {
+                match_count
+            };
+
+            if score > 0 || filename_match {
+                scored.push((score, rel, filename_match, excerpts));
             }
         }
 
-        hits
+        // Sort by score descending, then by path for determinism.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        scored
+            .into_iter()
+            .take(max_results)
+            .map(|(score, path, filename_match, excerpts)| {
+                let _ = score;
+                SearchHit {
+                    path,
+                    matched_in_filename: filename_match,
+                    snippet: excerpts.join("\n"),
+                }
+            })
+            .collect()
     }
 }
 
@@ -501,5 +525,70 @@ mod tests {
         // Each entry must reference a distinct note path.
         let paths: std::collections::HashSet<&str> = log.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths.len(), n, "all entries must have distinct paths");
+    }
+
+    /// §3.4: a note with more matching lines must rank above one with
+    /// fewer, when neither filename matches.
+    #[test]
+    fn search_ranked_scores_by_match_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::new(dir.path().to_path_buf());
+        // "foo" appears 3 times in dense.md, 1 time in sparse.md
+        vault
+            .write_note("dense.md", "foo\nbar foo\nbaz foo")
+            .unwrap();
+        vault.write_note("sparse.md", "something foo else").unwrap();
+
+        let hits = vault.search_ranked("foo", 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "dense.md", "more matches must rank first");
+        assert_eq!(hits[1].path, "sparse.md");
+        // Excerpts: up to 3 matching lines, joined by newlines.
+        assert!(
+            hits[0].snippet.contains("bar foo"),
+            "must include matching excerpts"
+        );
+        assert!(
+            hits[0].snippet.contains(' '),
+            "snippet must have multiple lines"
+        );
+    }
+
+    /// §3.4: a filename match must out-rank a pure content match with
+    /// more lines.
+    #[test]
+    fn search_ranked_filename_bonus_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::new(dir.path().to_path_buf());
+        // "target" in the filename: bonus 10 + content matches
+        vault.write_note("target.md", "x\ny\nz").unwrap();
+        // 5 content matches but no filename match: score = 5
+        vault
+            .write_note(
+                "other.md",
+                "a target\nb target\nc target\nd target\ne target",
+            )
+            .unwrap();
+
+        let hits = vault.search_ranked("target", 10);
+        assert_eq!(
+            hits[0].path, "target.md",
+            "filename match (score≥10) must beat 5 content matches"
+        );
+        assert!(hits[0].matched_in_filename);
+    }
+
+    /// §3.4: search() delegates to search_ranked, so existing callers
+    /// get relevance ordering automatically.
+    #[test]
+    fn search_delegates_to_ranked() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::new(dir.path().to_path_buf());
+        vault.write_note("a.md", "alpha\nbeta\nalpha").unwrap();
+        vault.write_note("b.md", "alpha").unwrap();
+
+        // "alpha" appears in both; a.md has 2 matches, b.md has 1.
+        let hits = vault.search("alpha", 10);
+        assert_eq!(hits[0].path, "a.md", "search must be relevance-ranked");
     }
 }

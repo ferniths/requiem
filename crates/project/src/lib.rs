@@ -260,7 +260,11 @@ impl ProjectProfile {
         out.push_str(&format!(
             "PROJECT CONTEXT — root: {} · ecosystems: {} · languages: {}\n",
             self.root,
-            self.ecosystems.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("+"),
+            self.ecosystems
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("+"),
             self.languages.join(", "),
         ));
         for (key, cmd) in &self.build_commands {
