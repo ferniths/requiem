@@ -119,7 +119,10 @@ mod tests {
         let history: Vec<ChatMessage> = (0..10)
             .map(|i| tool_result(&format!("t{i}"), &format!("x{}", "y".repeat(500))))
             .collect();
-        assert!(!budget.fits(&history), "precondition: history must be over budget");
+        assert!(
+            !budget.fits(&history),
+            "precondition: history must be over budget"
+        );
         let result = Compressor.apply(history, &budget);
         assert!(result.compressed);
         assert!(result.tokens_freed > 0);
@@ -140,7 +143,11 @@ mod tests {
         let a = ChatMessage::assistant("same content");
         let b = ChatMessage::user("same content");
         let deduped = dedup_consecutive(&[a, b]);
-        assert_eq!(deduped.len(), 2, "same content, different role must not dedup");
+        assert_eq!(
+            deduped.len(),
+            2,
+            "same content, different role must not dedup"
+        );
     }
 
     #[test]
@@ -158,6 +165,10 @@ mod tests {
             tool_calls: Vec::new(),
         };
         let deduped = dedup_consecutive(&[a, b]);
-        assert_eq!(deduped.len(), 2, "same content, different tool_call_id must not dedup");
+        assert_eq!(
+            deduped.len(),
+            2,
+            "same content, different tool_call_id must not dedup"
+        );
     }
 }

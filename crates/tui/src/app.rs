@@ -2535,11 +2535,9 @@ impl App {
         } else if area.width >= 80 {
             // Two panels side-by-side on wide terminals; errors on a
             // separate row below.
-            let [top, bottom] = Layout::vertical([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
-            .areas(area);
+            let [top, bottom] =
+                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(area);
             let [left, right] =
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .areas(top);
@@ -2724,7 +2722,10 @@ impl App {
             .any(|e| e.severity == Severity::Critical);
 
         let title = if err_count > 0 {
-            format!(" ERROR LOG · {err_count}{} ", if focused { "●" } else { "" })
+            format!(
+                " ERROR LOG · {err_count}{} ",
+                if focused { "●" } else { "" }
+            )
         } else {
             format!(" ERROR LOG{} ", if focused { "●" } else { "" })
         };
@@ -2798,7 +2799,11 @@ impl App {
                     Span::styled(format!("{} ", e.severity.label()), t.style_bold(sev_tok)),
                     Span::styled(
                         truncate_chars(&e.description, (inner.width as usize).saturating_sub(36)),
-                        t.style(if sel { Token::Text } else { Token::TextSecondary }),
+                        t.style(if sel {
+                            Token::Text
+                        } else {
+                            Token::TextSecondary
+                        }),
                     ),
                 ];
                 if let Some(status) = e.http_status {
@@ -3212,10 +3217,7 @@ impl App {
                             _ => t.style_bold(Token::Warning),
                         },
                     ),
-                    Span::styled(
-                        truncate_chars(&err.description, 36),
-                        t.style(Token::Text),
-                    ),
+                    Span::styled(truncate_chars(&err.description, 36), t.style(Token::Text)),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("  source ", t.style(Token::TextMuted)),
@@ -3683,21 +3685,19 @@ fn build_error_from_event(e: &Event) -> ErrorFields {
             summary,
             duration_ms,
             ..
-        } => {
-            ErrorFields {
-                severity: Severity::Error,
-                source: "tool".into(),
-                agent: Some(agent.clone()),
-                task_id: None,
-                error_class: Some("tool".into()),
-                description: format!("{tool} failed ({duration_ms}ms) {summary}"),
-                http_status: None,
-                retry_info: None,
-                correlation_id: Some(format!("err_tool|{agent}|{tool}")),
-                model: None,
-                endpoint: None,
-            }
-        }
+        } => ErrorFields {
+            severity: Severity::Error,
+            source: "tool".into(),
+            agent: Some(agent.clone()),
+            task_id: None,
+            error_class: Some("tool".into()),
+            description: format!("{tool} failed ({duration_ms}ms) {summary}"),
+            http_status: None,
+            retry_info: None,
+            correlation_id: Some(format!("err_tool|{agent}|{tool}")),
+            model: None,
+            endpoint: None,
+        },
         Notice { text, level } => {
             let sev = match level {
                 NoticeLevel::Error => Severity::Error,
@@ -3717,21 +3717,19 @@ fn build_error_from_event(e: &Event) -> ErrorFields {
                 endpoint: None,
             }
         }
-        RetryStatus { status, text, .. } => {
-            ErrorFields {
-                severity: Severity::Error,
-                source: "provider".into(),
-                agent: None,
-                task_id: None,
-                error_class: Some("retry".into()),
-                description: truncate_chars(text, 80),
-                http_status: None,
-                retry_info: Some(status.clone()),
-                correlation_id: Some(format!("err_retry|{status}")),
-                model: None,
-                endpoint: None,
-            }
-        }
+        RetryStatus { status, text, .. } => ErrorFields {
+            severity: Severity::Error,
+            source: "provider".into(),
+            agent: None,
+            task_id: None,
+            error_class: Some("retry".into()),
+            description: truncate_chars(text, 80),
+            http_status: None,
+            retry_info: Some(status.clone()),
+            correlation_id: Some(format!("err_retry|{status}")),
+            model: None,
+            endpoint: None,
+        },
         _ => ErrorFields {
             severity: Severity::Info,
             source: "system".into(),
@@ -4334,7 +4332,10 @@ fn hello() {
         app.dash.open = true;
         let raw = render_to_string(&app, 120, 40);
         let has_error_log = raw.lines().any(|l| l.contains("ERROR LOG"));
-        assert!(has_error_log, "ERROR LOG panel border visible in 120-col layout: {raw}");
+        assert!(
+            has_error_log,
+            "ERROR LOG panel border visible in 120-col layout: {raw}"
+        );
         // The error entry should be in the errors buffer.
         assert_eq!(app.dash.errors.len(), 1, "one error entry recorded");
         assert_eq!(app.dash.errors[0].http_status, Some(503));

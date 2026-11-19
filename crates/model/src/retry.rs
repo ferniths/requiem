@@ -69,7 +69,11 @@ impl RetryPolicy {
         let base = self.base_delay_ms as f64 * exp;
         let cap = self.max_delay_ms as f64;
         let base = base.min(cap);
-        let jitter = if self.jitter { base * jitter_factor() } else { base };
+        let jitter = if self.jitter {
+            base * jitter_factor()
+        } else {
+            base
+        };
         Duration::from_millis(jitter as u64)
     }
 

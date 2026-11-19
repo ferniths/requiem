@@ -257,7 +257,7 @@ impl ModelClient {
                         {
                             pool.record_success(&endpoint.id, 0).await;
                         }
-                        pool.rate_limiter().record_success();
+                        pool.rate_limiter().record_success().await;
                     }
                     return Ok(r);
                 }
@@ -473,7 +473,7 @@ impl ModelClient {
                         {
                             pool.record_success(&endpoint.id, 0).await;
                         }
-                        pool.rate_limiter().record_success();
+                        pool.rate_limiter().record_success().await;
                     }
                     break r;
                 }

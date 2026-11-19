@@ -185,7 +185,7 @@ async fn rate_limit_manager_success_clears_cooldown() {
     let mgr = RateLimitManager::new();
     mgr.record_rate_limit(100).await;
     assert!(mgr.is_limited());
-    mgr.record_success();
+    mgr.record_success().await;
     assert!(!mgr.is_limited());
     assert_eq!(mgr.consecutive_429s(), 0);
 }
@@ -197,7 +197,7 @@ async fn multiple_consecutive_429s_scale_cooldown() {
     mgr.record_rate_limit(100).await;
     mgr.record_rate_limit(100).await;
     assert_eq!(mgr.consecutive_429s(), 3);
-    mgr.record_success();
+    mgr.record_success().await;
     assert_eq!(mgr.consecutive_429s(), 0);
 }
 

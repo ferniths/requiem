@@ -68,13 +68,16 @@ impl RateLimitManager {
         );
     }
 
-    /// Record a successful request: clears the consecutive-429 counter
-    /// and the limited flag.
-    pub fn record_success(&self) {
+    /// Record a successful request: clears the consecutive-429 counter,
+    /// the limited flag, and any active cooldown so stale state does not
+    /// block subsequent requests.
+    pub async fn record_success(&self) {
         self.consecutive_429s
             .store(0, std::sync::atomic::Ordering::SeqCst);
         self.limited
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        *self.cooldown_until.lock().await = None;
+        self.notify.notify_waiters();
     }
 
     /// Block until the current cooldown (if any) expires.
@@ -236,7 +239,7 @@ mod tests {
         assert_eq!(mgr.consecutive_429s(), 1);
         assert!(mgr.is_limited());
 
-        mgr.record_success();
+        mgr.record_success().await;
         assert_eq!(mgr.consecutive_429s(), 0);
         assert!(!mgr.is_limited());
     }
@@ -246,5 +249,18 @@ mod tests {
         let mgr = RateLimitManager::new();
         let waited = mgr.acquire().await;
         assert_eq!(waited, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn record_success_clears_stale_cooldown() {
+        let mgr = RateLimitManager::new();
+        mgr.record_rate_limit(500).await;
+        assert!(mgr.is_limited());
+        // A success clears the cooldown; the next acquire returns
+        // immediately instead of waiting for the old 500 ms window.
+        mgr.record_success().await;
+        let waited = mgr.acquire().await;
+        assert_eq!(waited, Duration::ZERO);
+        assert!(!mgr.is_limited());
     }
 }
