@@ -213,7 +213,14 @@ impl Tool for SubagentTool {
             role,
             task_id: sub_task.id.clone(),
             context: context.map(|s| s.to_string()),
+            handoff: None,
         };
+
+        let handoff_prompt = spec
+            .handoff
+            .as_ref()
+            .map(|h| h.to_prompt())
+            .filter(|p| !p.is_empty());
 
         let handle = requiem_orchestration::subagent::spawn_subagent_with_limit(
             &self.parent,
@@ -224,6 +231,17 @@ impl Tool for SubagentTool {
         .map_err(|e| crate::ToolError::InvalidArgument(e.to_string()))?;
 
         let mut run = AgentRun::new(handle.agent, sub_task);
+
+        // Inject the structured handoff into the child's system prompt
+        // so it receives a compact summary instead of the full parent
+        // conversation.
+        if let Some(ref prompt) = handoff_prompt {
+            if let Some(sys) = run.history.first_mut() {
+                if let Some(serde_json::Value::String(content)) = &mut sys.content {
+                    content.push_str(prompt);
+                }
+            }
+        }
 
         // Resolve the tools and executor the child will use. When a concrete
         // spawn_tool_map is set, the child gets the full tool defs and the
@@ -453,6 +471,7 @@ impl Tool for ParallelSubagentTool {
                 role,
                 task_id: task.id.clone(),
                 context: ctx.map(|s| s.to_string()),
+                handoff: None,
             };
 
             let handle = requiem_orchestration::subagent::spawn_subagent_with_limit(
