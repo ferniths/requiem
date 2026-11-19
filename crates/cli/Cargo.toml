@@ -21,6 +21,7 @@ requiem-obsidian = { path = "../obsidian" }
 requiem-memory = { path = "../memory" }
 requiem-tui = { path = "../tui" }
 requiem-networking = { path = "../networking" }
+requiem-mcp = { path = "../mcp" }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

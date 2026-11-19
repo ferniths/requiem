@@ -1,0 +1,29 @@
+# REQUIEM MCP — native Model Context Protocol client.
+#
+# Connects to any MCP server (Ghidra, IDA, filesystem, browser, …) over
+# stdio or Streamable HTTP, discovers their tools/resources/prompts and
+# registers them into REQUIEM's tool registry as namespaced
+# `server__tool` entries.
+
+[package]
+name = "requiem-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+requiem-core.workspace = true
+requiem-model.workspace = true
+requiem-permissions.workspace = true
+requiem-tools.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+rmcp = { workspace = true }
+reqwest = "0.13"

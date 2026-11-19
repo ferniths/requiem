@@ -51,6 +51,9 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new("proxy", "Config", "proxy pool status and management")
         .with_args(&["[list|test|add|remove|enable|disable|rotate|stats|refresh|provider]"]),
+    // ── MCP ─────────────────────────────────────────────────────────
+    CommandSpec::new("mcp", "MCP", "MCP server management: /mcp [subcommand]")
+        .with_args(&["[list|add|remove|connect|disconnect|reconnect|status|tools|resources|prompts|test|logs|permissions]"]),
     // ── Memory ──────────────────────────────────────────────────────
     CommandSpec::new("sessions", "Memory", "list past sessions"),
     CommandSpec::new("resume", "Memory", "resume a past session: /resume <id>")

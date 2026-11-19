@@ -268,6 +268,34 @@ pub async fn run_session(
         bridge.add_tool(std::sync::Arc::new(ObsidianTool::with_vaults(roots)));
     }
 
+    // MCP: initialize the manager and register tools from auto-connect servers.
+    let mcp_manager = Arc::new(requiem_mcp::McpManager::new(config.mcp.clone()));
+    for sc in &config.mcp.servers {
+        if sc.enabled && sc.auto_connect {
+            if let Err(e) = mcp_manager.connect(&sc.name).await {
+                tracing::warn!(server = %sc.name, error = %e, "mcp auto-connect failed");
+            }
+        }
+    }
+    // Register discovered MCP tools into the bridge.
+    {
+        let mut collected: Vec<(String, Arc<dyn Tool>)> = Vec::new();
+        for sc in &config.mcp.servers {
+            if !sc.enabled {
+                continue;
+            }
+            let mut local_map: std::collections::HashMap<String, Arc<dyn Tool>> = std::collections::HashMap::new();
+            let _ = mcp_manager.register_tools(&sc.name, &mut local_map).await;
+            for (k, v) in local_map {
+                collected.push((k, v));
+            }
+        }
+        let mut tools_map = bridge.tools.lock().unwrap();
+        for (name, tool) in collected {
+            tools_map.insert(name, tool);
+        }
+    }
+
     // Seed the full-screen app with prior records on resume.
     let prior = if resume.is_some() {
         store.records_for_session(&session_id).unwrap_or_default()
@@ -1520,6 +1548,241 @@ async fn dispatch_slash(
                     app.push_system(
                         &format!(
                             "unknown subcommand '{unknown}' — options: status, list, test, add, remove, enable, disable, rotate, stats, refresh, provider",
+                        ),
+                        NoticeLevel::Warning,
+                    );
+                }
+            }
+            Directive::Continue
+        }
+        "mcp" => {
+            let mcp_manager = Arc::new(requiem_mcp::McpManager::new(config.mcp.clone()));
+            let sub = rest.split_whitespace().next().unwrap_or("list");
+            match sub {
+                "list" | "" => {
+                    let servers = &config.mcp.servers;
+                    if servers.is_empty() {
+                        app.push_system(
+                            "no MCP servers configured — add them under [mcp] in ~/.requiem/config.toml",
+                            NoticeLevel::Info,
+                        );
+                    } else {
+                        let mut out = String::from("mcp servers:");
+                        for sc in servers {
+                            let state = mcp_manager.status(&sc.name).await;
+                            out.push_str(&format!(
+                                "\n  {} [{}] — {state} · enabled={}",
+                                sc.name,
+                                sc.description,
+                                sc.enabled,
+                            ));
+                        }
+                        app.push_system(&out, NoticeLevel::Info);
+                    }
+                }
+                "status" => {
+                    let snaps = mcp_manager.lifecycle_snapshots().await;
+                    if snaps.is_empty() {
+                        app.push_system("no MCP servers configured", NoticeLevel::Info);
+                    } else {
+                        let mut out = String::from("mcp status:");
+                        for s in &snaps {
+                            out.push_str(&format!(
+                                "\n  {} — {} · tools={} resources={} prompts={} · latency={}",
+                                s.name,
+                                s.status,
+                                s.tool_count,
+                                s.resource_count,
+                                s.prompt_count,
+                                s.last_latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_default(),
+                            ));
+                        }
+                        app.push_system(&out, NoticeLevel::Info);
+                    }
+                }
+                "connect" => {
+                    let args: Vec<&str> = rest.split_whitespace().skip(1).collect();
+                    if args.is_empty() {
+                        app.push_system("usage: /mcp connect <server>", NoticeLevel::Warning);
+                    } else {
+                        let name = args[0];
+                        match mcp_manager.connect(name).await {
+                            Ok(()) => app.push_system(
+                                &format!("connected to MCP server '{name}'"),
+                                NoticeLevel::Success,
+                            ),
+                            Err(e) => app.push_system(
+                                &format!("failed to connect '{name}': {e}"),
+                                NoticeLevel::Error,
+                            ),
+                        }
+                    }
+                }
+                "disconnect" => {
+                    let args: Vec<&str> = rest.split_whitespace().skip(1).collect();
+                    if args.is_empty() {
+                        app.push_system("usage: /mcp disconnect <server>", NoticeLevel::Warning);
+                    } else {
+                        let name = args[0];
+                        match mcp_manager.disconnect(name).await {
+                            Ok(()) => app.push_system(
+                                &format!("disconnected MCP server '{name}'"),
+                                NoticeLevel::Success,
+                            ),
+                            Err(e) => app.push_system(
+                                &format!("failed to disconnect '{name}': {e}"),
+                                NoticeLevel::Error,
+                            ),
+                        }
+                    }
+                }
+                "reconnect" => {
+                    let args: Vec<&str> = rest.split_whitespace().skip(1).collect();
+                    if args.is_empty() {
+                        app.push_system("usage: /mcp reconnect <server>", NoticeLevel::Warning);
+                    } else {
+                        let name = args[0];
+                        match mcp_manager.reconnect(name).await {
+                            Ok(()) => app.push_system(
+                                &format!("reconnected MCP server '{name}'"),
+                                NoticeLevel::Success,
+                            ),
+                            Err(e) => app.push_system(
+                                &format!("failed to reconnect '{name}': {e}"),
+                                NoticeLevel::Error,
+                            ),
+                        }
+                    }
+                }
+                "tools" => {
+                    let args: Vec<&str> = rest.split_whitespace().skip(1).collect();
+                    let name = args.first().copied().unwrap_or("");
+                    if name.is_empty() {
+                        app.push_system("usage: /mcp tools <server>", NoticeLevel::Warning);
+                    } else {
+                        let mut tools_map = std::collections::HashMap::new();
+                        match mcp_manager.register_tools(name, &mut tools_map).await {
+                            Ok(n) => {
+                                let mut out = format!("mcp tools for '{name}' ({n}):");
+                                for tool_name in tools_map.keys() {
+                                    out.push_str(&format!("\n  {tool_name}"));
+                                }
+                                app.push_system(&out, NoticeLevel::Info);
+                            }
+                            Err(e) => app.push_system(
+                                &format!("failed to list tools for '{name}': {e}"),
+                                NoticeLevel::Error,
+                            ),
+                        }
+                    }
+                }
+                "resources" => {
+                    let args: Vec<&str> = rest.split_whitespace().skip(1).collect();
+                    if args.is_empty() {
+                        app.push_system("usage: /mcp resources <server>", NoticeLevel::Warning);
+                    } else {
+                        let name = args[0];
+                        let client = mcp_manager.clients_read().await.get(name).cloned();
+                        match client {
+                            Some(c) => match c.list_resources().await {
+                                Ok(res) => {
+                                    let mut out = format!("resources from '{name}' ({}):", res.len());
+                                    for r in &res {
+                                        out.push_str(&format!("\n  {} — {}", r.uri, r.name));
+                                    }
+                                    app.push_system(&out, NoticeLevel::Info);
+                                }
+                                Err(e) => app.push_system(
+                                    &format!("failed to list resources: {e}"),
+                                    NoticeLevel::Error,
+                                ),
+                            },
+                            None => app.push_system(
+                                &format!("server '{name}' not connected"),
+                                NoticeLevel::Warning,
+                            ),
+                        }
+                    }
+                }
+                "prompts" => {
+                    let args: Vec<&str> = rest.split_whitespace().skip(1).collect();
+                    if args.is_empty() {
+                        app.push_system("usage: /mcp prompts <server>", NoticeLevel::Warning);
+                    } else {
+                        let name = args[0];
+                        let client = mcp_manager.clients_read().await.get(name).cloned();
+                        match client {
+                            Some(c) => match c.list_prompts().await {
+                                Ok(prompts) => {
+                                    let mut out = format!("prompts from '{name}' ({}):", prompts.len());
+                                    for p in &prompts {
+                                        out.push_str(&format!("\n  {} — {}", p.name, p.description));
+                                    }
+                                    app.push_system(&out, NoticeLevel::Info);
+                                }
+                                Err(e) => app.push_system(
+                                    &format!("failed to list prompts: {e}"),
+                                    NoticeLevel::Error,
+                                ),
+                            },
+                            None => app.push_system(
+                                &format!("server '{name}' not connected"),
+                                NoticeLevel::Warning,
+                            ),
+                        }
+                    }
+                }
+                "test" => {
+                    let args: Vec<&str> = rest.split_whitespace().skip(1).collect();
+                    if args.len() < 2 {
+                        app.push_system("usage: /mcp test <server> <tool> [json-args]", NoticeLevel::Warning);
+                    } else {
+                        let name = args[0];
+                        let tool = args[1];
+                        let arg_str = args.get(2).map(|s| s.to_string()).unwrap_or_default();
+                        let args_val = serde_json::from_str(&arg_str).unwrap_or(serde_json::json!({}));
+                        match mcp_manager.call_tool(name, tool, &args_val).await {
+                            Ok(result) => {
+                                let text = result.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                                app.push_system(
+                                    &format!("mcp test {name}__{tool}: {text}"),
+                                    NoticeLevel::Success,
+                                );
+                            }
+                            Err(e) => app.push_system(
+                                &format!("mcp test {name}__{tool} failed: {e}"),
+                                NoticeLevel::Error,
+                            ),
+                        }
+                    }
+                }
+                "logs" => {
+                    let log_dir = crate::logging::log_dir();
+                    app.push_system(
+                        &format!(
+                            "MCP activity logs: {}\n  filter with: findstr /i \"mcp\" <log-file>",
+                            log_dir.display()
+                        ),
+                        NoticeLevel::Info,
+                    );
+                }
+                "permissions" => {
+                    let mut out = String::from("mcp permission policies:");
+                    for sc in &config.mcp.servers {
+                        let policy = sc.default_tool_policy.clone();
+                        let allow = sc.tool_allow.join(",");
+                        let deny = sc.tool_deny.join(",");
+                        out.push_str(&format!(
+                            "\n  {} — default: {policy} · allow: [{allow}] · deny: [{deny}]",
+                            sc.name
+                        ));
+                    }
+                    app.push_system(&out, NoticeLevel::Info);
+                }
+                unknown => {
+                    app.push_system(
+                        &format!(
+                            "unknown subcommand '{unknown}' — options: list, status, connect, disconnect, reconnect, tools, resources, prompts, test, logs, permissions"
                         ),
                         NoticeLevel::Warning,
                     );

@@ -71,6 +71,14 @@ arboard = { version = "3", default-features = false }
 # secrets (masked terminal input)
 rpassword = "7"
 
+# MCP (Model Context Protocol) client
+rmcp = { version = "3", features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+] }
+
 # internal crates
 requiem-core = { path = "crates/core" }
 requiem-model = { path = "crates/model" }
@@ -82,6 +90,7 @@ requiem-project = { path = "crates/project" }
 requiem-obsidian = { path = "crates/obsidian" }
 requiem-memory = { path = "crates/memory" }
 requiem-networking = { path = "crates/networking" }
+requiem-mcp = { path = "crates/mcp" }
 requiem-tui = { path = "crates/tui" }
 requiem-cli = { path = "crates/cli" }
 

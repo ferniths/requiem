@@ -400,6 +400,34 @@ See the `/diagnostics` command for the live breaker state and `/retry` to force 
 
 ---
 
+## MCP (Model Context Protocol)
+
+REQUIEM is a generic, first-class MCP client. Connect to any compatible
+server (Ghidra, IDA Pro, filesystem, browser, database, doc servers) over
+stdio or Streamable HTTP. Discovered tools are registered as `server__tool`
+entries and flow through the existing permission gate and multi-agent
+orchestration automatically.
+
+```toml
+# ~/.requiem/config.toml
+[mcp]
+
+[mcp.servers.ghidra]
+description = "Ghidra headless MCP bridge"
+transport = "stdio"
+command = "python3"
+args = ["-m", "ghidra_mcp", "--project", "C:/ghidra/projects/default"]
+enabled = true
+auto_connect = true
+trusted = true
+```
+
+In-session commands: `/mcp list`, `/mcp connect <name>`, `/mcp tools <name>`,
+`/mcp test <name> <tool> [json]`, `/mcp status`. See [docs/mcp.md](docs/mcp.md)
+for the full spec, security notes, and IDA Pro / Ghidra setup examples.
+
+---
+
 ## Testing
 
 ```bash

@@ -81,6 +81,13 @@ pub struct Config {
     /// with a direct-connection default — zero behaviour change.
     #[serde(default)]
     pub network: NetworkConfig,
+
+    // ── MCP (Model Context Protocol) ────────────────────────────
+    /// MCP server configuration. Servers are defined under `[mcp.servers]`
+    /// in the TOML config. All fields have serde defaults so existing
+    /// configs without this section deserialize with an empty default.
+    #[serde(default)]
+    pub mcp: requiem_mcp::McpConfig,
 }
 
 fn default_max_concurrency() -> u32 {
@@ -218,6 +225,7 @@ impl Default for Config {
             vaults: Vec::new(),
             initialized: false,
             network: NetworkConfig::default(),
+            mcp: Default::default(),
         }
     }
 }
