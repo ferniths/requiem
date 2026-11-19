@@ -10,6 +10,7 @@ requiem-core = { path = "../core" }
 requiem-model = { path = "../model" }
 requiem-networking = { path = "../networking" }
 requiem-context = { path = "../context" }
+requiem-project = { path = "../project" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

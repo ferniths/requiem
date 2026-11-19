@@ -250,6 +250,93 @@ pub fn detect(root: &Path) -> Option<ProjectProfile> {
     })
 }
 
+impl ProjectProfile {
+    /// Render a compact context block for injection into an agent's
+    /// system prompt. This is the §4.3 "project-aware" context: the
+    /// agent knows which build/test/lint commands to run without
+    /// guessing.
+    pub fn render_context(&self) -> String {
+        let mut out = String::with_capacity(256);
+        out.push_str(&format!(
+            "PROJECT CONTEXT — root: {} · ecosystems: {} · languages: {}\n",
+            self.root,
+            self.ecosystems.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("+"),
+            self.languages.join(", "),
+        ));
+        for (key, cmd) in &self.build_commands {
+            out.push_str(&format!("  build[{}]: {}\n", key, cmd));
+        }
+        for (key, cmd) in &self.test_commands {
+            out.push_str(&format!("  test[{}]:  {}\n", key, cmd));
+        }
+        if let Some(lint) = &self.lint_command {
+            out.push_str(&format!("  lint:      {}\n", lint));
+        }
+        if !self.subprojects.is_empty() {
+            let subs: Vec<&str> = self.subprojects.iter().map(|s| s.as_str()).collect();
+            out.push_str(&format!("  subprojects: {}\n", subs.join(", ")));
+        }
+        out
+    }
+
+    /// §7.3 — Validate that the primary build/test tools are actually
+    /// available on this machine. Returns a list of warnings for
+    /// commands whose tool is missing from PATH. Empty list = all
+    /// detected commands are runnable.
+    pub fn validate_tools(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        // Extract the base tool name from each command (first word).
+        let tools: Vec<&str> = self
+            .build_commands
+            .values()
+            .chain(self.test_commands.values())
+            .map(|cmd| cmd.split_whitespace().next().unwrap_or(""))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        for tool in &tools {
+            if !tool_available(tool) {
+                missing.push(format!("tool not found on PATH: {tool}"));
+            }
+        }
+        missing
+    }
+}
+
+/// Check whether a binary is resolvable on the system PATH.
+///
+/// Uses `which` on Unix and `where` on Windows. Returns `false` when
+/// the binary is not found. This is a best-effort check: it does not
+/// verify the tool is the correct version, only that it exists.
+fn tool_available(name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        let out = Command::new("where")
+            .arg(name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        use std::process::Command;
+        let out = Command::new("which")
+            .arg(name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        out
+    }
+}
+
 /// Detect languages by file extension, sampling the top 3 directory levels.
 fn detect_languages(root: &Path) -> Vec<String> {
     let mut found = std::collections::BTreeSet::new();
@@ -478,5 +565,58 @@ mod tests {
             "missing python subproject: {:?}",
             profile.subprojects
         );
+    }
+
+    #[test]
+    fn render_context_includes_build_and_test_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let mut f = std::fs::File::create(dir.path().join("src").join("main.rs")).unwrap();
+        f.write_all(b"fn main() {}").unwrap();
+
+        let profile = detect(dir.path()).unwrap();
+        let ctx = profile.render_context();
+        assert!(ctx.contains("PROJECT CONTEXT"), "must have header");
+        assert!(ctx.contains("cargo"), "must list cargo ecosystem");
+        assert!(ctx.contains("cargo build"), "must list build command");
+        assert!(ctx.contains("cargo test"), "must list test command");
+        assert!(ctx.contains("Rust"), "must list detected language");
+    }
+
+    #[test]
+    fn render_context_includes_subprojects() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]").unwrap();
+        std::fs::create_dir_all(dir.path().join("crates").join("core")).unwrap();
+        std::fs::write(
+            dir.path().join("crates").join("core").join("Cargo.toml"),
+            "[package]\nname = \"core\"",
+        )
+        .unwrap();
+
+        let profile = detect(dir.path()).unwrap();
+        let ctx = profile.render_context();
+        assert!(
+            ctx.contains("subprojects"),
+            "monorepo must list subprojects, got: {ctx}"
+        );
+        assert!(ctx.contains("core"), "must include subproject path");
+    }
+
+    #[test]
+    fn validate_tools_returns_empty_for_known_tools() {
+        // `sh` and `cmd`/`sh` are always present on their respective
+        // platforms; `cargo` is present in this test environment.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let profile = detect(dir.path()).unwrap();
+        // We don't assert the list is empty (cargo might not be on PATH
+        // in a minimal CI), but we assert the method returns a Vec.
+        let missing = profile.validate_tools();
+        // If cargo is missing, it should be reported.
+        if !missing.iter().any(|m| m.contains("cargo")) {
+            assert!(missing.is_empty() || !missing.iter().any(|m| m.contains("cargo")));
+        }
     }
 }

@@ -101,6 +101,20 @@ impl AgentRun {
     /// mode-specific instructions so the agent behaves differently in
     /// Ask vs. Debug vs. Research, etc.
     pub fn with_mode(agent: Agent, task: Task, mode: Option<&str>) -> Self {
+        Self::with_mode_context(agent, task, mode, None)
+    }
+
+    /// Start a new run with a mode-specific system prompt and an
+    /// optional project context block (§4.3). The project context is
+    /// injected after the mode prompt so the agent knows which build,
+    /// test, and lint commands to run without guessing.
+    #[allow(dead_code)]
+    pub fn with_mode_context(
+        agent: Agent,
+        task: Task,
+        mode: Option<&str>,
+        project_context: Option<&str>,
+    ) -> Self {
         let mut history = Vec::new();
         let mut system = format!(
             "You are the {} agent in REQUIEM, a multi-agent coding harness.\n\
@@ -114,6 +128,11 @@ impl AgentRun {
 
         if let Some(m) = mode {
             system.push_str(mode_prompt(m));
+        }
+
+        if let Some(ctx) = project_context {
+            system.push_str("\n\n");
+            system.push_str(ctx);
         }
 
         if let Some(body) = &task.body {
@@ -995,5 +1014,22 @@ mod tests {
         // All are distinct.
         assert_ne!(sys_ask, sys_debug);
         assert_ne!(sys_debug, sys_research);
+    }
+
+    #[test]
+    fn project_context_injected_into_system_prompt() {
+        let agent = Agent::master("test", Id::new());
+        let task = Task::new("build the project");
+        let project_ctx = "PROJECT CONTEXT — root: /x · ecosystems: cargo\n  build[cargo]: cargo build\n  test[cargo]:  cargo test\n";
+
+        let run = AgentRun::with_mode_context(agent, task, Some("code"), Some(project_ctx));
+        let sys = run.history[0]
+            .content
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(sys.contains("PROJECT CONTEXT"), "project context must be in system prompt");
+        assert!(sys.contains("cargo build"), "build command must be present");
+        assert!(sys.contains("Mode: CODE"), "mode prompt must coexist with project context");
     }
 }
