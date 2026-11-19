@@ -34,12 +34,20 @@ fn unique_temp_path(dir: &Path, file_name: &Path) -> PathBuf {
 /// A vault rooted at a filesystem directory.
 pub struct Vault {
     root: PathBuf,
+    /// Serializes the changelog read-modify-write so concurrent
+    /// `write_note` calls on the same vault instance cannot clobber
+    /// each other's entries. Held only across the changelog section of
+    /// `write_note`; note writes themselves are atomic via rename.
+    changelog_lock: std::sync::Mutex<()>,
 }
 
 impl Vault {
     /// Open a vault rooted at `path`.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { root: path.into() }
+        Self {
+            root: path.into(),
+            changelog_lock: std::sync::Mutex::new(()),
+        }
     }
 
     /// The vault's root directory.
@@ -164,7 +172,15 @@ impl Vault {
             std::fs::rename(&tmp, &target).map_err(|e| VaultError::Io(e.to_string()))?;
         }
 
-        // Append to the change log (unique temp + rename for atomicity).
+        // Append to the change log. Hold the per-vault lock so two
+        // concurrent `write_note` calls on the same `Vault` instance
+        // cannot read the same base log and clobber each other's
+        // entries. The note write above is already atomic (rename),
+        // so only the changelog section needs serialization.
+        let _changelog_guard = self
+            .changelog_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = ChangeLogEntry {
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -449,5 +465,41 @@ mod tests {
         assert_eq!(vault.read_note("a/b/c.md").unwrap(), "deep");
         // A `.` component is harmless and stays inside the vault.
         assert_eq!(vault.read_note("./a/b/c.md").unwrap(), "deep");
+    }
+
+    /// Regression: concurrent `write_note` calls on the same vault
+    /// instance must not clobber each other's changelog entries.
+    /// Each entry in the log must reference a distinct note path.
+    #[test]
+    fn concurrent_writes_preserve_all_changelog_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = std::sync::Arc::new(Vault::new(dir.path().to_path_buf()));
+
+        let n = 20;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let v = std::sync::Arc::clone(&vault);
+            handles.push(std::thread::spawn(move || {
+                v.write_note(&format!("note-{i}.md"), &format!("content {i}"))
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // All N entries must be present in the changelog — none lost.
+        let log_path = dir.path().join(".requiem-changelog.json");
+        let log: Vec<ChangeLogEntry> =
+            serde_json::from_str(&std::fs::read_to_string(log_path).unwrap()).unwrap();
+        assert_eq!(
+            log.len(),
+            n,
+            "changelog must contain all {n} entries, got {}",
+            log.len()
+        );
+        // Each entry must reference a distinct note path.
+        let paths: std::collections::HashSet<&str> = log.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths.len(), n, "all entries must have distinct paths");
     }
 }
