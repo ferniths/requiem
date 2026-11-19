@@ -113,31 +113,78 @@ impl Tool for TerminalTool {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| crate::ToolError::Terminal(format!("failed to spawn: {e}")))?;
 
-        let output =
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
-                .await
-            {
-                Ok(Ok(out)) => out,
-                Ok(Err(e)) => return Err(crate::ToolError::Terminal(e.to_string())),
+        // Take the pipes out so we can read them independently of child.wait().
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+
+        // Bounded stream reader: accumulates up to MAX_OUTPUT_CHARS bytes,
+        // then drains the remaining stream without further allocation.
+        async fn read_bounded(mut pipe: impl tokio::io::AsyncRead + Unpin) -> String {
+            use tokio::io::AsyncReadExt;
+            let mut buf: Vec<u8> = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            loop {
+                if buf.len() >= MAX_OUTPUT_CHARS {
+                    while pipe.read(&mut chunk).await.map(|n| n > 0).unwrap_or(false) {}
+                    break;
+                }
+                match pipe.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        // Read both streams concurrently (bounded), then wait for the child.
+        let read_fut = async {
+            let (so, se) = tokio::join!(
+                async {
+                    if let Some(p) = stdout_pipe.take() {
+                        read_bounded(p).await
+                    } else {
+                        String::new()
+                    }
+                },
+                async {
+                    if let Some(p) = stderr_pipe.take() {
+                        read_bounded(p).await
+                    } else {
+                        String::new()
+                    }
+                }
+            );
+            let status = child.wait().await;
+            (so, se, status)
+        };
+
+        let (stdout_raw, stderr_raw, status) =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), read_fut).await {
+                Ok((so, se, status)) => (so, se, status),
                 Err(_) => {
-                    // The timeout dropped the child (kill_on_drop ensures the
-                    // process is terminated).
+                    // Timeout: kill the child. Its pipes close, unblocking
+                    // the reads; the spawned join is dropped.
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
                     return Err(crate::ToolError::Terminal(format!(
                         "command timed out after {timeout_ms} ms and was killed"
                     )));
                 }
             };
 
-        let (stdout, stdout_truncated) = truncate_output(&String::from_utf8_lossy(&output.stdout));
-        let (stderr, stderr_truncated) = truncate_output(&String::from_utf8_lossy(&output.stderr));
+        let status = status.map_err(|e| crate::ToolError::Terminal(e.to_string()))?;
+        let (stdout, stdout_truncated) = truncate_output(&stdout_raw);
+        let (stderr, stderr_truncated) = truncate_output(&stderr_raw);
+        let exit_code = status.code().unwrap_or(-1);
         Ok(serde_json::json!({
             "stdout": stdout,
             "stderr": stderr,
-            "exit_code": output.status.code().unwrap_or(-1),
+            "exit_code": exit_code,
             "timed_out": false,
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated

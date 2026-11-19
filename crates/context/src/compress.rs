@@ -71,12 +71,18 @@ impl ContextStrategy for Compressor {
     }
 }
 
-/// Remove consecutive messages that are identical (same role + content).
+/// Remove consecutive messages that are identical (same role, content,
+/// tool_call_id, and tool-call structure). Two messages with the same
+/// content but different roles are NOT duplicates.
 fn dedup_consecutive(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     for m in messages {
-        if out.last().is_some() && out.last().unwrap().content == m.content {
-            // Skip the duplicate.
+        if out.last().is_some()
+            && out.last().unwrap().content == m.content
+            && out.last().unwrap().role == m.role
+            && out.last().unwrap().tool_call_id == m.tool_call_id
+            && out.last().unwrap().tool_calls.len() == m.tool_calls.len()
+        {
             continue;
         }
         out.push(m.clone());
@@ -107,10 +113,13 @@ mod tests {
 
     #[test]
     fn over_budget_compresses_tool_results() {
-        let budget = ContextBudget::new(20);
-        let history: Vec<ChatMessage> = (0..50)
-            .map(|i| tool_result(&format!("t{i}"), &format!("result {i}")))
+        // 10 messages with long content; budget of 100 tokens can't fit
+        // them all, but compression to short placeholders helps.
+        let budget = ContextBudget::new(100);
+        let history: Vec<ChatMessage> = (0..10)
+            .map(|i| tool_result(&format!("t{i}"), &format!("x{}", "y".repeat(500))))
             .collect();
+        assert!(!budget.fits(&history), "precondition: history must be over budget");
         let result = Compressor.apply(history, &budget);
         assert!(result.compressed);
         assert!(result.tokens_freed > 0);
@@ -124,5 +133,31 @@ mod tests {
         let c = ChatMessage::user("different");
         let deduped = dedup_consecutive(&[a, b, c]);
         assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn dedup_same_content_different_roles_not_merged() {
+        let a = ChatMessage::assistant("same content");
+        let b = ChatMessage::user("same content");
+        let deduped = dedup_consecutive(&[a, b]);
+        assert_eq!(deduped.len(), 2, "same content, different role must not dedup");
+    }
+
+    #[test]
+    fn dedup_same_content_different_tool_call_id_not_merged() {
+        let a = ChatMessage {
+            role: requiem_model::request::Role::Tool,
+            content: Some(serde_json::json!("result")),
+            tool_call_id: Some("t1".into()),
+            tool_calls: Vec::new(),
+        };
+        let b = ChatMessage {
+            role: requiem_model::request::Role::Tool,
+            content: Some(serde_json::json!("result")),
+            tool_call_id: Some("t2".into()),
+            tool_calls: Vec::new(),
+        };
+        let deduped = dedup_consecutive(&[a, b]);
+        assert_eq!(deduped.len(), 2, "same content, different tool_call_id must not dedup");
     }
 }

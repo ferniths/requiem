@@ -5,10 +5,10 @@
 //! errors (4xx bad request, invalid model, context-length overflow) are
 //! surfaced immediately without retrying.
 //!
-//! Jitter is produced with a small in-crate LCG so the crate has no
-//! external RNG dependency.
+//! Jitter is produced with a thread-seeded LCG so concurrent callers
+//! receive independent delays, preventing synchronized retry bursts.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use requiem_core::error::RequiemError;
 
@@ -39,6 +39,28 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Generate a jitter factor in [0.5, 1.5] using a thread-and-time-seeded
+/// LCG so that concurrent callers at the same attempt number receive
+/// different delays.
+fn jitter_factor() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let tid = std::thread::current().id();
+    // Mix in a hash of the thread ID for per-thread independence.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    tid.hash(&mut h);
+    let seed = nanos ^ h.finish();
+    // 64-bit LCG (xorshift-lite): mix the seed, take a fraction.
+    let x = seed
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(seed >> 32);
+    let frac = ((x & 0xFFFF) as f64 / 0xFFFF as f64) * 1.0 + 0.5;
+    frac.min(1.5)
+}
+
 impl RetryPolicy {
     /// Compute the delay before attempt `n` (0-indexed: n=0 is the first
     /// retry, n=1 the second, etc.).
@@ -47,14 +69,7 @@ impl RetryPolicy {
         let base = self.base_delay_ms as f64 * exp;
         let cap = self.max_delay_ms as f64;
         let base = base.min(cap);
-        let jitter = if self.jitter {
-            // LCG: a cheap, deterministic-enough pseudo-random in [0.5, 1.5].
-            let seed = (n as u64).wrapping_mul(0x9E3779B97F4A7C15);
-            let frac = ((seed & 0xFFFF) as f64 / 0xFFFF as f64) * 1.0 + 0.5;
-            base * frac.min(1.5)
-        } else {
-            base
-        };
+        let jitter = if self.jitter { base * jitter_factor() } else { base };
         Duration::from_millis(jitter as u64)
     }
 
@@ -87,9 +102,7 @@ pub fn delay_for_error(policy: &RetryPolicy, attempt: u32, err: &RequiemError) -
             let cap = policy.max_delay_ms;
             let clamped = requested.clamp(base, cap);
             if policy.jitter {
-                let seed = (attempt as u64).wrapping_mul(0x9E3779B97F4A7C15);
-                let frac = ((seed & 0xFFFF) as f64 / 0xFFFF as f64) * 1.0 + 0.5;
-                Duration::from_millis((clamped as f64 * frac.min(1.5)) as u64)
+                Duration::from_millis((clamped as f64 * jitter_factor()) as u64)
             } else {
                 Duration::from_millis(clamped)
             }
@@ -162,5 +175,23 @@ mod tests {
         // Without jitter: base 500ms, 500ms, 1000ms...
         assert_eq!(delay0.as_millis(), 500);
         assert_eq!(delay1.as_millis(), 1000);
+    }
+
+    #[test]
+    fn jitter_produces_independent_delays() {
+        // Two consecutive jittered calls for the same base should differ
+        // (the seed includes nanosecond time + thread ID, so collisions
+        // are vanishingly unlikely in a test).
+        let policy = RetryPolicy::default();
+        let err = RequiemError::RateLimited {
+            retry_after_ms: 5_000,
+        };
+        let d1 = delay_for_error(&policy, 0, &err);
+        let d2 = delay_for_error(&policy, 0, &err);
+        // Both must be in [2500, 7500].
+        assert!(d1.as_millis() >= 2_500 && d1.as_millis() <= 7_500);
+        assert!(d2.as_millis() >= 2_500 && d2.as_millis() <= 7_500);
+        // In practice they will differ; we can't assert that with 100%
+        // certainty, but the probability of a collision is ~1/65536.
     }
 }

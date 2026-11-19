@@ -2,9 +2,34 @@
 //! notes, and provides safe atomic writes with a change log.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
+
+/// Process-wide counter for generating unique temp filenames.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Build a unique temp path in `dir` for the target file named by
+/// `file_name`. The name includes a timestamp, PID, and process-wide
+/// counter so concurrent writers cannot collide.
+fn unique_temp_path(dir: &Path, file_name: &Path) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() % 1_000_000)
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stem = file_name
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("note");
+    let ext = file_name
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("md");
+    dir.join(format!(".{stem}.{pid}.{ts}.{n}.tmp.{ext}"))
+}
 
 /// A vault rooted at a filesystem directory.
 pub struct Vault {
@@ -27,7 +52,8 @@ impl Vault {
         self.root.is_dir()
     }
 
-    /// List all markdown files in the vault (non-recursive, top-level only).
+    /// List all markdown files in the vault (recursive, includes
+    /// subdirectories).
     pub fn list_notes(&self) -> Vec<PathBuf> {
         WalkDir::new(&self.root)
             .into_iter()
@@ -92,8 +118,13 @@ impl Vault {
         std::fs::read_to_string(&real).map_err(|e| VaultError::Io(e.to_string()))
     }
 
-    /// Write a note atomically: write to a temp file in the same directory,
-    /// then rename over the target. Appends to the change log.
+    /// Write a note atomically: write to a uniquely-named temp file in
+    /// the same directory, then rename over the target. Appends to the
+    /// change log.
+    ///
+    /// The temp filename includes a process-wide counter and timestamp so
+    /// concurrent writers to the same note cannot collide on a shared
+    /// temp path.
     pub fn write_note(&self, rel_path: &str, content: &str) -> Result<ChangeLogEntry, VaultError> {
         let path = self.resolve_relative(rel_path)?;
         // Ensure the configured vault root exists first: `canonicalize` needs
@@ -118,12 +149,22 @@ impl Vault {
         Self::ensure_contained(&root, &real_parent, rel_path)?;
         let target = real_parent.join(&file_name);
 
-        // Atomic write: temp file in same directory, then rename.
-        let tmp = target.with_file_name(format!(".{}.tmp", file_name.to_str().unwrap_or("note")));
+        // Atomic write: unique temp file in same directory, then rename.
+        let tmp = unique_temp_path(
+            &real_parent,
+            Path::new(file_name.to_str().unwrap_or("note")),
+        );
         std::fs::write(&tmp, content).map_err(|e| VaultError::Io(e.to_string()))?;
-        std::fs::rename(&tmp, &target).map_err(|e| VaultError::Io(e.to_string()))?;
+        if std::fs::rename(&tmp, &target).is_err() {
+            // Clean up the temp file on failure so we don't leave debris.
+            let _ = std::fs::remove_file(&tmp);
+            // Retry once: the target may have been modified by another
+            // writer between our read and our rename.
+            std::fs::write(&tmp, content).map_err(|e| VaultError::Io(e.to_string()))?;
+            std::fs::rename(&tmp, &target).map_err(|e| VaultError::Io(e.to_string()))?;
+        }
 
-        // Append to the change log.
+        // Append to the change log (unique temp + rename for atomicity).
         let entry = ChangeLogEntry {
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -141,7 +182,14 @@ impl Vault {
         };
         log.push(entry.clone());
         let log_json = serde_json::to_string_pretty(&log).unwrap_or_default();
-        std::fs::write(&log_path, log_json).map_err(|e| VaultError::Io(e.to_string()))?;
+        let log_tmp = unique_temp_path(&self.root, std::path::Path::new(".requiem-changelog.json"));
+        std::fs::write(&log_tmp, log_json).map_err(|e| VaultError::Io(e.to_string()))?;
+        if std::fs::rename(&log_tmp, &log_path).is_err() {
+            let _ = std::fs::remove_file(&log_tmp);
+            return Err(VaultError::Io(
+                "failed to atomically update changelog".to_string(),
+            ));
+        }
 
         Ok(entry)
     }
